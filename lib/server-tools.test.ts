@@ -13,6 +13,11 @@ import { createItemReservationStore } from "./item-reservations.ts";
 
 const hosts: FakePluginHost[] = [];
 
+const isToolError = (result: unknown): boolean =>
+  typeof result === "object" && result !== null && "isError" in result
+    ? (result as { isError?: boolean }).isError === true
+    : false;
+
 afterEach(async () => {
   while (hosts.length > 0) await hosts.pop()!.harness.lifecycle.dispose();
 });
@@ -138,11 +143,6 @@ describe("large-plan agent tool contracts", () => {
     },
     origin: { kind: null, pluginId: null },
   });
-
-  const isToolError = (result: unknown): boolean =>
-    typeof result === "object" && result !== null && "isError" in result
-      ? (result as { isError?: boolean }).isError === true
-      : false;
 
   it("gives every provider only the canonical UltraGoal skill and root controls", async () => {
     const host = registeredHost();
@@ -1086,5 +1086,230 @@ describe("resolve_finding end to end", () => {
 
     assert.equal((result as { isError?: boolean }).isError, true);
     assert.equal(findings.get("thr_root", rec.finding.id)!.status, "open");
+  });
+});
+
+describe("automatic slice integration", () => {
+  /**
+   * The merge target is a DECLARED field. `defaultBranch` describes the
+   * project; it is not a statement about where this goal's work belongs, and
+   * on the goals that run this plugin it names `main` — a passive upstream
+   * tracker — while the base is `integration`. Measured on the host database
+   * (`bb.db`, 2026-09-14): of the managed worktree environments carrying no
+   * mergeBaseBranch, 100 have a defaultBranch that DIFFERS from the baseBranch
+   * they were cut from, 47 of those `main` vs `integration`. Falling through to
+   * defaultBranch squash-merges those slices onto unrelated history and records
+   * "integrated" while doing it, so the corruption surfaces much later as an
+   * unexplained conflict with nothing pointing back here.
+   */
+  interface FakeEnvironment {
+    branchName: string | null;
+    baseBranch: string | null;
+    defaultBranch: string | null;
+    mergeBaseBranch: string | null;
+  }
+
+  const spawnedWorker = () => makeThreadResponse({
+    id: "thr_worker_int",
+    projectId: "proj",
+    providerId: "acp-opencode",
+    environmentId: "env_worker_int",
+    parentThreadId: "thr_int",
+    status: "active",
+  });
+
+  async function runIntegration(environment: FakeEnvironment) {
+    const hostRpcCalls: string[] = [];
+    const host = createFakePluginHost({
+      pluginId: `ultragoal-integration-${hosts.length}`,
+      agentSkillIds: ["ultragoal"],
+      experimental_callHostRpc: (call) => {
+        hostRpcCalls.push(call.method);
+        if (call.method === "branchAddsWork") return { adds: true };
+        return { removed: false, freedBytes: 0, reason: "test" };
+      },
+      sdk: {
+        threads: {
+          get: async ({ threadId }) => makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "acp-opencode",
+            status: "idle",
+            // Only the WORKER has the environment under test. The root thread
+            // deliberately has none, so collab's own spawn-side refusal (which
+            // reads the ROOT environment) cannot stand in for the consumer-side
+            // behaviour this test is about.
+            environmentId: threadId === "thr_worker_int" ? "env_worker_int" : null,
+            parentThreadId: threadId === "thr_worker_int" ? "thr_int" : null,
+          }),
+          list: () => [],
+          spawn: () => spawnedWorker(),
+          fork: async () => spawnedWorker(),
+          update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+          output: () => ({ output: "Worker finished the slice." }),
+          send: () => ({ ok: true }),
+          stop: () => ({ ok: true }),
+          timeline: () => ({ rows: [] }),
+          interactions: { list: async () => [] },
+        },
+        environments: {
+          get: async ({ environmentId }) => ({
+            id: environmentId,
+            projectId: "proj",
+            hostId: "host_test",
+            path: "/tmp/ultragoal-integration-test",
+            isGitRepo: true,
+            isWorktree: true,
+            managed: true,
+            status: "ready",
+            name: null,
+            createdAt: 0,
+            ...environment,
+          }),
+          squashMerge: () => ({ ok: true }),
+        },
+      },
+    } satisfies CreateFakePluginHostOptions);
+    hosts.push(host);
+    const db = host.bb.storage.database();
+    db.exec(`
+      CREATE TABLE goals (
+        thread_id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER NOT NULL,
+        turn_count INTEGER NOT NULL, max_turns INTEGER NOT NULL, max_minutes INTEGER NOT NULL,
+        last_continue_at INTEGER, last_assistant_hash TEXT
+      );
+      INSERT INTO goals VALUES ('thr_sentinel', 'test', 'complete', NULL, 1, 1, 1, 0, 0, 0, NULL, NULL);
+    `);
+    plugin(host.bb);
+    db.prepare(
+      "UPDATE goals SET thread_id = 'thr_int', status = 'active', max_workers = 1, verify_enabled = 0, auto_integrate_completed_slices = 1 WHERE thread_id = 'thr_sentinel'",
+    ).run();
+
+    const items = createItemStore(host.bb);
+    const findings = createFindingStore(host.bb);
+    const item = items.add("thr_int", "Land the slice on the goal's base branch", "pending", {
+      files: ["src/integration.ts"],
+    })!;
+    const defect = findings.report("thr_int", {
+      title: "The slice's defect",
+      file: "src/integration.ts:1",
+      evidence: "Closed on the worker's report, before any merge was attempted.",
+      fixFiles: ["src/integration.ts"],
+    }).finding;
+    assert.equal(findings.linkItem("thr_int", defect.id, item.id), true);
+
+    const spawned = await host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "integration_worker",
+        display_name: "The Base Branch Reckoning",
+        item_id: item.id,
+        message: `SLICE (item_id=${item.id}): Land the slice on the goal's base branch`,
+      },
+      { threadId: "thr_int" },
+    );
+    assert.equal(isToolError(spawned), false, JSON.stringify(spawned));
+
+    const done = await host.harness.behavior.callAgentTool(
+      "slice_done",
+      {
+        evidence: "commit deadbee; the slice's own check passed",
+        finding_evidence: [{ finding_id: defect.id, proof: "regression added and passing" }],
+      },
+      { threadId: "thr_worker_int" },
+    );
+    assert.equal(isToolError(done), false, JSON.stringify(done));
+
+    await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({
+        id: "thr_worker_int",
+        projectId: "proj",
+        providerId: "acp-opencode",
+        environmentId: "env_worker_int",
+        parentThreadId: "thr_int",
+        status: "idle",
+      }),
+      lastAssistantText: "Worker finished and called slice_done.",
+    });
+
+    // queueIntegration is fire-and-forget: the lifecycle handler stores the
+    // promise and returns. Drain it by waiting for the outcome row rather than
+    // guessing a tick count, which is how this test would go flaky.
+    let integration: { status: string; detail: string | null; branch: string | null } | undefined;
+    for (let attempt = 0; attempt < 200 && !integration; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      integration = db
+        .prepare("SELECT status, detail, branch FROM goal_item_integrations WHERE thread_id = ? AND item_id = ?")
+        .get("thr_int", item.id) as typeof integration;
+    }
+    // The register row is written BEFORE the findings reopen and the slice is
+    // requeued. Nothing awaits between them today, so the row is a sound
+    // trigger — but drain the rest of that turn anyway, or the day someone adds
+    // an await this test starts failing intermittently and for the wrong reason.
+    for (let settle = 0; settle < 20; settle += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return {
+      host,
+      hostRpcCalls,
+      defectId: defect.id,
+      itemId: item.id,
+      findings,
+      items,
+      integration,
+      squashMerges: host.harness.inspection.sdk.callsTo("environments.squashMerge"),
+    };
+  }
+
+  it("squash-merges into the branch the worker environment declares", async () => {
+    // Positive control. Without it, a fix that simply deleted the integration
+    // path would pass the refusal test below.
+    const run = await runIntegration({
+      branchName: "bb/slice-one",
+      baseBranch: "origin/main",
+      defaultBranch: "main",
+      mergeBaseBranch: "integration",
+    });
+
+    assert.equal(run.squashMerges.length, 1);
+    assert.deepEqual(run.squashMerges[0], [
+      { environmentId: "env_worker_int", mergeBaseBranch: "integration" },
+    ]);
+    assert.equal(run.integration?.status, "integrated");
+    assert.match(run.integration?.detail ?? "", /integration/);
+    assert.equal(run.findings.get("thr_int", run.defectId)!.status, "fixed");
+  });
+
+  it("refuses to merge, and strands the branch, when the worker environment names no merge base", async () => {
+    // defaultBranch and baseBranch are both present and both wrong: `main` is
+    // the project default and `origin/main` is a REMOTE ref that is not a merge
+    // target at all (the host database holds base_branch values that are bare
+    // SHAs). Neither may stand in for the declared merge base.
+    const run = await runIntegration({
+      branchName: "bb/slice-two",
+      baseBranch: "origin/main",
+      defaultBranch: "main",
+      mergeBaseBranch: null,
+    });
+
+    assert.deepEqual(run.squashMerges, []);
+    // The worktree holds the only copy of unmerged work. Reclaiming it here
+    // would delete that work, silently and unrecoverably.
+    assert.equal(run.hostRpcCalls.includes("reclaimWorktree"), false);
+    // Nor may a null base be handed to the repository probe: "does this branch
+    // add work relative to nothing" has no answer, and the fallback it would
+    // stand in for is the one being removed.
+    assert.equal(run.hostRpcCalls.includes("branchAddsWork"), false);
+    assert.equal(run.integration?.status, "failed");
+    assert.equal(run.integration?.branch, "bb/slice-two");
+    assert.match(run.integration?.detail ?? "", /merge base/i);
+    assert.match(run.integration?.detail ?? "", /env_worker_int/);
+    // Closure happened on the worker's report, before this ran. Nothing landed,
+    // so the register must stop claiming the defect is fixed.
+    assert.equal(run.findings.get("thr_int", run.defectId)!.status, "open");
+    const requeued = run.items.list("thr_int").find((row) => row.id === run.itemId)!;
+    assert.equal(requeued.status, "pending");
+    assert.match(requeued.step, /STRANDED WORK/);
   });
 });

@@ -721,6 +721,37 @@ export function createCollabStore(
       );
     }
     if (brief?.linkedDefects) briefLines.push(brief.linkedDefects);
+    // Read the root environment ONCE, before the prompt: the quality bar now
+    // names the integration branch, so the prompt depends on this lookup too.
+    //
+    // branchName FIRST, and that order is load-bearing. The root environment on
+    // an omegacode goal measures: branch_name=integration, merge_base_branch=
+    // NULL, default_branch=main. Reading mergeBaseBranch first would resolve to
+    // null there and cut every worker from the project default — which on this
+    // project is `main`, the passive upstream tracker, not the base. Do not
+    // "harmonize" this with integrateWorker: that reads the WORKER's
+    // environment, a different record, whose mergeBaseBranch bb populates from
+    // the named baseBranch below (measured: merge_base_branch=integration on
+    // every worker env). The two orders agree because they read different rows,
+    // not because either is arbitrary.
+    const rootEnv = parent.environmentId
+      ? await bb.sdk.environments
+          .get({ environmentId: parent.environmentId })
+          .catch(() => null)
+      : null;
+    const integrationBranch = rootEnv?.branchName ?? rootEnv?.mergeBaseBranch ?? null;
+    const parentHostId = rootEnv?.hostId ?? undefined;
+    // The root HAS an environment and we still could not name its branch. The
+    // old code downgraded to `{ kind: "default" }` here, which is the same
+    // corruption the brief now refuses by hand: a worker cut from the project
+    // default carries merge_base_branch=NULL, so integrateWorker falls through
+    // to default_branch and squash-merges the slice into the upstream tracker.
+    // Refusing costs one staffing attempt; guessing costs a silent bad merge.
+    if (parent.environmentId && !integrationBranch) {
+      return {
+        error: `Refusing to spawn: root environment ${parent.environmentId} names no integration branch, and a worker cut from the project default would aim its slice at the default branch rather than the goal's base. Set the root thread's branch, then staff again.`,
+      };
+    }
     const prompt = [
       trimmed,
       ...briefLines,
@@ -730,7 +761,7 @@ export function createCollabStore(
         ? 'You are an UltraGoal verifier. Inspect the worktree and report VERIFY_PASS or VERIFY_FAIL. For every linked defect emit one exact line: DEFECT_COVERAGE: {"finding_id":"fnd_...","status":"pass","proof":"what you checked"}. Prose mentions do not count. Do not implement fixes. Fail work that ships stubs/placeholders/TODO behavior, weakens or skips tests to get green, leaves dead or duplicated code behind, or touches files unrelated to its slice.'
         : "You are an UltraGoal subagent for this assigned slice only. Do the work and report evidence.",
       "Do not call ultragoal_finish, do not manage the parent UltraGoal plan, and do not re-orchestrate the whole objective.",
-      role === "verifier" ? "" : workerQualityBrief(),
+      role === "verifier" ? "" : workerQualityBrief(integrationBranch),
       role === "verifier"
         ? ""
         : "If your slice is a hunt/audit/review that uncovers discrete defects, call report_finding the moment you confirm each one (one call per defect; do not batch them into your final report) — a fix slice is staffed automatically per finding.",
@@ -740,24 +771,6 @@ export function createCollabStore(
     ]
       .filter(Boolean)
       .join("\n\n");
-    // Where completed slices are squash-merged. integrateWorker uses the root
-    // environment's mergeBaseBranch, falling back to its checked-out branch, so
-    // workers must be cut from the same place.
-    let integrationBranch: string | null = null;
-    if (parent.environmentId) {
-      try {
-        const rootEnv = await bb.sdk.environments.get({ environmentId: parent.environmentId });
-        integrationBranch = rootEnv.branchName ?? rootEnv.mergeBaseBranch ?? null;
-      } catch {
-        integrationBranch = null;
-      }
-    }
-    const parentHostId = parent.environmentId
-      ? await bb.sdk.environments
-          .get({ environmentId: parent.environmentId })
-          .then((environment) => environment.hostId)
-          .catch(() => undefined)
-      : undefined;
     // Execution is pinned with explicit provenance: the server drops
     // provider/model fields that carry no executionInputSources and re-derives
     // them from the project's stored defaults — which follow whatever the user
@@ -799,7 +812,9 @@ export function createCollabStore(
           // work: three of four live workers were simultaneously on stale
           // bases, one re-implementing a slice already merged, every one of
           // them heading for a conflict. A worker that starts behind the
-          // integration point is wasted before it reads a line.
+          // integration point is wasted before it reads a line. `default` is
+          // reached only by a goal whose root has no environment at all; a root
+          // that has one and cannot name its branch was refused above.
           baseBranch: integrationBranch
             ? { kind: "named" as const, name: integrationBranch }
             : { kind: "default" as const },

@@ -16,9 +16,14 @@ afterEach(async () => {
 function collabHost(options?: {
   discovered?: ReturnType<typeof makeThreadResponse>[];
   prompts?: Record<string, string>;
+  /** Branch checked out by the root's environment, i.e. where slices land. */
+  rootBranch?: string;
+  /** Root environment that exists but names no branch at all. */
+  rootEnvWithoutBranch?: boolean;
 }) {
   const stopped: string[] = [];
   const prompts: string[] = [];
+  const spawnArgsSeen: unknown[] = [];
   const queued: unknown[] = [];
   const sent: Array<{ threadId?: string; mode?: string }> = [];
   let spawnCalls = 0;
@@ -32,7 +37,10 @@ function collabHost(options?: {
             id: threadId,
             projectId: "proj",
             providerId: "acp-opencode",
-            environmentId: null,
+            environmentId:
+              (options?.rootBranch || options?.rootEnvWithoutBranch) && threadId === "thr_root"
+                ? "env_root"
+                : null,
             status: threadId === "thr_root" ? "idle" : "active",
           }),
         list: () => options?.discovered ?? [],
@@ -44,6 +52,7 @@ function collabHost(options?: {
         spawn: (args) => {
           spawnCalls += 1;
           prompts.push(args.prompt ?? "");
+          spawnArgsSeen.push(args);
           return makeThreadResponse({
             id: "thr_spawned",
             parentThreadId: "thr_root",
@@ -69,6 +78,18 @@ function collabHost(options?: {
         },
         update: ({ threadId }) => makeThreadResponse({ id: threadId }),
       },
+      environments: {
+        // Shaped from the live record for an UltraGoal root on omegacode
+        // (env_2j2yd334px): branch_name=integration, merge_base_branch=NULL,
+        // default_branch=main. mergeBaseBranch is deliberately absent.
+        get: async () => ({
+          id: "env_root",
+          hostId: "host_1",
+          branchName: options?.rootBranch ?? null,
+          mergeBaseBranch: null,
+          defaultBranch: "main",
+        }),
+      } as never,
     },
   });
   hosts.push(host);
@@ -129,7 +150,15 @@ function collabHost(options?: {
         SELECT RAISE(ABORT, 'root worker capacity is full');
       END;
   `);
-  return { host, stopped, prompts, queued, sent, spawnCalls: () => spawnCalls };
+  return {
+    host,
+    stopped,
+    prompts,
+    queued,
+    sent,
+    spawnCalls: () => spawnCalls,
+    spawnArgs: () => spawnArgsSeen,
+  };
 }
 
 describe("scheduler-strict collaboration spawns", () => {
@@ -258,6 +287,89 @@ describe("scheduler-strict collaboration spawns", () => {
     assert.doesNotMatch(state.prompts[0]!, /npm test -- domain/);
     assert.match(state.prompts[0]!, /fnd_public_verifier/);
     assert.match(state.prompts[0]!, /DEFECT_COVERAGE/);
+  });
+
+  it("names the root environment's branch in the worker brief, not a hardcoded main", async () => {
+    // The rebase target used to be the literal `main` in the brief template.
+    // Here `main` is the upstream tracker and `integration` is the base — a
+    // worker told to rebase onto `main` corrupts its candidate with unrelated
+    // history, and the corruption only surfaces at merge time.
+    const state = collabHost({ rootBranch: "integration" });
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: () => "itm_plumbing",
+    });
+    collab.registerTools();
+
+    await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_plumbing",
+        item_id: "itm_plumbing",
+        message: "SLICE (item_id=itm_plumbing): repair the brief",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.equal(state.prompts.length, 1);
+    assert.match(state.prompts[0]!, /`integration`/);
+    assert.doesNotMatch(state.prompts[0]!, /rebase onto `main`/);
+    // The rules that three workers never received, now carried by the prompt.
+    assert.match(state.prompts[0]!, /\/proc\/loadavg/);
+    assert.match(state.prompts[0]!, /not evidence/i);
+    // And what makes a command qualified travels with them. Without this the
+    // spawned brief still defers to a repo doc that pins an unqualified
+    // command, which is how the rule handed the violation back as a receipt.
+    assert.match(state.prompts[0]!, /however authoritative/i);
+  });
+
+  it("cuts a worker from the root's branch even when the root names no merge base", async () => {
+    // Regression guard against "harmonizing" this with integrateWorker's
+    // mergeBaseBranch-first order. The live root environment measures
+    // branch_name=integration, merge_base_branch=NULL, default_branch=main, so
+    // reading mergeBaseBranch first resolves to null and puts every worker on
+    // the project default — `main`, the passive upstream tracker at 748d686.
+    const state = collabHost({ rootBranch: "integration" });
+    const collab = createCollabStore(state.host.bb, { claimItem: () => "itm_base" });
+    collab.registerTools();
+
+    await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "cut_from_base",
+        item_id: "itm_base",
+        message: "SLICE (item_id=itm_base): build on integrated work",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    const spawn = state.spawnArgs()[0] as {
+      environment?: { workspace?: { baseBranch?: { kind?: string; name?: string } } };
+    };
+    assert.equal(spawn?.environment?.workspace?.baseBranch?.kind, "named");
+    assert.equal(spawn?.environment?.workspace?.baseBranch?.name, "integration");
+  });
+
+  it("refuses to staff a slice when a root environment names no branch", async () => {
+    // The plumbing must fail closed the same way the brief now tells the worker
+    // to. `{ kind: "default" }` here yields a worktree with
+    // merge_base_branch=NULL, and integrateWorker then falls through to
+    // default_branch and squash-merges the slice into the upstream tracker.
+    const state = collabHost({ rootEnvWithoutBranch: true });
+    const collab = createCollabStore(state.host.bb, { claimItem: () => "itm_nobase" });
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "no_base",
+        item_id: "itm_nobase",
+        message: "SLICE (item_id=itm_nobase): work with nowhere to land",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.match(JSON.stringify(result), /names no integration branch/);
+    assert.equal(state.spawnCalls(), 0);
   });
 
   it("keeps structured item evidence available after the reporting row retires", () => {

@@ -25,9 +25,25 @@ const MAX_BLOCKED_ITEMS = 12;
 const MAX_ACTIVE_AGENTS = 12;
 const MAX_AGENT_SECTION_CHARS = 1_400;
 
-/** The generalized engineering quality bar injected into every worker brief. */
-export function workerQualityBrief(): string {
-  return WORKER_BRIEF.trim();
+/**
+ * The generalized engineering quality bar injected into every worker brief.
+ *
+ * `integrationBranch` is the branch the goal's slices are squash-merged into,
+ * resolved from the root thread's environment. It is interpolated rather than
+ * written into the template because the template used to say `main`, and `main`
+ * is not universally the base: in omegacode it is a passive upstream tracker
+ * and the maintained base is `integration`. Two workers were aimed at it; both
+ * were careful enough to refuse, and the third would have rebased a factory
+ * candidate onto unrelated history, surfacing much later as an unexplained
+ * conflict. When the environment cannot be read the brief says so and sends the
+ * worker to look the branch up — a guessed branch name is the failure itself.
+ */
+export function workerQualityBrief(integrationBranch: string | null): string {
+  const named = (integrationBranch ?? "").trim();
+  const baseBranch = named
+    ? `This goal's integration branch is the LOCAL ref \`${named}\` — rebase onto that exact name (your worktree shares the project checkout's refs), and onto no other, however the repository's default branch is named.`
+    : "This goal's integration branch could not be read from its environment: resolve it from the repo's agent docs or this goal's standing rules before you rebase, and never assume `main` — in some repositories `main` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it, which is why this name is normally resolved for you. If those sources do not name it, call slice_blocked rather than rebase onto a guess.";
+  return render(WORKER_BRIEF.trim(), { base_branch: baseBranch });
 }
 
 function escapeXml(input: string): string {

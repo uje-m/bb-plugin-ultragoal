@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+- The worker brief names the goal's real integration branch instead of the
+  literal `main`, resolved from the root thread's environment (the same value
+  the worker's worktree is cut from, so the rebase target and the base branch
+  can no longer disagree). When the environment cannot be read the brief tells
+  the worker to look the branch up and to call `slice_blocked` rather than
+  guess. (Field case: in omegacode `main` is a passive upstream tracker at
+  748d686 and `integration` is the maintained base. Two workers were aimed at
+  `main`; one hit a conflict and aborted, one recognised the trap and declined.
+  A third, less careful, would have rebased a factory candidate onto unrelated
+  upstream history, surfacing much later as an unexplained conflict.)
+- The brief makes the gate battery fail closed, and gives it a host-load
+  precondition. The worker must ESTABLISH the qualified command — from the
+  goal's standing rules or the repo's agent docs — before citing any run as
+  evidence, and then run it verbatim, every scheduling flag included. Where
+  neither names one the command is simply not established: a bare `npm
+  test`, or any shortened default-scheduling substitute, is still not
+  evidence and must never be cited as one, and the worker reports the gap
+  and rests on the gates it could establish. Qualification is judged on the
+  command's own flags and not on the authority of the doc that named it: one
+  that forks a process per CPU and carries no scheduling limit lands in the
+  not-established arm instead of being handed back as a receipt, and where
+  that absent limit is the only defect — in a pinned command, or in the
+  repo's own test script when no doc pins one — the worker qualifies it
+  itself, same scope and nothing dropped, and says so in its evidence.
+  Without that arm the rule is fail-silent rather than fail-closed: a repo
+  whose script is otherwise right could cite no test receipt at all, and a
+  gate nobody may cite is a gate nobody runs. The earlier conditional
+  phrasing was itself the hole — omegacode's own CLAUDE.md pins the
+  unqualified `npm test`, so deferring to repo docs resolved straight back
+  to the violation, and a rule keyed on whether a source names A command
+  rather than a QUALIFIED one inherited exactly the same wrongness one
+  sentence later. Separately, before a run that forks a process per CPU the
+  worker reads `/proc/loadavg` and does not start above ~12; that threshold
+  is scoped to parallel batteries, since this host idles around 20-30 and a
+  rule that also covered a three-second single-process suite would be
+  ignored within a day. (Field case: three workers ran a bare `npm test`
+  because the qualified battery lived only in the orchestrator's head, and
+  on 2026-09-14 three simultaneous batteries drove the host to loadavg 95.6
+  with 64 concurrent `node --test` processes, starving a live Prove-phase
+  battery for 29 minutes.)
+- Staffing fails closed when the goal's base cannot be named. A root thread
+  that has an environment but no resolvable branch now refuses the spawn
+  instead of cutting the worker from the project default. Measured: a worker
+  cut from `default` carries merge_base_branch=NULL and default_branch=main, so
+  integrateWorker falls through to default_branch and squash-merges the slice
+  into `main` — the passive upstream tracker at 748d686, not the base. The
+  consumer half of that path is filed separately; this closes the producer.
+- The root environment's branchName is read BEFORE its mergeBaseBranch, and
+  that order is now pinned by a test and explained where it is read. The live
+  root record measures branch_name=integration, merge_base_branch=NULL,
+  default_branch=main; reading mergeBaseBranch first resolves to null there and
+  would put every worker on the upstream tracker. integrateWorker's opposite
+  order is not a contradiction — it reads the WORKER's environment, whose
+  mergeBaseBranch bb populates from the named base the spawn requests
+  (measured: merge_base_branch=integration on every worker env). The comment
+  that claimed integrateWorker reads the root environment and falls back to
+  "its checked-out branch" was wrong on both counts and is replaced with the
+  measured values.
+- The exact command still has no home the plugin may populate on its own:
+  standing rules are pane-authored by design (`server-tools.test.ts` — "lets
+  only the pane RPC write standing worker rules"), and a per-item `check` is
+  agent-authored and deliberately kept out of worker prompts. The fail-closed
+  wording is what covers the interval.
+
 ## 0.28.0
 
 - Repository mutation is explicit per goal and off by default. Automatic

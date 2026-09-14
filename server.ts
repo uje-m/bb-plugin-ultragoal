@@ -3451,6 +3451,16 @@ export default function plugin(bb: BbPluginApi) {
       deps: z.array(z.string()).optional().describe("item_ids this slice must wait for."),
     }),
     async execute({ step, files, check, deps }, { threadId }) {
+      // Verifiers share the worker tool list but are briefed never to rewrite
+      // the parent plan, so the role gate lives here - the same chokepoint
+      // slice_done and slice_blocked use. Intake holds no slice at all, so a
+      // row/item_id check would lock out the caller this tool exists for.
+      if (collab.rowOf(threadId)?.role === "verifier") {
+        return {
+          content: [{ type: "text", text: "add_slice is for goal workers and intake, not verifiers" }],
+          isError: true,
+        };
+      }
       const rootThreadId = collab.rootId(threadId);
       const goal = store.get(rootThreadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
@@ -3837,7 +3847,7 @@ export default function plugin(bb: BbPluginApi) {
         ? withStandingBrief(worker, workerBriefs.get(goal.threadId))
         : worker;
       return {
-        tools: [...COLLAB_TOOL_NAMES, "slice_done", "slice_blocked", "report_finding", "resolve_finding", "request_decision"],
+        tools: [...COLLAB_TOOL_NAMES, "slice_done", "slice_blocked", "add_slice", "report_finding", "resolve_finding", "request_decision"],
         skills: [],
         instructions: briefed,
       };

@@ -16,20 +16,32 @@
   precondition. The worker must ESTABLISH the qualified command — from the
   goal's standing rules or the repo's agent docs — before citing any run as
   evidence, and then run it verbatim, every scheduling flag included. Where
-  neither names one the command is simply not established: a bare `npm test`,
-  or any shortened default-scheduling substitute, is still not evidence and
-  must never be cited as one, and the worker reports the gap and rests on the
-  gates it could establish. The earlier conditional phrasing was itself the
-  hole — omegacode's own CLAUDE.md pins the unqualified `npm test`, so
-  deferring to repo docs resolved straight back to the violation. Separately,
-  before a run that forks a process per CPU the worker reads `/proc/loadavg`
-  and does not start above ~12; that threshold is scoped to parallel batteries,
-  since this host idles around 20-30 and a rule that also covered a
-  three-second single-process suite would be ignored within a day. (Field
-  case: three workers ran a bare `npm test` because the qualified battery
-  lived only in the orchestrator's head, and on 2026-09-14 three simultaneous
-  batteries drove the host to loadavg 95.6 with 64 concurrent `node --test`
-  processes, starving a live Prove-phase battery for 29 minutes.)
+  neither names one the command is simply not established: a bare `npm
+  test`, or any shortened default-scheduling substitute, is still not
+  evidence and must never be cited as one, and the worker reports the gap
+  and rests on the gates it could establish. Qualification is judged on the
+  command's own flags and not on the authority of the doc that named it: one
+  that forks a process per CPU and carries no scheduling limit lands in the
+  not-established arm instead of being handed back as a receipt, and where
+  that absent limit is the only defect — in a pinned command, or in the
+  repo's own test script when no doc pins one — the worker qualifies it
+  itself, same scope and nothing dropped, and says so in its evidence.
+  Without that arm the rule is fail-silent rather than fail-closed: a repo
+  whose script is otherwise right could cite no test receipt at all, and a
+  gate nobody may cite is a gate nobody runs. The earlier conditional
+  phrasing was itself the hole — omegacode's own CLAUDE.md pins the
+  unqualified `npm test`, so deferring to repo docs resolved straight back
+  to the violation, and a rule keyed on whether a source names A command
+  rather than a QUALIFIED one inherited exactly the same wrongness one
+  sentence later. Separately, before a run that forks a process per CPU the
+  worker reads `/proc/loadavg` and does not start above ~12; that threshold
+  is scoped to parallel batteries, since this host idles around 20-30 and a
+  rule that also covered a three-second single-process suite would be
+  ignored within a day. (Field case: three workers ran a bare `npm test`
+  because the qualified battery lived only in the orchestrator's head, and
+  on 2026-09-14 three simultaneous batteries drove the host to loadavg 95.6
+  with 64 concurrent `node --test` processes, starving a live Prove-phase
+  battery for 29 minutes.)
 - Staffing fails closed when the goal's base cannot be named. A root thread
   that has an environment but no resolvable branch now refuses the spawn
   instead of cutting the worker from the project default. Measured: a worker

@@ -316,6 +316,10 @@ describe("scheduler-strict collaboration spawns", () => {
     // The rules that three workers never received, now carried by the prompt.
     assert.match(state.prompts[0]!, /\/proc\/loadavg/);
     assert.match(state.prompts[0]!, /not evidence/i);
+    // And what makes a command qualified travels with them. Without this the
+    // spawned brief still defers to a repo doc that pins an unqualified
+    // command, which is how the rule handed the violation back as a receipt.
+    assert.match(state.prompts[0]!, /however authoritative/i);
   });
 
   it("cuts a worker from the root's branch even when the root names no merge base", async () => {

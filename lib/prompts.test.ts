@@ -95,4 +95,32 @@ describe("worker quality brief plumbing", () => {
     // would be ignored within a day, taking the rule that matters with it.
     assert.match(brief, /process per CPU/);
   });
+
+  it("judges a command by its own flags, not by the authority that named it", () => {
+    // The residual half of the same hole. The rule delegates to the repo's
+    // agent docs, and omegacode's CLAUDE.md pins `npm test` with no scheduling
+    // limit — so "run the one the docs name, verbatim" hands the violating
+    // command back as a receipt and the fail-closed arm is never reached. A
+    // rule that delegates to a source inherits that source's wrongness unless
+    // it also says what makes a command qualified.
+    const brief = workerQualityBrief("integration");
+    assert.match(brief, /forks a process per CPU and names no scheduling limit/);
+    assert.match(brief, /however authoritative/i);
+    // The fail-closed arm has to be reachable when a source DID name one.
+    assert.match(brief, /cannot be repaired that way/);
+  });
+
+  it("lets a worker add the absent scheduling limit rather than stall on it", () => {
+    // The arm the rule above creates. A repo whose only defect is the missing
+    // limit — its script already covers the right scope — could otherwise
+    // produce no test receipt at all, and a fail-closed rule that forbids
+    // every run quietly becomes a fail-silent one: no gate is ever cited and
+    // nobody notices it stopped being run.
+    const brief = workerQualityBrief("integration");
+    assert.match(brief, /qualify it yourself/);
+    // Self-qualification adds the limit; it never trims the battery, which is
+    // the shortened substitute the same paragraph forbids two sentences on.
+    assert.match(brief, /same scope/);
+    assert.match(brief, /nothing dropped/);
+  });
 });

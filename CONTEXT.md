@@ -24,6 +24,22 @@ _Avoid_: Actual selection, echoed arguments
 An execution fact explicitly emitted by the provider, such as a model fallback.
 _Avoid_: Requested value, inferred actual value
 
+**Execution revision**:
+The identity of one committed execution configuration that orders settings changes against child dispatch.
+_Avoid_: Worker generation, display version
+
+**Launch intent**:
+The durable declaration of the execution revision and effective selection that one child dispatch must use.
+_Avoid_: Spawn arguments, assignment
+
+**Execution drift**:
+A present canonical request or provider-reported value that contradicts the launch intent. Missing evidence is unavailable, not drift.
+_Avoid_: Unknown execution, inherited change
+
+**Launching unconfirmed**:
+A dispatched launch intent for which the provider has not yet emitted matching acceptance.
+_Avoid_: Assignment, launch blocked
+
 ## Ownership and recovery
 
 **Assignment**:

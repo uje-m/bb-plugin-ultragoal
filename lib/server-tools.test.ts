@@ -283,6 +283,73 @@ describe("large-plan agent tool contracts", () => {
     assert.match(configured.instructions ?? "", /canonical ultragoal_\* controls/);
   });
 
+  it("reaches intake with add_slice and keeps verifiers off the plan", async () => {
+    const host = registeredHost();
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id='thr_slice_root', status='active', max_workers=4 WHERE thread_id='thr_sentinel'",
+    ).run();
+    // Intake is a goal-tree child holding no slice of its own, so the worker
+    // branch of bb.agents.configure is the only surface that can reach it. The
+    // plugin's own intake prompt orders one add_slice call per owner feature
+    // request: registering the tool without exposing it there drops every such
+    // request silently, with no error anywhere.
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_slice_intake', 'thr_slice_root', 'thr_slice_root', '/root/intake', 1,
+        'Intake Courier', NULL, 'worker')
+    `).run();
+    const intake = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", "thr_slice_intake"),
+    );
+    assert.ok(
+      intake.tools.map((tool) => tool.name).includes("add_slice"),
+      "intake and workers must be able to file the slice their brief demands",
+    );
+
+    const items = createItemStore(host.bb);
+    const filed = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "Owner request: surface the plan filter in the UltraGoal pane." },
+      { threadId: "thr_slice_intake" },
+    );
+    assert.equal(isToolError(filed), false);
+    assert.deepEqual(
+      items.list("thr_slice_root").map((item) => item.step),
+      ["Owner request: surface the plan filter in the UltraGoal pane."],
+    );
+
+    // Verifiers share the worker tool list, and their brief forbids rewriting
+    // the parent plan, so the role gate has to live in execute like
+    // slice_done's - exposure alone would hand plan writes to a verifier.
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_slice_verifier', 'thr_slice_root', 'thr_slice_root', '/root/verifier', 2,
+        'Verifier', NULL, 'verifier')
+    `).run();
+    const refused = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "A verifier must never be able to append plan work." },
+      { threadId: "thr_slice_verifier" },
+    );
+    assert.equal(isToolError(refused), true);
+    assert.equal(items.list("thr_slice_root").length, 1, "a verifier write must not reach the plan");
+
+    // The root plans through ultragoal_patch; a second plan-mutation surface
+    // there would be a parallel source of truth for the same table.
+    const root = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", "thr_slice_root"),
+    );
+    assert.ok(
+      !root.tools.map((tool) => tool.name).includes("add_slice"),
+      "the root must keep ultragoal_patch as its only plan-mutation surface",
+    );
+  });
+
   it("audits stale finding links on the first startup pulse", async () => {
     const host = registeredHost();
     const db = host.bb.storage.database();

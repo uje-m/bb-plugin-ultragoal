@@ -283,6 +283,134 @@ describe("large-plan agent tool contracts", () => {
     assert.match(configured.instructions ?? "", /canonical ultragoal_\* controls/);
   });
 
+  it("staffs intake with add_slice so an owner request lands, and keeps verifiers off the plan", async () => {
+    let rows: Array<Record<string, unknown>> = [];
+    let spawnedPrompt = "";
+    let spawnedThreadId = "";
+    const host = registeredHost({
+      threads: {
+        get: ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "codex",
+            environmentId: null,
+            parentThreadId: threadId === "thr_intake_root" ? null : "thr_intake_root",
+            status: "active",
+          }),
+        list: () => [],
+        timeline: ({ threadId }) => ({
+          rows: threadId === "thr_intake_root" ? rows : [],
+        }),
+        spawn: (args) => {
+          spawnedPrompt = args.prompt ?? "";
+          spawnedThreadId = `thr_intake_${host.harness.sdk.callsTo("threads.spawn").length}`;
+          return makeThreadResponse({
+            id: spawnedThreadId,
+            projectId: "proj",
+            providerId: "codex",
+            environmentId: null,
+            parentThreadId: "thr_intake_root",
+            status: "active",
+          });
+        },
+        output: () => ({
+          output: null,
+        }),
+        stop: () => ({ ok: true }),
+        update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        interactions: { list: async () => [], resolve: async () => ({}) },
+      },
+    });
+    host.bb.storage.database().prepare(
+      "UPDATE goals SET thread_id = 'thr_intake_root', status = 'active' WHERE thread_id = 'thr_sentinel'",
+    ).run();
+    const items = createItemStore(host.bb);
+    const settle = async () => {
+      for (let index = 0; index < 20; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+
+    // The first owner message only baselines the durable intake cursor.
+    rows = [{ kind: "conversation", role: "user", id: "row_1", text: "kick off" }];
+    await host.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: "thr_intake_root", status: "active" }),
+    });
+    await settle();
+    assert.equal(spawnedThreadId, "", "baselining must not staff an intake courier");
+
+    rows = [
+      ...rows,
+      {
+        kind: "conversation",
+        role: "user",
+        id: "row_2",
+        text: "Owner request: add the /to-tickets plan to the PWA work",
+      },
+    ];
+    await host.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: "thr_intake_root", status: "active" }),
+    });
+    await settle();
+
+    // A feature request is filed by the courier the plugin spawns for it, so
+    // the courier's resolved tool set must carry every tool its brief names:
+    // registering add_slice without exposing it here drops each owner request
+    // with no error anywhere.
+    assert.notEqual(spawnedThreadId, "", "an owner request must staff an intake courier");
+    assert.match(spawnedPrompt, /add_slice call/);
+    const intake = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", spawnedThreadId),
+    );
+    assert.ok(
+      intake.tools.map((tool) => tool.name).includes("add_slice"),
+      "the intake brief orders add_slice, so the courier must be able to call it",
+    );
+
+    const filed = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "Owner request: add the /to-tickets plan to the PWA work" },
+      { threadId: spawnedThreadId },
+    );
+    assert.equal(isToolError(filed), false);
+    assert.deepEqual(
+      items.list("thr_intake_root").map((item) => item.step),
+      ["Owner request: add the /to-tickets plan to the PWA work"],
+    );
+
+    // Verifiers share the worker tool list and are briefed never to rewrite
+    // the parent plan, so the role gate lives in execute, next to slice_done's.
+    host.bb.storage.database().prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_intake_verifier', 'thr_intake_root', 'thr_intake_root', '/root/verifier', 2,
+        'Verifier', NULL, 'verifier')
+    `).run();
+    const refused = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "A verifier must never be able to append plan work." },
+      { threadId: "thr_intake_verifier" },
+    );
+    assert.equal(isToolError(refused), true);
+    assert.equal(items.list("thr_intake_root").length, 1, "a verifier write must not reach the plan");
+
+    // The root plans through ultragoal_patch; a second plan-mutation surface
+    // there would be a parallel source of truth for the same table.
+    const root = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", "thr_intake_root"),
+    );
+    assert.ok(
+      !root.tools.map((tool) => tool.name).includes("add_slice"),
+      "the root must keep ultragoal_patch as its only plan-mutation surface",
+    );
+
+    // add_slice publishes and kicks the scheduler on a floating promise; drain
+    // it here so the fake host is not disposed under a live database write.
+    await settle();
+  });
+
   it("audits stale finding links on the first startup pulse", async () => {
     const host = registeredHost();
     const db = host.bb.storage.database();

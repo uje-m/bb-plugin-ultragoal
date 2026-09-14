@@ -1350,9 +1350,31 @@ export default function plugin(bb: BbPluginApi) {
       strandedBranch = environment.branchName ?? null;
       integrationCheckout = (environment as { path?: string | null }).path ?? null;
       integrationHostId = (environment as { hostId?: string | null }).hostId ?? null;
-      const base =
-        environment.mergeBaseBranch ?? environment.defaultBranch ?? environment.baseBranch;
-      if (!base) return;
+      // Merge into the branch the environment DECLARES, or into nothing.
+      // `defaultBranch` describes the project and `baseBranch` records where
+      // the worktree was cut from; neither is a statement about where this
+      // goal's work belongs. Measured on this host: of the managed worktree
+      // environments carrying no mergeBaseBranch, 100 have a defaultBranch that
+      // differs from their own baseBranch — 47 of them `main` against
+      // `integration`, which on the repository this plugin runs is the passive
+      // upstream tracker versus the maintained base — and base_branch values
+      // include `origin/main` and bare SHAs, which are not merge targets at
+      // all. So the old fallback chain did not degrade gracefully; it picked a
+      // plausible-looking wrong branch and reported success. Refusing strands
+      // one branch for a human; guessing writes the slice onto unrelated
+      // history and surfaces months later as an unexplained conflict.
+      //
+      // This throws rather than returning so the refusal lands on the ONE
+      // stranded-work path below: the register records it, the closed defects
+      // reopen, and the root is steered. A quiet `return` here is what made the
+      // bad merge invisible, and a second recording site here would be a second
+      // source of truth for "this slice did not land".
+      const base = environment.mergeBaseBranch;
+      if (!base) {
+        throw new Error(
+          `environment ${worker.environmentId} declares no mergeBaseBranch, so this slice has no merge base to squash into; its branch is left intact for a human to land`,
+        );
+      }
       integrationBase = base;
       await bb.sdk.environments.squashMerge({
         environmentId: worker.environmentId,
@@ -1478,7 +1500,7 @@ export default function plugin(bb: BbPluginApi) {
       integrationSteerAt.set(rootThreadId, Date.now());
       await sendSteering(
         rootThreadId,
-        `INTEGRATION CONFLICT: completed slice ${itemId} (worker ${workerThreadId}) could not be squash-merged into the default branch automatically: ${message}. Merge that worker's branch manually and run the repository gates before anything else. Remote publication is a separate user-authorized action.`,
+        `INTEGRATION CONFLICT: completed slice ${itemId} (worker ${workerThreadId}) could not be squash-merged into ${integrationBase ?? "its base branch"} automatically: ${message}. Merge that worker's branch manually and run the repository gates before anything else. Remote publication is a separate user-authorized action.`,
         "steer",
       );
     }

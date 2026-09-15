@@ -40,6 +40,7 @@ import {
 } from "./lib/finding-brief.js";
 import { workRelatedName } from "./lib/names.js";
 import { createItemStore, type ItemStore } from "./lib/items.js";
+import { createItemReservationStore } from "./lib/item-reservations.js";
 import {
   forgetNativeScan,
   hasPendingNativeTasks,
@@ -66,7 +67,6 @@ import {
   ownSliceScope,
   retirementPermittedByHost,
   liveVerifierCount,
-  occupyingWorkerIds,
   orphanInProgressIds,
   isTransientTurnFailure,
   isTurnAlreadyActiveError,
@@ -244,6 +244,76 @@ let snapshotDefaults: GoalSettingDefaults = {
   shareWorktreeNodeModules: true,
 };
 
+/**
+ * A host read that failed because the thread is definitively GONE (code
+ * `thread_not_found`), as opposed to any other failed read, on which the caller
+ * must keep failing closed.
+ *
+ * Duck-typed on purpose: the plugin's SDK client and the server's own error are
+ * two bundles with two class identities, so neither `instanceof` nor the class
+ * name crosses that boundary. The message is never matched either — the server
+ * answers a different 404 with the same "Thread not found" text under the code
+ * `invalid_request`, so a text test would treat a bad request as missing work.
+ *
+ * The CODE is what names the thread's absence, and a status that disagrees with
+ * it is not evidence of absence: a 404 carrying some other code is a request
+ * problem, and a `thread_not_found` behind a 500 came from a failing read, not a
+ * missing thread. Retiring on either would stop a worker that is still there, so
+ * they fail closed. A missing status is allowed because the in-process
+ * `ApiError` always carries one and the code alone is already definitive.
+ */
+export function threadIsGone(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const { status, code, body } = error as {
+    status?: unknown;
+    code?: unknown;
+    body?: unknown;
+  };
+  const bodyCode =
+    body !== null && typeof body === "object"
+      ? (body as { code?: unknown }).code
+      : undefined;
+  if (code !== "thread_not_found" && bodyCode !== "thread_not_found") return false;
+  return status === undefined || status === 404;
+}
+
+/**
+ * Durable worker rows the retirement sweep must consider, read from the durable
+ * rows rather than from the projected crew: the projection drops every worker
+ * whose slice is closed and every worker it cannot read, which is exactly the
+ * set being collected here.
+ *
+ * A row holds a capacity slot while belonging to no open slice in two ways —
+ * a finished worker whose slice is closed or gone from the plan
+ * ({@link finishedWorkerRetirementCandidates}), and a row with no item at all,
+ * which is how intake couriers and discovered children are created by design.
+ * Nothing item-keyed can ever retire the second kind, so on a cap-10 goal five
+ * of them halved effective capacity and the fence admitted nothing.
+ *
+ * Being a candidate is not a decision: the caller confirms each row's host and
+ * still refuses to retire anything that reads as live.
+ */
+export function retirementCandidates(
+  rootThreadId: string,
+  rows: readonly { threadId: string; itemId: string | null; role: string | null }[],
+  items: readonly Pick<GoalItem, "id" | "status">[],
+  hasLiveVerifier: (workerThreadId: string) => boolean,
+): string[] {
+  // A row for the root itself is never a worker to retire, whatever it holds.
+  const workers = rows.filter((row) => row.threadId !== rootThreadId);
+  const itemless = workers
+    .filter(
+      (row) => row.role !== "verifier" && !row.itemId && !hasLiveVerifier(row.threadId),
+    )
+    .map((row) => row.threadId);
+  return [
+    ...new Set([
+      ...finishedWorkerRetirementCandidates(workers, items, hasLiveVerifier),
+      ...itemless,
+    ]),
+  ];
+}
+
 export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoContinue: {
@@ -395,6 +465,12 @@ export default function plugin(bb: BbPluginApi) {
   const itemRequirements = createItemRequirementStore(bb.storage.database());
   const staffingHolds = createStaffingHoldStore(bb.storage.database());
   const integrations = createIntegrationRecordStore(bb.storage.database());
+  // The scheduler's slot math and the capacity fence must share ONE unit of
+  // account: the durable rows plus live reservations `acquire` counts. A second
+  // handle onto the same store is safe — all of its state is in SQLite, not in
+  // the store object — and it lets scheduleReady read the fence directly
+  // instead of projecting the crew.
+  const reservations = createItemReservationStore(bb.storage.database());
 
   const collab = createCollabStore(bb, {
     onChange: (rootThreadId) => {
@@ -915,8 +991,14 @@ export default function plugin(bb: BbPluginApi) {
       const openItemIds = new Set(
         list.filter((item) => item.status !== "completed").map((item) => item.id),
       );
-      const occupied = occupyingWorkerIds(agents, openItemIds);
-      let slots = freeSlots(maxWorkers, occupied.length);
+      // Plan against the fence's unit of account, never against the projected
+      // crew. `acquire` and the capacity triggers count every durable row plus
+      // every live reservation; a planner that counted fewer — the projection
+      // drops item-less rows whose host is not live — asked for spawns the
+      // fence refused, and STAFF_RETRY_MS turned each refusal into a five-minute
+      // penalty box per ready slice. The retirement sweep in healStalls owns the
+      // rows this count includes and the projection does not.
+      let slots = freeSlots(maxWorkers, reservations.occupancy(rootThreadId));
       if (slots <= 0) return;
       const completedIds = new Set(
         list.filter((item) => item.status === "completed").map((item) => item.id),
@@ -1569,33 +1651,40 @@ export default function plugin(bb: BbPluginApi) {
           .filter((agent) => agent.status === "running" || agent.status === "starting")
           .map((agent) => agent.threadId),
       );
-      const candidates = finishedWorkerRetirementCandidates(
-        collab.durableRowsForRoot(rootThreadId).filter((row) => row.threadId !== rootThreadId),
+      const candidates = retirementCandidates(
+        rootThreadId,
+        collab.durableRowsForRoot(rootThreadId),
         plannedItems,
-        (workerThreadId) => verifierStillDeciding(
-          collab.verifiersFor(workerThreadId).map((row) => ({
-            threadId: row.thread_id,
-            createdAt: row.created_at,
-            reportStatus: row.report_status ?? null,
-          })),
-          (verifierThreadId) => liveHosts.has(verifierThreadId),
-          now,
-          RESCUE_AFTER_MS,
-        ),
+        (workerThreadId) =>
+          verifierStillDeciding(
+            collab.verifiersFor(workerThreadId).map((row) => ({
+              threadId: row.thread_id,
+              createdAt: row.created_at,
+              reportStatus: row.report_status ?? null,
+            })),
+            (verifierThreadId) => liveHosts.has(verifierThreadId),
+            now,
+            RESCUE_AFTER_MS,
+          ),
       );
       const retired = new Set<string>();
       for (const workerThreadId of candidates) {
         // Confirm each candidate's host directly. The in-memory projection
         // cannot answer this: it drops exactly these workers, so absence there
         // means "unknown", not "dead". Retiring on unknown would stop a live
-        // worker whenever a single host read failed transiently.
-        let hostStatus: string | null = null;
+        // worker whenever a single host read failed transiently — but a thread
+        // the host has FORGOTTEN is not unknown. It is gone, and failing closed
+        // on that 404 is how two of them held capacity slots on thr_ud7k5xhiud
+        // forever: the sweep re-confirmed, skipped, and re-confirmed again.
+        let hostLabel: string;
         try {
-          hostStatus = (await bb.sdk.threads.get({ threadId: workerThreadId })).status ?? null;
-        } catch {
-          continue;
+          const status = (await bb.sdk.threads.get({ threadId: workerThreadId })).status ?? null;
+          if (!retirementPermittedByHost(status)) continue;
+          hostLabel = status ?? "unknown";
+        } catch (error) {
+          if (!threadIsGone(error)) continue;
+          hostLabel = "gone";
         }
-        if (!retirementPermittedByHost(hostStatus)) continue;
         collab.forget(workerThreadId);
         firstSeenIdle.delete(workerThreadId);
         retired.add(workerThreadId);
@@ -1610,7 +1699,7 @@ export default function plugin(bb: BbPluginApi) {
           .archive({ threadId: workerThreadId })
           .catch(() => undefined);
         bb.log.info(
-          `Retired finished worker ${workerThreadId} on ${rootThreadId} (host ${hostStatus}): its slice is closed; released its scheduler slot`,
+          `Retired finished worker ${workerThreadId} on ${rootThreadId} (host ${hostLabel}): its slice is closed; released its scheduler slot`,
         );
       }
 
@@ -2315,34 +2404,66 @@ export default function plugin(bb: BbPluginApi) {
     if (!latest || !latest.id) return;
     const seen = goal.intakeRowId;
     if (seen === latest.id) return;
-    store.setIntakeRow(rootThreadId, latest.id);
     // First-ever sighting for this goal baselines without replaying history;
     // the cursor is durable, so a plugin reload never skips a message again.
-    if (seen === null) return;
-    if (parseSlashGoal(latest.text)) return;
-    const result = await collab.spawnWorker({
-      parentThreadId: rootThreadId,
-      itemId: null,
-      maxWorkers: view(goal).settings.maxWorkers,
-      skipClaim: true,
-      // Fixed name: the slug must start with intake_ so idle cleanup matches.
-      displayName: "Intake Courier",
-      message: [
-        "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
-        "The goal owner just sent the message below to the goal thread. File every actionable item through the formal tools:",
-        "- Each DEFECT they describe: one report_finding call (title = the defect in one sentence; file = the best area path you can determine by reading the repo read-only; evidence = the owner's words plus any quick read-only verification). Duplicates are fingerprint-deduped — file without fear.",
-        "- Each FEATURE/UX request: one add_slice call (step starts 'Owner UX:' or 'Owner request:', self-contained, narrow or empty files).",
-        "- Questions or decisions only the owner can answer are NOT yours to file; skip them.",
-        "If nothing is actionable, do nothing. End your turn when filing is complete — do not call slice_done (you hold no slice), do not implement fixes, do not message anyone.",
-        "OWNER MESSAGE:",
-        latest.text,
-      ].join("\n\n"),
-    });
+    if (seen === null) {
+      store.setIntakeRow(rootThreadId, latest.id);
+      return;
+    }
+    if (parseSlashGoal(latest.text)) {
+      store.setIntakeRow(rootThreadId, latest.id);
+      return;
+    }
+    const maxWorkers = view(goal).settings.maxWorkers;
+    const occupancy = reservations.occupancy(rootThreadId);
+    // The fence counts every durable row, so a full root refuses the courier's
+    // insert AFTER its child thread exists — leaving an orphan with no row. Read
+    // the fence first: a full root then costs a log line, and the owner's
+    // message stays queued for the next pass instead of being dropped.
+    if (occupancy >= maxWorkers) {
+      bb.log.warn(
+        `Intake on ${rootThreadId} deferred: root worker capacity is full (${occupancy}/${maxWorkers}); the owner message stays queued`,
+      );
+      return;
+    }
+    // The cursor advances only once the courier exists. Advancing it first is
+    // how an owner's message was dropped for good: the spawn is exactly what can
+    // fail (the capacity fence refuses a full root), and a cursor already past
+    // the message means no later pass ever retries it.
+    let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
+    try {
+      result = await collab.spawnWorker({
+        parentThreadId: rootThreadId,
+        itemId: null,
+        maxWorkers,
+        skipClaim: true,
+        // Fixed name: the slug must start with intake_ so idle cleanup matches.
+        displayName: "Intake Courier",
+        message: [
+          "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
+          "The goal owner just sent the message below to the goal thread. File every actionable item through the formal tools:",
+          "- Each DEFECT they describe: one report_finding call (title = the defect in one sentence; file = the best area path you can determine by reading the repo read-only; evidence = the owner's words plus any quick read-only verification). Duplicates are fingerprint-deduped — file without fear.",
+          "- Each FEATURE/UX request: one add_slice call (step starts 'Owner UX:' or 'Owner request:', self-contained, narrow or empty files).",
+          "- Questions or decisions only the owner can answer are NOT yours to file; skip them.",
+          "If nothing is actionable, do nothing. End your turn when filing is complete — do not call slice_done (you hold no slice), do not implement fixes, do not message anyone.",
+          "OWNER MESSAGE:",
+          latest.text,
+        ].join("\n\n"),
+      });
+    } catch (error) {
+      bb.log.warn(
+        `Intake spawn failed on ${rootThreadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
     if ("error" in result) {
       bb.log.warn(`Intake spawn failed on ${rootThreadId}: ${result.error}`);
-    } else {
-      bb.log.info(`Intake ${result.nickname} (${result.threadId}) triaging owner message on ${rootThreadId}`);
+      return;
     }
+    store.setIntakeRow(rootThreadId, latest.id);
+    bb.log.info(`Intake ${result.nickname} (${result.threadId}) triaging owner message on ${rootThreadId}`);
   }
 
   async function nudgeRoot(rootId: string): Promise<void> {
@@ -4033,7 +4154,13 @@ export default function plugin(bb: BbPluginApi) {
     if (rootId && rootId !== thread.id) void publishFresh(rootId);
     const rows = await readTimeline(thread.id);
     await applyUserSlash(thread.id, lastUserText(rows));
-    void maybeIntakeUserMessage(thread.id, rows);
+    void maybeIntakeUserMessage(thread.id, rows).catch((error) => {
+      bb.log.warn(
+        `Intake pass failed on ${thread.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
   });
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {

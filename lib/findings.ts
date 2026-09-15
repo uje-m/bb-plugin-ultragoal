@@ -16,6 +16,8 @@ interface FindingRow {
   resolution_note: string | null;
   fix_files: string | null;
   check_cmd: string | null;
+  /** BB project the FILING thread stood in; null on pre-column rows. */
+  project_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -30,6 +32,12 @@ export interface FindingRegistrationOutcome {
 export interface RemediationFinding extends GoalFinding {
   fixFiles: string[];
   check: string | null;
+  /**
+   * The project the finding was filed from, when the filing thread named one.
+   * Staffing compares it against the project the worker environment is cut
+   * from; null means "unknown", never "elsewhere".
+   */
+  projectId: string | null;
 }
 
 /**
@@ -110,6 +118,7 @@ function rowToRemediation(row: FindingRow): RemediationFinding {
       ? fixFiles
       : [row.file.trim().replace(/[:#]\d+([-:]\d+)?$/, "")].filter(Boolean),
     check: row.check_cmd?.trim() || null,
+    projectId: row.project_id?.trim() || null,
   };
 }
 
@@ -130,10 +139,10 @@ export function createFindingStore(bb: BbPluginApi) {
   const insert = db.prepare(`
     INSERT INTO goal_findings (
       id, thread_id, fingerprint, title, file, evidence, status, item_id,
-      resolution_note, fix_files, check_cmd, created_at, updated_at
+      resolution_note, fix_files, check_cmd, project_id, created_at, updated_at
     ) VALUES (
       @id, @thread_id, @fingerprint, @title, @file, @evidence, @status, @item_id,
-      @resolution_note, @fix_files, @check_cmd, @created_at, @updated_at
+      @resolution_note, @fix_files, @check_cmd, @project_id, @created_at, @updated_at
     )
   `);
   const setStatus = db.prepare(`
@@ -156,7 +165,18 @@ export function createFindingStore(bb: BbPluginApi) {
     /** Records a finding; a repeat fingerprint returns the existing one instead. */
     report(
       threadId: string,
-      input: { title: string; file: string; evidence: string; fixFiles?: string[]; check?: string | null },
+      input: {
+        title: string;
+        file: string;
+        evidence: string;
+        fixFiles?: string[];
+        check?: string | null;
+        /**
+         * Project the filing thread stood in, resolved by the caller from the
+         * host — never from the agent's own description of where it works.
+         */
+        projectId?: string | null;
+      },
     ): { created: boolean; finding: GoalFinding } {
       const fingerprint = fingerprintOf(input.file, input.title);
       const existing = byFingerprint.get(threadId, fingerprint) as FindingRow | undefined;
@@ -177,6 +197,7 @@ export function createFindingStore(bb: BbPluginApi) {
             ? JSON.stringify([...new Set(input.fixFiles.map((file) => file.trim()).filter(Boolean))])
             : null,
         check_cmd: input.check?.trim() || null,
+        project_id: input.projectId?.trim() || null,
         created_at: now,
         updated_at: now,
       };

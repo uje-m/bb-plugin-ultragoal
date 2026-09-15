@@ -442,6 +442,14 @@ export function createGoalStore(bb: BbPluginApi) {
     `ALTER TABLE goals ADD COLUMN auto_integrate_completed_slices INTEGER`,
     `ALTER TABLE goals ADD COLUMN reclaim_merged_worktrees INTEGER`,
     `ALTER TABLE goals ADD COLUMN read_local_provider_data INTEGER`,
+    // Which repository a finding was filed FROM, resolved host-side from the
+    // filing thread and never from the agent's text. Staffing cuts the worker
+    // environment from the GOAL's project, so when a goal spans repositories
+    // the two disagree and the worker is handed a checkout that cannot contain
+    // its scoped files. NULL on every pre-existing row and on rows whose filing
+    // thread named no project: absent provenance is not a mismatch, and reading
+    // it as one would refuse the entire legacy remediation backlog.
+    `ALTER TABLE goal_findings ADD COLUMN project_id TEXT`,
     // `fixed` used to mean "a slice completed and its worker said so", with no
     // landing ever shown. Every row still carrying it predates that distinction,
     // and a reader of the finding alone would take it for a live fix — the exact

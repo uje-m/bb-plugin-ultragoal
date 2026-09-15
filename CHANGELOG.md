@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- A slice is never staffed into a checkout that cannot hold its files. A finding
+  now carries the project its FILING thread stood in — resolved host-side from
+  the thread, never from the agent's `file` text, which is exactly the
+  untrusted input this provenance replaces — and staffing refuses when none of
+  an item's recorded finding projects is the project it is about to cut a
+  worker from. (Field case: a finding filed against this repository was staffed
+  into an omegacode worktree that has no `lib/` directory at all, so the
+  worker's only exits were `slice_blocked`, or creating the file in the wrong
+  repository and reporting done. It reproduced on the very slice filed to fix
+  it.) Absent provenance is never a mismatch: every finding recorded before the
+  column existed, and every orchestrator-minted slice, staffs exactly as
+  before. Beside the refusal — and deliberately NOT a gate — a spawn-time
+  warning names declared paths that do not resolve in the tree being cut.
+  (Measured over 170 live findings: 68 name a path absent from their base
+  branch, but only 8 are wrong-repository — the other 60 are stale bases, so
+  refusing on absence would refuse sixty correct slices to catch eight. The
+  in-plan instance it catches: an item declaring `test/import-closure.test.ts`
+  when the real file is `test/host-only/import-closure.test.ts`.)
+
 - Automatic slice integration merges into the branch the worker environment
   DECLARES, or into nothing. `integrateWorker` used to fall through
   `mergeBaseBranch ?? defaultBranch ?? baseBranch`, so a worker environment that

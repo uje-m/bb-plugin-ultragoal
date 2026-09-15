@@ -1,4 +1,6 @@
 import type { AgentPermissionMode } from "./goal-settings.js";
+import { existsSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { immediateSendMode } from "./scheduler.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { isPromptLikeTitle, shortSliceTitle } from "./titles.js";
@@ -152,7 +154,16 @@ export function createCollabStore(
     itemBrief?: (
       rootThreadId: string,
       itemId: string,
-    ) => { files: string[]; linkedDefects?: string } | null;
+    ) => {
+      files: string[];
+      linkedDefects?: string;
+      /**
+       * Distinct BB projects the item's linked findings were filed from,
+       * captured host-side at filing time. Empty for orchestrator-minted work
+       * and for findings recorded before the column existed.
+       */
+      findingProjectIds?: string[];
+    } | null;
     /**
      * Permission mode for spawned workers. Defaults to "auto" so a worker's
      * risky actions still reach the normal approval gate; an operator raises it
@@ -712,6 +723,26 @@ export function createCollabStore(
         return { error: `An agent named ${taskName} already exists.` };
       }
       const brief = itemId ? hooks?.itemBrief?.(rootThreadId, itemId) ?? null : null;
+      // A finding names a file in the repository its filer was standing in, but
+      // the worker environment below is cut from the GOAL's project. When a goal
+      // spans repositories those are different checkouts, and the mismatch was
+      // silent: a slice scoped to `server.ts` was handed a worktree of a repo
+      // that has never contained a server.ts, where the only remaining exits are
+      // slice_blocked or creating the file in the wrong repository and reporting
+      // done. Refuse instead, but only on recorded provenance that DISAGREES —
+      // findings with no project (pre-column rows, and orchestrator-minted items,
+      // which have no finding at all) are unaffected, so this fails closed on a
+      // proven mismatch and never on missing data.
+      const cutProjectId = parent.projectId ?? args.projectId ?? null;
+      const findingProjectIds = brief?.findingProjectIds ?? [];
+      if (cutProjectId && findingProjectIds.length > 0 && !findingProjectIds.includes(cutProjectId)) {
+        return {
+          error:
+            `Slice ${itemId} was filed against project ${findingProjectIds.join(", ")}, but this goal cuts worker environments from ${cutProjectId}. ` +
+            "Staffing it would hand the worker a checkout that does not contain the scoped files. " +
+            "Move the slice to a goal rooted in the finding's project, or re-file the finding from the repository that should own the fix.",
+        };
+      }
     const briefLines: string[] = [];
     if (brief?.files?.length) {
       briefLines.push(
@@ -751,6 +782,30 @@ export function createCollabStore(
       return {
         error: `Refusing to spawn: root environment ${parent.environmentId} names no integration branch, and a worker cut from the project default would aim its slice at the default branch rather than the goal's base. Set the root thread's branch, then staff again.`,
       };
+    }
+    // A declared path that does not resolve in the tree the worker is about to
+    // be cut from is the signature of the mis-staffing this guard family
+    // exists for: a slice scoped to `server.ts` in a worktree that has no
+    // server.ts, or a row scoped to `test/x.test.ts` when the real file is
+    // `test/host-only/x.test.ts`. Existence is deliberately a WARNING here and
+    // not a gate: of 170 live findings naming a path absent from their base,
+    // only 8 turned out to be filed against another repository — the other 60
+    // are stale bases, and refusing all 68 to catch 8 would refuse sixty
+    // correct slices. The project-keyed refusal above stays the only block;
+    // this one names the paths and staffs anyway, so the worker learns before
+    // it spends a turn discovering the same thing by hand.
+    const staffedTree = (rootEnv as { path?: string | null } | null)?.path ?? null;
+    if (staffedTree && brief?.files?.length) {
+      const missing = brief.files.filter((declared) => {
+        const bare = declared.trim().replace(/[:#]\d+([-:]\d+)?$/, "");
+        if (!bare) return false;
+        return !existsSync(isAbsolute(bare) ? bare : join(staffedTree, bare));
+      });
+      if (missing.length > 0) {
+        bb.log.warn(
+          `Staffing ${itemId ?? taskName} on ${rootThreadId}: declared path(s) absent from the tree being cut (${staffedTree}): ${missing.join(", ")}. If the finding was filed against another repository this scope cannot be satisfied here; check before creating the file.`,
+        );
+      }
     }
     const prompt = [
       trimmed,

@@ -488,6 +488,17 @@ export default function plugin(bb: BbPluginApi) {
       return {
         files: item.files,
         linkedDefects: linkedDefectBrief(rootThreadId, itemId),
+        // Every project the item's open findings were filed from. Staffing
+        // compares these against the project it is about to cut a worker from,
+        // and "none recorded" is not a mismatch — every pre-column row and
+        // every orchestrator-minted item lands here.
+        findingProjectIds: [
+          ...new Set(
+            linkedOpenFindings(rootThreadId, itemId)
+              .map((finding) => finding.projectId)
+              .filter((projectId): projectId is string => Boolean(projectId)),
+          ),
+        ],
       };
     },
     releaseItem(rootThreadId, itemId, reason) {
@@ -3407,6 +3418,20 @@ export default function plugin(bb: BbPluginApi) {
     }
   }
 
+  /**
+   * The project a thread stood in, read from the host. Deliberately NOT a
+   * parameter of any agent-facing tool: a filer's own description of where it
+   * works is exactly the untrusted text this provenance exists to replace.
+   */
+  async function projectOfThread(threadId: string): Promise<string | null> {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return thread.projectId?.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   async function registerFinding(
     rootThreadId: string,
     input: {
@@ -3416,6 +3441,8 @@ export default function plugin(bb: BbPluginApi) {
       fixFiles?: string[];
       check?: string | null;
       ownSlice?: boolean;
+      /** Resolved by the caller from the filing thread, never from tool args. */
+      projectId?: string | null;
     },
   ): Promise<{ created: boolean; findingId: string; fixItemId: string | null; status: string }> {
     const result = findings.report(rootThreadId, {
@@ -3424,6 +3451,7 @@ export default function plugin(bb: BbPluginApi) {
       evidence: input.evidence,
       fixFiles: input.fixFiles,
       check: input.check,
+      projectId: input.projectId,
     });
     if (result.created && input.ownSlice) {
       // An outside auditor filing a proven blocker can demand its own slice.
@@ -3662,6 +3690,7 @@ export default function plugin(bb: BbPluginApi) {
         evidence,
         fixFiles: fix_files,
         check,
+        projectId: await projectOfThread(threadId),
       });
       if (!registered.created) {
         return {
@@ -4447,6 +4476,7 @@ export default function plugin(bb: BbPluginApi) {
         }
         const registered = await registerFinding(threadId, {
           title, file, evidence, fixFiles, check, ownSlice,
+          projectId: await projectOfThread(threadId),
         });
         return {
           exitCode: 0,

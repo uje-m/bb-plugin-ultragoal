@@ -29,6 +29,7 @@ function freshFindings() {
       updated_at INTEGER NOT NULL,
       fix_files TEXT,
       check_cmd TEXT,
+      project_id TEXT,
       UNIQUE(thread_id, fingerprint)
     )
   `);
@@ -220,5 +221,51 @@ describe("a fix that never reached the base branch", () => {
     assert.equal(findings.reopenForFailedIntegration("thr_g", "itm_1", "merge conflict"), 1);
     assert.equal(findings.get("thr_g", rec.finding.id)?.status, "open");
     assert.equal(findings.counts("thr_g").fixed, 0);
+  });
+});
+
+describe("finding project provenance", () => {
+  it("records the filing project and exposes it for staffing", () => {
+    // Staffing cuts the worker environment from the GOAL's project, so it needs
+    // the FILING thread's project to compare against. Read host-side from the
+    // thread, never from the agent's text: a model that can name its own repo
+    // can defeat the refusal it exists to trigger.
+    const findings = freshFindings();
+    findings.report("thr_g", {
+      title: "Cross-repo defect",
+      file: "lib/collab.ts:750",
+      evidence: "Exists only in the plugin repository.",
+      projectId: "proj_ultragoal",
+    });
+    assert.equal(findings.remediationQueue("thr_g")[0]?.projectId, "proj_ultragoal");
+  });
+
+  it("leaves provenance null for a filing thread that named no project", () => {
+    // 170 live findings predate the column. Absent provenance must read as
+    // "unknown", never "elsewhere", or the guard refuses the whole backlog.
+    const findings = freshFindings();
+    findings.report("thr_g", { title: "Legacy", file: "a.ts:1", evidence: "e" });
+    assert.equal(findings.remediationQueue("thr_g")[0]?.projectId, null);
+  });
+
+  it("keeps provenance on a duplicate fingerprint rather than overwriting it", () => {
+    // A re-sweep from another checkout must not silently re-home an existing
+    // finding: the first filer's project is what the fix slice was cut for.
+    const findings = freshFindings();
+    const first = findings.report("thr_g", {
+      title: "Same defect",
+      file: "a.ts:1",
+      evidence: "e",
+      projectId: "proj_first",
+    });
+    const again = findings.report("thr_g", {
+      title: "Same defect",
+      file: "a.ts:2",
+      evidence: "e",
+      projectId: "proj_second",
+    });
+    assert.equal(again.created, false);
+    assert.equal(findings.remediationQueue("thr_g")[0]?.projectId, "proj_first");
+    assert.equal(findings.remediationQueue("thr_g")[0]?.id, first.finding.id);
   });
 });

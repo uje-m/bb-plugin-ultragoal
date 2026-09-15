@@ -596,7 +596,10 @@ describe("large-plan agent tool contracts", () => {
     rows = [ownerRow("row_1", "kick off")];
     await host.harness.behavior.emitThreadEvent("thread.active", active());
     await settle();
-    assert.deepEqual(spawned, [], "baselining must not staff an intake courier");
+    // Compare emptiness by length: assert.deepEqual is typed `asserts actual is T`,
+    // so its [] expectation would narrow `spawned` to never[] for the rest of the
+    // test and every later `spawned[0].id` would stop typechecking.
+    assert.equal(spawned.length, 0, "baselining must not staff an intake courier");
     assert.equal(cursor(), "row_1", "the baseline cursor must be durable");
 
     // A full root defers the courier and leaves the owner's message queued: the
@@ -607,7 +610,7 @@ describe("large-plan agent tool contracts", () => {
     db.prepare("UPDATE goals SET max_workers = 0 WHERE thread_id = 'thr_intake_root'").run();
     await host.harness.behavior.emitThreadEvent("thread.active", active());
     await settle();
-    assert.deepEqual(spawned, [], "a full root must not staff an intake courier");
+    assert.equal(spawned.length, 0, "a full root must not staff an intake courier");
     assert.equal(cursor(), "row_1", "a deferred owner message stays queued, never skipped");
 
     // Capacity returns: the same message staffs the courier, whose brief is the

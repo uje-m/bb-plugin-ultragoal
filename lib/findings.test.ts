@@ -76,7 +76,7 @@ describe("filing warns when a slice has no gate", () => {
   });
 });
 
-describe("a completed slice closes only the defects its completion attests", () => {
+describe("a completed slice cannot claim a fix is live", () => {
   it("leaves a linked finding open when the closure attests nothing for it", () => {
     // The slice finished; the defect did not. This stamped EVERY open finding
     // linked to the item, so an unlanded or cross-repo fix was recorded as
@@ -86,7 +86,7 @@ describe("a completed slice closes only the defects its completion attests", () 
     const findings = freshFindings();
     const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
     findings.linkItem("thr_g", rec.finding.id, "itm_1");
-    assert.equal(findings.markFixedByItem("thr_g", "itm_1", "slice reported done", []), 0);
+    assert.equal(findings.markAttestedByItem("thr_g", "itm_1", "slice reported done", []), 0);
     assert.equal(findings.get("thr_g", rec.finding.id)?.status, "open");
   });
 
@@ -98,13 +98,44 @@ describe("a completed slice closes only the defects its completion attests", () 
     const silent = findings.report("thr_g", { title: "silent", file: "b.ts:1", evidence: "e" });
     findings.linkItem("thr_g", attested.finding.id, "itm_1");
     findings.linkItem("thr_g", silent.finding.id, "itm_1");
-    const closed = findings.markFixedByItem("thr_g", "itm_1", "n", [
+    const closed = findings.markAttestedByItem("thr_g", "itm_1", "n", [
       { findingId: attested.finding.id, proof: "npm test -- a passed" },
       { findingId: silent.finding.id, proof: "   " },
     ]);
     assert.equal(closed, 1);
-    assert.equal(findings.get("thr_g", attested.finding.id)?.status, "fixed");
+    assert.equal(findings.get("thr_g", attested.finding.id)?.status, "fixed_unverified");
     assert.equal(findings.get("thr_g", silent.finding.id)?.status, "open");
+  });
+
+  it("records a completion's closure as attested, never as a landed fix", () => {
+    // THE defect: a slice completing is not a fix being live. This worker
+    // attested its defect, so the slice closes — but nothing has shown the fix
+    // is in the repository the running install consumes, and for an unlanded or
+    // cross-repo fix nothing ever will. `fixed` is reserved for a shown landing.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "Cross-repo defect", file: "lib/collab.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", rec.finding.id, "itm_1");
+    assert.equal(
+      findings.markAttestedByItem("thr_g", "itm_1", "worker reported done", [
+        { findingId: rec.finding.id, proof: "the plugin PR is open" },
+      ]),
+      1,
+    );
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed_unverified");
+    assert.equal(findings.counts("thr_g").fixed, 0);
+    assert.equal(findings.counts("thr_g").fixedUnverified, 1);
+  });
+
+  it("promotes an attested finding only when the landing is shown", () => {
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", rec.finding.id, "itm_1");
+    findings.markAttestedByItem("thr_g", "itm_1", "n", [{ findingId: rec.finding.id, proof: "p" }]);
+
+    assert.equal(findings.confirmLandedByItem("thr_g", "itm_1", "squash-merged into integration"), 1);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed");
+    // Idempotent: a second integration pass has nothing left to promote.
+    assert.equal(findings.confirmLandedByItem("thr_g", "itm_1", "again"), 0);
   });
 });
 
@@ -116,10 +147,10 @@ describe("a fix that never reached the base branch", () => {
     const findings = freshFindings();
     const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
     findings.linkItem("thr_g", rec.finding.id, "itm_1");
-    findings.markFixedByItem("thr_g", "itm_1", "worker said so", [
+    findings.markAttestedByItem("thr_g", "itm_1", "worker said so", [
       { findingId: rec.finding.id, proof: "the fix is on the slice branch" },
     ]);
-    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed");
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed_unverified");
 
     const reopened = findings.reopenForFailedIntegration("thr_g", "itm_1", "merge conflict");
     assert.equal(reopened, 1);
@@ -141,22 +172,53 @@ describe("a fix that never reached the base branch", () => {
     const other = findings.report("thr_g", { title: "other", file: "b.ts:1", evidence: "e" });
     findings.linkItem("thr_g", mine.finding.id, "itm_1");
     findings.linkItem("thr_g", other.finding.id, "itm_2");
-    findings.markFixedByItem("thr_g", "itm_1", "n", [{ findingId: mine.finding.id, proof: "p1" }]);
-    findings.markFixedByItem("thr_g", "itm_2", "n", [{ findingId: other.finding.id, proof: "p2" }]);
+    findings.markAttestedByItem("thr_g", "itm_1", "n", [{ findingId: mine.finding.id, proof: "p1" }]);
+    findings.markAttestedByItem("thr_g", "itm_2", "n", [{ findingId: other.finding.id, proof: "p2" }]);
     findings.reopenForFailedIntegration("thr_g", "itm_1", "conflict");
     assert.equal(findings.get("thr_g", mine.finding.id)?.status, "open");
-    assert.equal(findings.get("thr_g", other.finding.id)?.status, "fixed");
+    assert.equal(findings.get("thr_g", other.finding.id)?.status, "fixed_unverified");
   });
 
   it("leaves an already-present slice closed, since its work IS on the branch", () => {
     // 0.25.3: "Already up to date (nothing to squash)" records as integrated,
-    // so this reopen path must never run for it.
+    // so this reopen path must never run for it. It stays attested rather than
+    // fixed on purpose: a branch that adds no work HERE cannot show that THIS
+    // slice landed the fix, which is the unlanded and cross-repo case.
     const findings = freshFindings();
     const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
     findings.linkItem("thr_g", rec.finding.id, "itm_1");
-    findings.markFixedByItem("thr_g", "itm_1", "n", [
+    findings.markAttestedByItem("thr_g", "itm_1", "n", [
       { findingId: rec.finding.id, proof: "already on the branch" },
     ]);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed_unverified");
+  });
+
+  it("reopens an attested closure too, because it was never shown to land", () => {
+    // The merge failed, so the fix is provably not on the base branch — and an
+    // attested closure carried no landing evidence to begin with.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", rec.finding.id, "itm_1");
+    findings.markAttestedByItem("thr_g", "itm_1", "n", [{ findingId: rec.finding.id, proof: "p" }]);
+    assert.equal(findings.reopenForFailedIntegration("thr_g", "itm_1", "merge conflict"), 1);
+    assert.equal(findings.counts("thr_g").fixedUnverified, 0);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "open");
+  });
+
+  it("reopens an already-promoted fix, so a legacy `fixed` row is not stranded", () => {
+    // `fixed` is reachable from a confirmed landing (and from every row a
+    // pre-upgrade register still holds). A later integration failure must undo
+    // it exactly as it undoes an attested one, or the register keeps the
+    // strongest claim in the presence of proof it is wrong.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", rec.finding.id, "itm_1");
+    findings.markAttestedByItem("thr_g", "itm_1", "n", [{ findingId: rec.finding.id, proof: "p" }]);
+    findings.confirmLandedByItem("thr_g", "itm_1", "landed");
     assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed");
+
+    assert.equal(findings.reopenForFailedIntegration("thr_g", "itm_1", "merge conflict"), 1);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "open");
+    assert.equal(findings.counts("thr_g").fixed, 0);
   });
 });

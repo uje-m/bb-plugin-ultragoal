@@ -110,7 +110,7 @@ describe("durable finding remediation queue", () => {
       items: state.items,
       evidence: [{ findingId: ids[0]!, proof: "the slice's own gate passed" }],
     });
-    assert.equal(closed.fixed, 1);
+    assert.equal(closed.attested, 1);
 
     // Recreate the stores over the same database: the backlog must recover
     // from durable metadata, not an in-memory registration callback.
@@ -297,9 +297,9 @@ describe("durable finding remediation queue", () => {
         { findingId: valid.id, proof: "valid defect fixed" },
       ],
     });
-    assert.deepEqual(closed, { fixed: 2, requeuedMissing: 0, requeuedInvalid: 1 });
-    assert.equal(state.findings.get("thr_root", primary.id)!.status, "fixed");
-    assert.equal(state.findings.get("thr_root", valid.id)!.status, "fixed");
+    assert.deepEqual(closed, { attested: 2, requeuedMissing: 0, requeuedInvalid: 1 });
+    assert.equal(state.findings.get("thr_root", primary.id)!.status, "fixed_unverified");
+    assert.equal(state.findings.get("thr_root", valid.id)!.status, "fixed_unverified");
     assert.equal(state.findings.get("thr_root", stale.id)!.status, "open");
     assert.equal(state.findings.get("thr_root", stale.id)!.itemId, null);
 
@@ -351,7 +351,7 @@ describe("durable finding remediation queue", () => {
       maxStaffed: 0,
     });
     assert.equal(repaired.requeuedInvalid, 1);
-    assert.equal(repaired.autoFixed, 0);
+    assert.equal(repaired.autoAttested, 0);
     assert.equal(restartedFindings.get("thr_root", primary.id)!.status, "fixed");
     assert.equal(restartedFindings.get("thr_root", stale.id)!.status, "open");
     assert.equal(restartedFindings.get("thr_root", stale.id)!.itemId, null);
@@ -379,7 +379,7 @@ describe("durable finding remediation queue", () => {
       items: state.items,
       maxStaffed: 1,
     });
-    assert.equal(repaired.autoFixed, 0);
+    assert.equal(repaired.autoAttested, 0);
     assert.equal(repaired.requeuedCompleted, 1);
     assert.equal(state.findings.get("thr_root", finding.id)!.status, "open");
     assert.notEqual(state.findings.get("thr_root", finding.id)!.itemId, item.id);
@@ -410,9 +410,11 @@ describe("durable finding remediation queue", () => {
         { findingId: finding.id, proof: "commit abc123; npm test -- proven passed" },
       ],
     });
-    assert.equal(repaired.autoFixed, 1);
+    assert.equal(repaired.autoAttested, 1);
     assert.equal(repaired.requeuedCompleted, 0);
-    assert.equal(state.findings.get("thr_root", finding.id)!.status, "fixed");
+    // Recovered as ATTESTED, not fixed: the persisted proof says the work was
+    // done, and nothing here shows it reached the branch the install consumes.
+    assert.equal(state.findings.get("thr_root", finding.id)!.status, "fixed_unverified");
   });
 
   it("preserves later links named by #42+#43 and #57+#58 CONTEXT clauses", () => {
@@ -707,5 +709,47 @@ describe("durable finding remediation queue", () => {
     });
     assert.equal(result.requeuedMissing, 1);
     assert.equal(state.findings.get("thr_root", finding.id)!.itemId, null);
+  });
+});
+
+describe("a completed slice cannot certify a fix as live", () => {
+  it("does not record a cross-repo fix as fixed when nothing landed here", () => {
+    // The defect, on the live closure path. This item belongs to a goal in one
+    // repository; the defect it is linked to is about a file only another
+    // repository contains. The slice completes and the worker attests what it
+    // can — and the register used to record the defect FIXED: closed, with
+    // nothing anywhere showing the fix is live where this install runs, and no
+    // integration failure able to undo it because this repository never had
+    // the work to merge. Closure is an attestation, and the state must say so.
+    const state = stores();
+    const finding = state.findings.report("thr_root", {
+      title: "The gate is merged on a fork and never runs in production",
+      file: "lib/collab.ts:750",
+      evidence: "The running install resolves upstream; the fix is on a fork.",
+      fixFiles: ["lib/collab.ts"],
+    }).finding;
+    const item = state.items.add("thr_root", "Fix: gate [lib/collab.ts]", "pending", {
+      deps: [],
+      files: ["lib/collab.ts"],
+      check: null,
+    })!;
+    assert.equal(state.findings.linkItem("thr_root", finding.id, item.id), true);
+    state.items.setStatus("thr_root", item.id, "completed");
+
+    closeFindingsForCompletedItem({
+      threadId: "thr_root",
+      itemId: item.id,
+      note: "worker reported done",
+      findings: state.findings,
+      items: state.items,
+      evidence: [{ findingId: finding.id, proof: "the PR is open on the fork" }],
+    });
+
+    assert.equal(state.findings.get("thr_root", finding.id)!.status, "fixed_unverified");
+    // Reclassified, not dropped: a bug that left the row open (or deleted it)
+    // would satisfy the assertion above and still lose the defect.
+    assert.equal(state.findings.counts("thr_root").fixedUnverified, 1);
+    assert.equal(state.findings.counts("thr_root").open, 0);
+    assert.equal(state.findings.counts("thr_root").fixed, 0);
   });
 });

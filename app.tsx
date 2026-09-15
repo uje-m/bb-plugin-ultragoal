@@ -549,7 +549,7 @@ function GoalPlanPanel({ threadId }: { threadId: string }) {
           <Metric
             label="Defects"
             value={`${goal.findings.open} open`}
-            details={`${goal.findings.assignedDefects} linked to work · ${goal.findings.awaitingAssignment} waiting for work · ${goal.findings.fixed} fixed · ${goal.findings.dismissed} dismissed · related defects may share one work item, so totals differ`}
+            details={`${goal.findings.assignedDefects} linked to work · ${goal.findings.awaitingAssignment} waiting for work · ${goal.findings.fixed} fixed · ${goal.findings.fixedUnverified} attested, not shown landed · ${goal.findings.dismissed} dismissed · related defects may share one work item, so totals differ`}
           />
           <div className="grid grid-cols-3 divide-x divide-border/70">
             <CompactMetric label="Tokens" value={formatTokens(goal.tokensUsed)} hint={tokenHint} />
@@ -1710,7 +1710,7 @@ function CompletionView({ goal }: { goal: GoalSnapshot }) {
   const answered = goal.decisions.filter((decision) => decision.status === "answered").length;
   const stats: Array<[string, string]> = [
     ["Work items", String(goal.items.length)],
-    ["Defects addressed", String(goal.findings.fixed + goal.findings.dismissed)],
+    ["Defects addressed", String(goal.findings.fixed + goal.findings.fixedUnverified + goal.findings.dismissed)],
     ["Decisions", String(answered)],
     ["Workers", String(goal.agents.length)],
     ["Tokens", formatTokens(goal.tokensUsed)],

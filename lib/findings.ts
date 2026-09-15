@@ -237,6 +237,7 @@ export function createFindingStore(bb: BbPluginApi) {
     counts(threadId: string): {
       open: number;
       fixed: number;
+      fixedUnverified: number;
       dismissed: number;
       assignedDefects: number;
       awaitingAssignment: number;
@@ -248,6 +249,7 @@ export function createFindingStore(bb: BbPluginApi) {
       return {
         open: open.length,
         fixed: rows.filter((row) => row.status === "fixed").length,
+        fixedUnverified: rows.filter((row) => row.status === "fixed_unverified").length,
         dismissed: rows.filter((row) => row.status === "dismissed").length,
         assignedDefects: assigned.length,
         awaitingAssignment: open.length - assigned.length,
@@ -288,16 +290,15 @@ export function createFindingStore(bb: BbPluginApi) {
     },
 
     /**
-     * Put a finding back in play because its fix is provably not on the base
-     * branch. Closure happens on a worker's report, before the merge is even
-     * attempted, so a genuine integration failure previously left the register
-     * asserting a fix that does not exist. Only entries closed by THIS item are
-     * reopened, and only from a fixed state — a dismissal was a human judgement
-     * about the defect itself and no merge outcome should overturn it.
+     * A finding whose fix is not shown to be live goes back in play. Only
+     * entries this slice closed are reopened, and only from a state a merge
+     * outcome can contradict — `fixed_unverified` is exactly that state, and a
+     * dismissal was a human judgement about the defect itself that no merge
+     * outcome should overturn.
      */
     reopenForFailedIntegration(threadId: string, itemId: string, note: string): number {
       const rows = (byItem.all(threadId, itemId) as FindingRow[]).filter(
-        (row) => row.status === "fixed",
+        (row) => row.status === "fixed" || row.status === "fixed_unverified",
       );
       db.transaction(() => {
         const updatedAt = Date.now();
@@ -316,16 +317,20 @@ export function createFindingStore(bb: BbPluginApi) {
 
     /**
      * A completed fix slice closes the findings its completion attests — never
-     * every finding that happens to be linked to the item.
+     * every finding that happens to be linked to the item — and records them
+     * as `fixed_unverified`, never `fixed`.
      *
-     * "The slice finished" is not "the defect is fixed". Stamping every open
-     * link recorded an unlanded fix as closed the moment its item completed,
-     * and reopenForFailedIntegration could not undo it: that path fires on a
-     * merge failure, and a slice whose work never entered this repository's
-     * integration path never produces one. A linked defect the completion does
-     * not affirmatively cover stays open, where the queue can still reach it.
+     * A slice completing shows that work was done, not where it runs. Stamping
+     * `fixed` here recorded an unlanded or cross-repo fix as closed the moment
+     * its item completed, and reopenForFailedIntegration could not undo it:
+     * that path fires on a merge failure, and a slice whose work never entered
+     * this repository's integration path never produces one. The attested
+     * state says what is actually known — the completion affirms a fix; no
+     * landing has been shown — and `confirmLandedByItem` promotes it once one
+     * is. A linked defect the completion does not cover stays open, where the
+     * queue can still reach it.
      */
-    markFixedByItem(
+    markAttestedByItem(
       threadId: string,
       itemId: string,
       note: string,
@@ -344,7 +349,7 @@ export function createFindingStore(bb: BbPluginApi) {
           setStatus.run({
             thread_id: threadId,
             id: row.id,
-            status: "fixed",
+            status: "fixed_unverified",
             resolution_note: note.trim().slice(0, 400) || null,
             updated_at: updatedAt,
           });
@@ -356,6 +361,33 @@ export function createFindingStore(bb: BbPluginApi) {
         );
       }
       return closing.length;
+    },
+
+    /**
+     * Promote this slice's attested findings to `fixed` because the landing is
+     * now shown: its work is on the base branch the goal ships from.
+     *
+     * Deliberately separate from the closure. The register may only claim a fix
+     * is live when something other than the completing worker's own report says
+     * so, and the merge is that something.
+     */
+    confirmLandedByItem(threadId: string, itemId: string, note: string): number {
+      const rows = (byItem.all(threadId, itemId) as FindingRow[]).filter(
+        (row) => row.status === "fixed_unverified",
+      );
+      db.transaction(() => {
+        const updatedAt = Date.now();
+        for (const row of rows) {
+          setStatus.run({
+            thread_id: threadId,
+            id: row.id,
+            status: "fixed",
+            resolution_note: note.trim().slice(0, 400) || null,
+            updated_at: updatedAt,
+          });
+        }
+      })();
+      return rows.length;
     },
 
     clear(threadId: string): void {

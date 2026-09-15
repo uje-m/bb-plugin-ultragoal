@@ -115,9 +115,12 @@ export function formatGoalCard(goal: GoalSnapshot): string {
   if (goal.decisions.length > MAX_STATUS_DECISIONS) {
     lines.push(`NEEDS YOU: … ${goal.decisions.length - MAX_STATUS_DECISIONS} more decision(s) omitted`);
   }
-  if (goal.findings.open + goal.findings.fixed + goal.findings.dismissed > 0) {
+  if (
+    goal.findings.open + goal.findings.fixed + goal.findings.fixedUnverified + goal.findings.dismissed >
+    0
+  ) {
     lines.push(
-      `Defects: ${goal.findings.open} open (${goal.findings.assignedDefects} linked to work, ${goal.findings.awaitingAssignment} waiting for work across ${goal.findings.remediationWorkItems} repair work items), ${goal.findings.fixed} fixed, ${goal.findings.dismissed} dismissed`,
+      `Defects: ${goal.findings.open} open (${goal.findings.assignedDefects} linked to work, ${goal.findings.awaitingAssignment} waiting for work across ${goal.findings.remediationWorkItems} repair work items), ${goal.findings.fixed} fixed, ${goal.findings.fixedUnverified} attested but not shown landed, ${goal.findings.dismissed} dismissed`,
     );
   }
   if (goal.agents.length > 0) {

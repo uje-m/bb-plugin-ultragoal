@@ -1398,6 +1398,22 @@ export default function plugin(bb: BbPluginApi) {
       bb.log.info(
         `Integrated slice ${itemId}: squash-merged ${environment.branchName ?? worker.environmentId} into ${base} on ${rootThreadId}`,
       );
+      // Closure happened on the worker's report, before this merge was even
+      // attempted, so those findings were recorded as ATTESTED, not landed.
+      // This slice's work is now on the base branch the goal ships from — that
+      // merge is the landing the register was waiting for, and with an explicit
+      // resolution it is the only thing that may promote an attested fix to
+      // fixed. The two "already present" paths below deliberately do NOT: a
+      // branch that adds nothing cannot show that THIS slice landed the fix,
+      // which is exactly the unlanded and cross-repo case the states separate.
+      const landed = findings.confirmLandedByItem(
+        rootThreadId,
+        itemId,
+        `Landed: this slice's work was squash-merged into ${base}.`,
+      );
+      if (landed > 0) {
+        bb.log.info(`Confirmed ${landed} finding(s) landed by slice ${itemId} on ${rootThreadId}`);
+      }
       // Completed, merged, and now the worktree is pure disk. The plugin made
       // it, so the plugin removes it — leaving that to whoever notices the disk
       // filling is how 217 of them accumulated.
@@ -1855,10 +1871,10 @@ export default function plugin(bb: BbPluginApi) {
         `Completion guard on ${itemId}: detached ${result.requeuedInvalid} invalid and ${result.requeuedMissing} missing-item finding link(s) before closure`,
       );
     }
-    if (result.fixed + result.requeuedInvalid + result.requeuedMissing > 0) {
+    if (result.attested + result.requeuedInvalid + result.requeuedMissing > 0) {
       reconcileFindingBacklog(rootThreadId);
     }
-    return result.fixed;
+    return result.attested;
   }
 
   /** Apply the same stale-link rule as startup before checking a completion
@@ -3372,14 +3388,14 @@ export default function plugin(bb: BbPluginApi) {
       const changed =
         result.linked +
         result.minted +
-        result.autoFixed +
+        result.autoAttested +
         result.healedDuplicates +
         result.requeuedMissing +
         result.requeuedInvalid +
         result.requeuedCompleted;
       if (changed === 0) return;
       bb.log.info(
-        `Finding queue on ${rootThreadId}: ${result.minted} minted, ${result.linked} attached, ${result.healedDuplicates} duplicate singleton(s) healed, ${result.autoFixed} recovered from structured evidence, ${result.requeuedMissing} requeued missing, ${result.requeuedInvalid} requeued invalid, ${result.requeuedCompleted} requeued from unproven completed work; ${result.remediationWorkItems} remediation work item(s), ${result.awaitingAssignment} awaiting assignment`,
+        `Finding queue on ${rootThreadId}: ${result.minted} minted, ${result.linked} attached, ${result.healedDuplicates} duplicate singleton(s) healed, ${result.autoAttested} recovered from structured evidence, ${result.requeuedMissing} requeued missing, ${result.requeuedInvalid} requeued invalid, ${result.requeuedCompleted} requeued from unproven completed work; ${result.remediationWorkItems} remediation work item(s), ${result.awaitingAssignment} awaiting assignment`,
       );
       markGoalEvent(rootThreadId);
       void publishFresh(rootThreadId);
@@ -3750,7 +3766,7 @@ export default function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "resolve_finding",
     description:
-      "Resolve an open finding that will not be closed by a fix slice: mark it not_a_defect with evidence, or fixed when the fix landed outside its own slice. Findings fixed by their auto-created fix slice close automatically — do not resolve those by hand.",
+      "Resolve an open finding that will not be closed by a fix slice: mark it not_a_defect with evidence, or fixed when the fix is shown to be live where it must run — pass --repository when that is not this goal's checkout. A completed slice records its own defects as fixed_unverified: attested by the worker, landing never shown. This is how one becomes fixed once the landing is shown, and near-exact ids still refuse a resolution for something that is not a defect.",
     parameters: z.object({
       finding: z.string().min(1).describe("Finding id (fnd_...) or fingerprint from report_finding/ultragoal_state."),
       resolution: z.enum(["fixed", "not_a_defect"]).describe("What happened to it."),

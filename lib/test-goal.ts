@@ -77,6 +77,7 @@ export function makeLargeGoal(count = 1_000): GoalSnapshot {
     findings: {
       open: 137,
       fixed: 159,
+      fixedUnverified: 12,
       dismissed: 9,
       assignedDefects: 50,
       awaitingAssignment: 87,

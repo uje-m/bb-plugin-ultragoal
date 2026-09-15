@@ -9,7 +9,7 @@ import {
 export interface FindingQueueResult {
   linked: number;
   minted: number;
-  autoFixed: number;
+  autoAttested: number;
   requeuedMissing: number;
   requeuedInvalid: number;
   requeuedCompleted: number;
@@ -69,7 +69,8 @@ export function detachStaleFindingLinks(input: {
 }
 
 export interface FindingCompletionResult extends StaleFindingLinkResult {
-  fixed: number;
+  /** Findings this completion attested and closed. */
+  attested: number;
 }
 
 /**
@@ -162,10 +163,10 @@ export function closeFindingsForCompletedItem(input: {
 }): FindingCompletionResult {
   const detached = detachStaleFindingLinks({ ...input, itemId: input.itemId });
   const item = input.items.list(input.threadId).find((entry) => entry.id === input.itemId);
-  const fixed = item?.status === "completed"
-    ? input.findings.markFixedByItem(input.threadId, input.itemId, input.note, input.evidence)
+  const attested = item?.status === "completed"
+    ? input.findings.markAttestedByItem(input.threadId, input.itemId, input.note, input.evidence)
     : 0;
-  return { ...detached, fixed };
+  return { ...detached, attested };
 }
 
 /**
@@ -189,7 +190,7 @@ export function reconcileFindingQueue(input: {
   const itemById = new Map(allItems.map((item) => [item.id, item]));
   const age = new Map(items.creationOrder(threadId).map((id, index) => [id, index]));
   allItems.sort((left, right) => (age.get(left.id) ?? 0) - (age.get(right.id) ?? 0));
-  let autoFixed = 0;
+  let autoAttested = 0;
   const detached = detachStaleFindingLinks({ threadId, findings, items });
   const requeuedMissing = detached.requeuedMissing;
   const requeuedInvalid = detached.requeuedInvalid;
@@ -209,7 +210,7 @@ export function reconcileFindingQueue(input: {
   for (const [itemId, group] of completedGroups) {
     const evidence = input.completionEvidence?.(itemId) ?? [];
     if (missingLinkedDefectEvidenceIds(evidence, group).length === 0) {
-      autoFixed += findings.markFixedByItem(
+      autoAttested += findings.markAttestedByItem(
         threadId,
         itemId,
         "Recovered from persisted structured per-defect completion evidence.",
@@ -278,7 +279,7 @@ export function reconcileFindingQueue(input: {
   return {
     linked,
     minted,
-    autoFixed,
+    autoAttested,
     requeuedMissing,
     requeuedInvalid,
     requeuedCompleted,

@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { rpcContract, type GoalAgent, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
+import { rpcContract, type GoalAgent, type GoalDecision, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
 import {
   accountGoalProgress,
   readThreadTokens,
@@ -1082,27 +1082,84 @@ export default function plugin(bb: BbPluginApi) {
   const decisionPromptBackoff = new Map<string, number>();
   const DECISION_PROMPT_BACKOFF_MS = 10 * 60_000;
 
+  // An owner decision is keyed by the goal row that owns it, and one resolution
+  // now serves both the agent's tool surface and the decision paths. They used
+  // to disagree: `collab.rootId` fell back to the caller's own thread while
+  // `agents.configure` fell back to the provider parent, so a child with a
+  // parent but no collab row was instructed as a worker and keyed as a root —
+  // its decision landed where no projection for that goal reads. A goal row
+  // lookup cannot silently fall back to the caller: a thread that owns an
+  // unfinished goal is its goal, and a thread that owns none belongs to the
+  // goal of the tree above it.
+  function goalOwnerFor(threadId: string, providerParentId: string | null): StoredGoal | null {
+    const own = store.get(threadId);
+    // A thread that already owns an unfinished goal is its owner. The goal of
+    // an ancestor is only the fallback for a thread that owns none: inheriting
+    // it over the caller's own goal would retarget every tool and decision onto
+    // the ancestor while view(), publish() and ensureDecisionPrompts() stay on
+    // the caller's row, leaving that goal ungated and unanswerable.
+    if (own && isUnfinished(own.status)) return own;
+    const row = collab.rowOf(threadId);
+    const parentId = row?.parent_thread_id ?? providerParentId ?? null;
+    // The recorded tree root wins whether or not the row recorded a parent —
+    // parent_thread_id is nullable, and a row can name its goal with no parent
+    // at all. The parent is only the fallback for a tree no collab row recorded;
+    // a row parenting itself is no tree reference either.
+    const ownerThreadId =
+      row?.root_thread_id ??
+      (parentId && parentId !== threadId
+        ? store.get(parentId)
+          ? parentId
+          : collab.rowOf(parentId)?.root_thread_id ?? null
+        : null);
+    if (!ownerThreadId || ownerThreadId === threadId) return own;
+    const inherited = store.get(ownerThreadId);
+    return inherited && isUnfinished(inherited.status) ? inherited : own;
+  }
+
+  // Tool calls carry only the caller's thread id, so the provider's parent is
+  // read back when no collab row recorded the tree.
+  async function goalOwnerOfCaller(threadId: string): Promise<StoredGoal | null> {
+    const row = collab.rowOf(threadId);
+    if (row) return goalOwnerFor(threadId, null);
+    let parentThreadId: string | null = null;
+    try {
+      parentThreadId = (await bb.sdk.threads.get({ threadId })).parentThreadId ?? null;
+    } catch {
+      parentThreadId = null;
+    }
+    return goalOwnerFor(threadId, parentThreadId);
+  }
+
+  // Every goal-keyed tool resolves its goal here: the goal the caller owns,
+  // else the goal of the tree above it, and only then the caller-derived collab
+  // root. One resolution keeps plan writes, findings, decisions and the
+  // completion gate on the same row.
+  async function goalThreadIdOfCaller(threadId: string): Promise<string> {
+    return (await goalOwnerOfCaller(threadId))?.threadId ?? collab.rootId(threadId);
+  }
+
   async function applyDecisionAnswer(
-    rootThreadId: string,
+    goalThreadId: string,
     decisionId: string,
     answer: string,
   ): Promise<boolean> {
-    const resolved = decisions.resolve(rootThreadId, decisionId, "answered", answer);
+    const resolved = decisions.resolve(goalThreadId, decisionId, "answered", answer);
     if (!resolved) return false;
-    markGoalEvent(rootThreadId);
+    markGoalEvent(goalThreadId);
     decisionAborts.get(decisionId)?.abort();
-    const goal = store.get(rootThreadId);
-    if (goal) publish(rootThreadId, view(goal));
-    bb.log.info(`Owner decision ${decisionId} answered on ${rootThreadId}: ${answer.slice(0, 80)}`);
+    const goal = store.get(goalThreadId);
+    if (goal) publish(goalThreadId, view(goal));
+    bb.log.info(`Owner decision ${decisionId} answered on ${goalThreadId}: ${answer.slice(0, 80)}`);
     await sendSteering(
-      rootThreadId,
+      goalThreadId,
       `OWNER DECISION ANSWERED (${decisionId}): "${resolved.question}" -> ${answer}. Act on this now and resolve any dependent work.`,
-      (await threadIsRunning(bb, rootThreadId)) ? "steer" : "start",
+      (await threadIsRunning(bb, goalThreadId)) ? "steer" : "start",
     );
     return true;
   }
 
-  function raiseDecisionPrompt(rootThreadId: string, decisionId: string): void {
+  function raiseDecisionPrompt(goalThreadId: string, decisionId: string): void {
     if (decisionKeepers.has(decisionId) || decisionDismissed.has(decisionId)) return;
     const failedAt = decisionPromptBackoff.get(decisionId);
     if (failedAt != null && Date.now() - failedAt < DECISION_PROMPT_BACKOFF_MS) return;
@@ -1110,7 +1167,7 @@ export default function plugin(bb: BbPluginApi) {
     void (async () => {
       try {
         while (true) {
-          const current = decisions.get(rootThreadId, decisionId);
+          const current = decisions.get(goalThreadId, decisionId);
           if (!current || current.status !== "open") return;
           const controller = new AbortController();
           decisionAborts.set(decisionId, controller);
@@ -1124,7 +1181,7 @@ export default function plugin(bb: BbPluginApi) {
                 : current.question;
             result = await bb.ui.requestInput(
               {
-                threadId: rootThreadId,
+                threadId: goalThreadId,
                 rendererId: "owner-decision",
                 title,
                 payload: {
@@ -1132,7 +1189,7 @@ export default function plugin(bb: BbPluginApi) {
                   question: current.question,
                   context: current.context,
                   options: current.options,
-                  threadId: rootThreadId,
+                  threadId: goalThreadId,
                 },
                 timeoutMs: 60 * 60_000,
               },
@@ -1141,7 +1198,7 @@ export default function plugin(bb: BbPluginApi) {
           } catch (error) {
             decisionPromptBackoff.set(decisionId, Date.now());
             bb.log.warn(
-              `Owner-decision prompt failed on ${rootThreadId}: ${
+              `Owner-decision prompt failed on ${goalThreadId}: ${
                 error instanceof Error ? error.message : String(error)
               } (backing off 10m)`,
             );
@@ -1155,7 +1212,7 @@ export default function plugin(bb: BbPluginApi) {
               typeof raw === "string" ? raw : String((raw as { answer?: unknown })?.answer ?? "")
             ).trim();
             if (!answer) continue;
-            await applyDecisionAnswer(rootThreadId, decisionId, answer);
+            await applyDecisionAnswer(goalThreadId, decisionId, answer);
             return;
           }
           if (result.reason === "timeout") continue;
@@ -1174,9 +1231,9 @@ export default function plugin(bb: BbPluginApi) {
     })();
   }
 
-  function ensureDecisionPrompts(rootThreadId: string): void {
-    for (const decision of decisions.list(rootThreadId, "open")) {
-      raiseDecisionPrompt(rootThreadId, decision.id);
+  function ensureDecisionPrompts(goalThreadId: string): void {
+    for (const decision of decisions.list(goalThreadId, "open")) {
+      raiseDecisionPrompt(goalThreadId, decision.id);
     }
   }
 
@@ -1786,9 +1843,18 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   publishFresh = async (threadId: string) => {
-    const goal = store.get(threadId);
-    if (!goal) return;
-    publish(threadId, await viewFresh(goal));
+    try {
+      const goal = store.get(threadId);
+      if (!goal) return;
+      publish(threadId, await viewFresh(goal));
+    } catch (error) {
+      // A generation that dies mid-flight (a reload closes its database and
+      // rejects its realtime handle) is the only expected failure: the durable
+      // rows are already written and the next pulse republishes. Every other
+      // failure is a real projection bug and must reach the caller.
+      if (!(error instanceof Error) || error.name !== "PluginContextStaleError") throw error;
+      bb.log.warn(`UltraGoal state refresh on ${threadId} stopped with its plugin generation`);
+    }
   };
 
   const verifying = new Set<string>();
@@ -3204,7 +3270,7 @@ export default function plugin(bb: BbPluginApi) {
       })
       .strict(),
     async execute({ objective, token_budget }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       const existing = store.get(rootThreadId);
       if (existing && isUnfinished(existing.status)) {
         return {
@@ -3234,7 +3300,7 @@ export default function plugin(bb: BbPluginApi) {
       plan_limit: z.number().int().min(1).max(100).optional(),
     }).strict(),
     async execute({ plan_status, plan_cursor, plan_limit }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       await refreshRunning(rootThreadId);
       const accounted = await account(rootThreadId);
       const goal = accounted ?? store.get(rootThreadId);
@@ -3263,7 +3329,7 @@ export default function plugin(bb: BbPluginApi) {
       })).max(200).default([]),
     }).strict(),
     async execute({ plan, remove_item_ids }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       const goal = store.get(rootThreadId);
       if (!goal || !isUnfinished(goal.status)) {
         return { content: [{ type: "text", text: "no unfinished UltraGoal" }], isError: true };
@@ -3345,11 +3411,12 @@ export default function plugin(bb: BbPluginApi) {
       summary: z.string().optional(),
     }).strict(),
     async execute({ status, summary }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       const accounted = (await account(rootThreadId)) ?? store.get(rootThreadId);
       if (!accounted) {
         return { content: [{ type: "text", text: "no UltraGoal" }], isError: true };
       }
+      const owner = accounted.threadId;
       if (status === "complete") {
         if (!summary || summary.trim().length < 40) {
           return { content: [{ type: "text", text: "completion requires a substantive delivery summary" }], isError: true };
@@ -3361,13 +3428,17 @@ export default function plugin(bb: BbPluginApi) {
             isError: true,
           };
         }
-        const openDecisions = decisions.list(rootThreadId, "open");
+        const openDecisions = decisions.list(owner, "open");
         const openFindings = findings.list(rootThreadId, "open");
         if (openDecisions.length > 0 || openFindings.length > 0) {
+          const openDecisionText =
+            openDecisions.length > 0
+              ? `${openDecisions.length} owner decision(s) (${openDecisions.map((decision) => decision.id).join(", ")})`
+              : "0 owner decision(s)";
           return {
             content: [{
               type: "text",
-              text: `cannot complete: ${openDecisions.length} owner decision(s) and ${openFindings.length} open defect(s) remain`,
+              text: `cannot complete: ${openDecisionText} and ${openFindings.length} open defect(s) remain`,
             }],
             isError: true,
           };
@@ -3542,7 +3613,7 @@ export default function plugin(bb: BbPluginApi) {
           isError: true,
         };
       }
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       const goal = store.get(rootThreadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
         return {
@@ -3676,7 +3747,7 @@ export default function plugin(bb: BbPluginApi) {
         .describe("Owner-visible verification metadata. It is not injected into another agent's prompt."),
     }),
     async execute({ title, file, evidence, fix_files, check }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       const goal = store.get(rootThreadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
         return {
@@ -3736,18 +3807,38 @@ export default function plugin(bb: BbPluginApi) {
       options: z.array(z.string()).optional().describe("Concrete answer options, if enumerable."),
     }),
     async execute({ question, context, options }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
-      const goal = store.get(rootThreadId);
+      const goal = await goalOwnerOfCaller(threadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
         return {
           content: [{ type: "text", text: "no active UltraGoal on this thread tree" }],
           isError: true,
         };
       }
-      const decision = decisions.request(rootThreadId, { question, context, options });
-      bb.log.info(`Owner decision ${decision.id} requested on ${rootThreadId}: ${question.slice(0, 80)}`);
-      raiseDecisionPrompt(rootThreadId, decision.id);
-      void publishFresh(rootThreadId);
+      const owner = goal.threadId;
+      let requested: GoalDecision;
+      try {
+        requested = decisions.request(owner, { question, context, options });
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+          isError: true,
+        };
+      }
+      // Read the row back through the owner key it was persisted under, so a
+      // row that key cannot list is refused instead of reported open.
+      const decision = decisions.get(owner, requested.id);
+      if (!decision || decision.id !== requested.id || decision.status !== "open") {
+        return {
+          content: [{
+            type: "text",
+            text: `owner decision ${requested.id} is not open under goal ${owner} after persisting (read back ${decision ? decision.status : "nothing"}); refusing to report it as open`,
+          }],
+          isError: true,
+        };
+      }
+      bb.log.info(`Owner decision ${decision.id} requested on ${owner}: ${question.slice(0, 80)}`);
+      raiseDecisionPrompt(owner, decision.id);
+      void publishFresh(owner);
       return {
         content: [
           {
@@ -3773,8 +3864,20 @@ export default function plugin(bb: BbPluginApi) {
       answer: z.string().min(1).describe("The owner's answer verbatim, or why it is moot."),
     }),
     async execute({ decision, resolution, answer }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
-      const resolved = decisions.resolve(rootThreadId, decision, resolution, answer);
+      const goal = await goalOwnerOfCaller(threadId);
+      if (!goal) {
+        return {
+          content: [{
+            type: "text",
+            text:
+              `decision ${decision} cannot be resolved: no UltraGoal owns this thread tree. ` +
+              "An owner decision is always owned by a goal; the goal row must exist before its decision can be answered or withdrawn.",
+          }],
+          isError: true,
+        };
+      }
+      const owner = goal.threadId;
+      const resolved = decisions.resolve(owner, decision, resolution, answer);
       if (!resolved) {
         return {
           content: [{ type: "text", text: `decision not found: ${decision}` }],
@@ -3782,8 +3885,8 @@ export default function plugin(bb: BbPluginApi) {
         };
       }
       decisionAborts.get(resolved.id)?.abort();
-      markGoalEvent(rootThreadId);
-      void publishFresh(rootThreadId);
+      markGoalEvent(owner);
+      void publishFresh(owner);
       return {
         content: [
           { type: "text", text: JSON.stringify({ decision_id: resolved.id, status: resolved.status }) },
@@ -3811,7 +3914,7 @@ export default function plugin(bb: BbPluginApi) {
         ),
     }),
     async execute({ finding, resolution, evidence, repository }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
+      const rootThreadId = await goalThreadIdOfCaller(threadId);
       // The tool is the path agents actually use. Validating only in the CLI
       // left this one unguarded, which is how a nonexistent commit was accepted
       // as a fix and recorded without objection.
@@ -4437,7 +4540,14 @@ export default function plugin(bb: BbPluginApi) {
         if (!decisionId || !answer) {
           return { exitCode: 1, stderr: "Usage: bb ultragoal decide <decision_id> <answer> [--thread <id>]" };
         }
-        const applied = await applyDecisionAnswer(threadId, decisionId, answer);
+        const owner = await goalOwnerOfCaller(threadId);
+        if (!owner) {
+          return {
+            exitCode: 1,
+            stderr: `Decision ${decisionId} cannot be resolved: no UltraGoal owns this thread tree. An owner decision is always owned by a goal.`,
+          };
+        }
+        const applied = await applyDecisionAnswer(owner.threadId, decisionId, answer);
         if (!applied) return { exitCode: 1, stderr: `Decision not found: ${decisionId}` };
         return { exitCode: 0, stdout: `Decision ${decisionId} answered: ${answer}` };
       }

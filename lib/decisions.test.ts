@@ -289,6 +289,80 @@ describe("owner decision ownership", () => {
     assert.deepEqual(openDecisionIds(childState.text), [decisionId]);
   });
 
+  it("never shadows a thread's own unfinished goal with an ancestor's", async () => {
+    const root = "thr_shadow_root";
+    const child = "thr_shadow_child";
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            status: "idle",
+            parentThreadId: threadId === child ? root : null,
+          }),
+      },
+    });
+    const db = host.bb.storage.database();
+    // Child first, parent second: ultragoal_start keys a thread with no goal of
+    // its own by the caller-derived root, and no collab row records the child's
+    // tree, so both threads end up owning an unfinished goal. The child's own
+    // goal is then the one its tools and decisions must stay on.
+    await startGoal(host, child, "Prove a child's own goal is never shadowed by its parent");
+    await startGoal(host, root, "Prove the parent's goal does not retarget the child");
+
+    const decisionId = await requestDecision(
+      host,
+      child,
+      "Does the shadowed thread's decision stay on its own goal?",
+    );
+    const row = db
+      .prepare("SELECT thread_id, status FROM goal_decisions WHERE id = ?")
+      .get(decisionId) as { thread_id: string; status: string };
+    assert.equal(row.thread_id, child, "the caller's own goal must own its decision");
+    assert.equal(row.status, "open");
+
+    const childState = await callTool(host, "ultragoal_state", {}, child);
+    assert.equal(childState.isError, false, childState.text);
+    assert.match(childState.text, /never shadowed by its parent/);
+    assert.deepEqual(openDecisionIds(childState.text), [decisionId]);
+    const rootState = await callTool(host, "ultragoal_state", {}, root);
+    assert.equal(rootState.isError, false, rootState.text);
+    assert.match(rootState.text, /does not retarget the child/);
+    assert.deepEqual(openDecisionIds(rootState.text), []);
+
+    // The completion gate must read the child's own decision, not the parent's
+    // clean board, which would complete the wrong goal while this one is open.
+    const gated = await callTool(
+      host,
+      "ultragoal_finish",
+      { status: "complete", summary: "A summary long enough to pass the completion length check." },
+      child,
+    );
+    assert.equal(gated.isError, true, gated.text);
+    assert.match(gated.text, new RegExp(decisionId));
+
+    const resolved = await callTool(
+      host,
+      "resolve_decision",
+      { decision: decisionId, resolution: "answered", answer: "Stay on the child's own goal." },
+      child,
+    );
+    assert.equal(resolved.isError, false, resolved.text);
+    const finished = await callTool(
+      host,
+      "ultragoal_finish",
+      { status: "complete", summary: "Only the caller's own goal is completed by this finish." },
+      child,
+    );
+    assert.equal(finished.isError, false, finished.text);
+    const statusOf = (threadId: string) =>
+      (db.prepare("SELECT status FROM goals WHERE thread_id = ?").get(threadId) as {
+        status: string;
+      }).status;
+    assert.equal(statusOf(child), "complete");
+    assert.equal(statusOf(root), "active");
+  });
+
   it("files a parentless worker's decision under the tree root its own row recorded", async () => {
     const host = registeredHost();
     const db = host.bb.storage.database();

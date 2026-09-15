@@ -59,6 +59,17 @@ export class DecisionOwnerMismatchError extends Error {
   }
 }
 
+/**
+ * Owner decisions live under the thread id of the goal row that owns them.
+ *
+ * Rows persisted by an earlier generation under a caller-derived key that names
+ * no goal row are inert by design: no goal's projection, read-back, or
+ * completion gate can reach them, and this store neither authors nor migrates
+ * them. A one-shot rekey is refused deliberately — a row nobody could read back
+ * is not evidence that a goal raised it, and rekeying it onto a goal would
+ * invent an owner gate that goal never had. They cannot gate completion because
+ * `ultragoal_finish` lists by the goal's own id, so stale rows stay dead weight.
+ */
 export function createDecisionStore(bb: BbPluginApi) {
   const db = bb.storage.database();
   const byThread = db.prepare(

@@ -134,8 +134,8 @@ describe("large-plan agent tool contracts", () => {
     assert.ok(row.updated_at > 0);
   });
 
-  const context = (providerId: string, threadId: string) => ({
-    thread: { id: threadId, title: "UltraGoal root", parentThreadId: null, sourceThreadId: null },
+  const context = (providerId: string, threadId: string, parentThreadId: string | null = null) => ({
+    thread: { id: threadId, title: "UltraGoal root", parentThreadId, sourceThreadId: null },
     project: { id: "proj", kind: "standard" as const, name: "Project", gitRemoteUrl: null },
     environment: {
       id: "env",
@@ -330,6 +330,103 @@ describe("large-plan agent tool contracts", () => {
       .prepare("SELECT thread_id FROM goal_decisions WHERE id = ?")
       .get(childDecisionId) as { thread_id: string };
     assert.equal(childOwner.thread_id, threadId);
+  });
+
+  it("keys every goal-scoped tool for a childless worker to the goal configure briefs it for", async () => {
+    const root = "thr_goal_key_root";
+    const childless = "thr_goal_key_worker";
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId: queried }) =>
+          makeThreadResponse({
+            id: queried,
+            status: "idle",
+            parentThreadId: queried === childless ? root : null,
+          }),
+      },
+    });
+    const started = await host.harness.behavior.callAgentTool(
+      "ultragoal_start",
+      { objective: "Prove one resolver keys every goal-scoped tool for a childless worker" },
+      { threadId: root },
+    );
+    assert.equal(isToolError(started), false, toolText(started));
+
+    // The childless worker is briefed as a worker off its provider parent, so
+    // configure offers the plan and finding tools the resolver must key to that
+    // goal. Asserting the pairing here keeps the briefing and the writes from
+    // drifting apart: a worker told to file a slice must be able to file it.
+    const configured = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", childless, root),
+    );
+    const names = configured.tools.map((tool) => tool.name);
+    assert.ok(names.includes("add_slice"), "a childless worker is briefed as a worker");
+    assert.ok(names.includes("report_finding"));
+
+    const items = createItemStore(host.bb);
+    const created = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "Key the childless worker's slice to the goal that briefed it." },
+      { threadId: childless },
+    );
+    assert.equal(isToolError(created), false, toolText(created));
+    assert.deepEqual(
+      items.list(root).map((item) => item.step),
+      ["Key the childless worker's slice to the goal that briefed it."],
+    );
+
+    const patched = await host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ step: "A childless worker's remaining plan write lands here.", status: "pending" }] },
+      { threadId: childless },
+    );
+    assert.equal(isToolError(patched), false, toolText(patched));
+    assert.deepEqual(
+      items.list(root).map((item) => item.step).sort(),
+      [
+        "A childless worker's remaining plan write lands here.",
+        "Key the childless worker's slice to the goal that briefed it.",
+      ].sort(),
+    );
+
+    // The tree already owns an unfinished goal, so the same resolution refuses
+    // a second one on the child instead of starting a goal the root never reads.
+    const restarted = await host.harness.behavior.callAgentTool(
+      "ultragoal_start",
+      { objective: "A childless worker must not create a goal beside the tree's" },
+      { threadId: childless },
+    );
+    assert.equal(isToolError(restarted), true, toolText(restarted));
+    assert.match(toolText(restarted), /unfinished UltraGoal/);
+    assert.equal(
+      (host.bb.storage.database()
+        .prepare("SELECT COUNT(*) AS n FROM goals WHERE thread_id IN (?, ?)")
+        .get(root, childless) as { n: number }).n,
+      1,
+      "the tree keeps exactly one goal row",
+    );
+
+    const reported = await host.harness.behavior.callAgentTool(
+      "report_finding",
+      {
+        title: "A childless worker's finding must be owned by the goal too",
+        file: "server.ts:1",
+        evidence: "Every goal-scoped write resolves through the same goal row.",
+        fix_files: ["server.ts"],
+      },
+      { threadId: childless },
+    );
+    assert.equal(isToolError(reported), false, toolText(reported));
+    // register_finding arms staffing with `void scheduleReady(...)`, so drain
+    // that turn before this test's database closes under it.
+    for (let index = 0; index < 8; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const findingId = (JSON.parse(toolText(reported)) as { finding_id: string }).finding_id;
+    const owner = host.bb.storage.database()
+      .prepare("SELECT thread_id FROM goal_findings WHERE id = ?")
+      .get(findingId) as { thread_id: string };
+    assert.equal(owner.thread_id, root, "findings must be keyed by the goal, not the caller");
   });
 
   it("reconstructs a transferred Codex root with canonical tools and live instructions", async () => {

@@ -36,12 +36,32 @@ function newId(): string {
   return `dec_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * A decision row whose persisted owner key is not the goal that created it.
+ * Raised instead of returning a decision the owning goal cannot read back.
+ */
+export class DecisionOwnerMismatchError extends Error {
+  constructor(
+    readonly owner: string,
+    readonly decisionId: string,
+    readonly persistedOwner: string | null,
+  ) {
+    super(
+      persistedOwner === null
+        ? `Owner decision ${decisionId} was not persisted under goal ${owner}`
+        : `Owner decision ${decisionId} was persisted under ${persistedOwner} instead of goal ${owner}`,
+    );
+    this.name = "DecisionOwnerMismatchError";
+  }
+}
+
 export function createDecisionStore(bb: BbPluginApi) {
   const db = bb.storage.database();
   const byThread = db.prepare(
     "SELECT * FROM goal_decisions WHERE thread_id = ? ORDER BY created_at ASC",
   );
   const byId = db.prepare("SELECT * FROM goal_decisions WHERE thread_id = ? AND id = ?");
+  const persistedOwnerOf = db.prepare("SELECT thread_id FROM goal_decisions WHERE id = ?");
   const insert = db.prepare(`
     INSERT INTO goal_decisions (id, thread_id, question, context, options, status, answer, created_at, answered_at)
     VALUES (@id, @thread_id, @question, @context, @options, @status, @answer, @created_at, @answered_at)
@@ -64,8 +84,7 @@ export function createDecisionStore(bb: BbPluginApi) {
           row.status === "open" &&
           row.question.trim().toLowerCase().replace(/\s+/g, " ") === normalized,
       );
-      if (existing) return rowToDecision(existing);
-      const row: DecisionRow = {
+      const row: DecisionRow = existing ?? {
         id: newId(),
         thread_id: threadId,
         question: input.question.trim(),
@@ -76,7 +95,16 @@ export function createDecisionStore(bb: BbPluginApi) {
         created_at: Date.now(),
         answered_at: null,
       };
-      insert.run(row);
+      if (!existing) insert.run(row);
+      // Owner decisions are keyed by the goal that owns them: the row handed
+      // back must be the row that same key reads, so the persisted owner is
+      // proved here rather than assumed from the insert argument.
+      const persistedOwner = (
+        persistedOwnerOf.get(row.id) as { thread_id: string } | undefined
+      )?.thread_id;
+      if (persistedOwner !== threadId) {
+        throw new DecisionOwnerMismatchError(threadId, row.id, persistedOwner ?? null);
+      }
       return rowToDecision(row);
     },
 

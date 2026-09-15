@@ -161,6 +161,25 @@ export function createItemReservationStore(db: PluginDatabase) {
       return txn.immediate();
     },
 
+    /**
+     * The fence's own unit of account: every non-retired worker row for the root
+     * plus every live reservation — exactly what `acquireStmt` and the
+     * `collab_agents_root_capacity_*` triggers count.
+     *
+     * Slot math MUST read this and never a projection of host statuses. The
+     * projection drops rows whose slice is already closed and rows that never
+     * had one (intake couriers, discovered children), while the fence counts
+     * them, so anything planned from the projection is a spawn that can never
+     * be admitted — and every refusal costs the slice five minutes.
+     */
+    occupancy(rootThreadId: string): number {
+      const row = rootOccupancy.get({
+        root_thread_id: rootThreadId,
+        now: Date.now(),
+      }) as { n: number } | undefined;
+      return row?.n ?? 0;
+    },
+
     isHeld(rootThreadId: string, itemId: string, exceptToken?: string): boolean {
       if (liveWorker.get(rootThreadId, itemId)) return true;
       const held = reservation.get(rootThreadId, itemId) as

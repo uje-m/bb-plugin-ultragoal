@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Automatic slice integration merges into the branch the worker environment
+  DECLARES, or into nothing. `integrateWorker` used to fall through
+  `mergeBaseBranch ?? defaultBranch ?? baseBranch`, so a worker environment that
+  named no merge base was squash-merged into the PROJECT DEFAULT and recorded as
+  `integrated`. `defaultBranch` describes the project and `baseBranch` records
+  where the worktree was cut from; neither says where a goal's work belongs.
+  (Measured on a live host: of the managed worktree environments carrying no
+  `mergeBaseBranch`, 100 have a `defaultBranch` that differs from their own
+  `baseBranch` — 47 of them `main` against `integration`, which on the
+  repository this plugin runs is the passive upstream tracker versus the
+  maintained base — and `base_branch` values include `origin/main` and bare
+  SHAs, which are not merge targets at all.) The refusal now takes the existing
+  stranded-work path: the integration register records the failure and the
+  branch, the defects closed on the worker's report reopen, the slice is
+  requeued naming its branch, and the root is steered — and the worktree, which
+  holds the only copy of that work, is not reclaimed. This closes the consumer
+  side of the defect whose producer side was closed by the worker-brief spawn
+  refusal.
 - The worker brief names the goal's real integration branch instead of the
   literal `main`, resolved from the root thread's environment (the same value
   the worker's worktree is cut from, so the rebase target and the base branch

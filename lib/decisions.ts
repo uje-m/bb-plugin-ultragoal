@@ -11,6 +11,7 @@ interface DecisionRow {
   answer: string | null;
   created_at: number;
   answered_at: number | null;
+  delivered_at: number | null;
 }
 
 function rowToDecision(row: DecisionRow): GoalDecision {
@@ -29,6 +30,7 @@ function rowToDecision(row: DecisionRow): GoalDecision {
     status: row.status,
     answer: row.answer,
     createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
   };
 }
 
@@ -51,6 +53,9 @@ export function createDecisionStore(bb: BbPluginApi) {
     WHERE thread_id = @thread_id AND id = @id
   `);
   const clearStmt = db.prepare("DELETE FROM goal_decisions WHERE thread_id = ?");
+  const markDeliveredStmt = db.prepare(
+    "UPDATE goal_decisions SET delivered_at = @delivered_at WHERE thread_id = @thread_id AND id = @id",
+  );
 
   return {
     request(
@@ -75,6 +80,7 @@ export function createDecisionStore(bb: BbPluginApi) {
         answer: null,
         created_at: Date.now(),
         answered_at: null,
+        delivered_at: null,
       };
       insert.run(row);
       return rowToDecision(row);
@@ -88,6 +94,18 @@ export function createDecisionStore(bb: BbPluginApi) {
     list(threadId: string, status?: GoalDecision["status"]): GoalDecision[] {
       const rows = (byThread.all(threadId) as DecisionRow[]).map(rowToDecision);
       return status ? rows.filter((decision) => decision.status === status) : rows;
+    },
+
+    /** Answered decisions whose steer to the root never landed. `delivered_at`
+     * is the source of truth; the pulse retries these until one lands. */
+    listUndelivered(threadId: string): GoalDecision[] {
+      return (byThread.all(threadId) as DecisionRow[])
+        .filter((row) => row.status === "answered" && row.delivered_at == null)
+        .map(rowToDecision);
+    },
+
+    markDelivered(threadId: string, id: string): void {
+      markDeliveredStmt.run({ thread_id: threadId, id, delivered_at: Date.now() });
     },
 
     resolve(

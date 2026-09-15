@@ -132,6 +132,8 @@ export const goalDecisionSchema = z.object({
   status: z.enum(["open", "answered", "withdrawn"]),
   answer: z.string().nullable(),
   createdAt: z.number().int(),
+  /** When the answer actually reached the root; null means still pending. */
+  deliveredAt: z.number().int().nullable().default(null),
 });
 
 export const goalFindingStatusSchema = z.enum(["open", "fixed", "dismissed"]);
@@ -188,6 +190,9 @@ export const goalSnapshotSchema = z.object({
     }),
   /** Open owner decisions — work that waits on the user, surfaced first. */
   decisions: z.array(goalDecisionSchema).default([]),
+  /** Answered decisions whose answer never reached the root. Without this a
+   * lost delivery is indistinguishable from "nothing is waiting". */
+  undeliveredDecisions: z.array(goalDecisionSchema).default([]),
   /** The delivery summary recorded when the goal was marked complete. */
   completionSummary: z.string().nullable().default(null),
 });

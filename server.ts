@@ -1095,12 +1095,17 @@ export default function plugin(bb: BbPluginApi) {
     const own = store.get(threadId);
     const row = collab.rowOf(threadId);
     const parentId = row?.parent_thread_id ?? providerParentId ?? null;
-    if (!parentId || parentId === threadId) return own;
-    // The recorded tree root wins; the parent itself is the fallback for a tree
-    // no collab row recorded.
+    // The recorded tree root wins whether or not the row recorded a parent —
+    // parent_thread_id is nullable, and a row can name its goal with no parent
+    // at all. The parent is only the fallback for a tree no collab row recorded;
+    // a row parenting itself is no tree reference either.
     const ownerThreadId =
       row?.root_thread_id ??
-      (store.get(parentId) ? parentId : collab.rowOf(parentId)?.root_thread_id ?? null);
+      (parentId && parentId !== threadId
+        ? store.get(parentId)
+          ? parentId
+          : collab.rowOf(parentId)?.root_thread_id ?? null
+        : null);
     if (!ownerThreadId || ownerThreadId === threadId) return own;
     const inherited = store.get(ownerThreadId);
     return inherited && isUnfinished(inherited.status) ? inherited : own;

@@ -289,6 +289,51 @@ describe("owner decision ownership", () => {
     assert.deepEqual(openDecisionIds(childState.text), [decisionId]);
   });
 
+  it("files a parentless worker's decision under the tree root its own row recorded", async () => {
+    const host = registeredHost();
+    const db = host.bb.storage.database();
+    const root = "thr_decision_parentless_root";
+    const worker = "thr_decision_parentless";
+    await startGoal(host, root, "Prove a row with no parent still names the goal tree it belongs to");
+    // parent_thread_id is nullable, so the recorded root_thread_id is the only
+    // tree reference this row carries. The caller-derived key is the worker
+    // itself while the tree root it recorded is the goal.
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES (?, ?, NULL, '/root/parentless-worker', 1, 'Parentless Worker', NULL, 'worker')
+    `).run(worker, root);
+    assert.equal(createCollabStore(host.bb).rootId(worker), root);
+
+    const decisionId = await requestDecision(
+      host,
+      worker,
+      "Does a parentless worker's question land under the recorded tree root?",
+    );
+    const row = db
+      .prepare("SELECT thread_id, status FROM goal_decisions WHERE id = ?")
+      .get(decisionId) as { thread_id: string; status: string };
+    assert.equal(row.thread_id, root, "the recorded tree root must own the decision");
+    assert.equal(row.status, "open");
+
+    const rootState = await callTool(host, "ultragoal_state", {}, root);
+    assert.equal(rootState.isError, false, rootState.text);
+    assert.deepEqual(openDecisionIds(rootState.text), [decisionId]);
+
+    // resolve_decision reads and writes through the same owner key.
+    const resolved = await callTool(
+      host,
+      "resolve_decision",
+      { decision: decisionId, resolution: "answered", answer: "Yes, under the recorded root." },
+      worker,
+    );
+    assert.equal(resolved.isError, false, resolved.text);
+    const after = await callTool(host, "ultragoal_state", {}, root);
+    assert.equal(after.isError, false, after.text);
+    assert.deepEqual(openDecisionIds(after.text), []);
+  });
+
   it("refuses to return a decision row the goal cannot read back", () => {
     const host = registeredHost();
     const db = host.bb.storage.database();

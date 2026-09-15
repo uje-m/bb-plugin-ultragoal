@@ -2,11 +2,13 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   createFakePluginHost,
+  makeThreadResponse,
   type CreateFakePluginHostOptions,
   type FakePluginHost,
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "../server.ts";
 import type { GoalSnapshot } from "../contract.js";
+import { createCollabStore } from "./collab.ts";
 import { DecisionOwnerMismatchError, createDecisionStore } from "./decisions.ts";
 import { progressPrompt } from "./prompts.ts";
 
@@ -242,12 +244,58 @@ describe("owner decision ownership", () => {
     assert.deepEqual(openDecisionIds(state.text).sort(), [rootDecisionId, workerDecisionId].sort());
   });
 
+  it("files a childless worker's decision under the goal root its own state projects", async () => {
+    const root = "thr_decision_owner_root";
+    const childless = "thr_decision_childless";
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            status: "idle",
+            parentThreadId: threadId === childless ? root : null,
+          }),
+      },
+    });
+    const db = host.bb.storage.database();
+    await startGoal(host, root, "Prove a childless worker's decision is owned by its goal root");
+
+    // No collab row recorded this child's tree, so the caller-derived key is the
+    // child itself while the goal its own tool surface resolves is the root.
+    // That difference is the defect: keying by the caller-derived id files the
+    // decision where the goal's projection never reads it.
+    const collab = createCollabStore(host.bb);
+    assert.equal(collab.rootId(childless), childless);
+    assert.notEqual(collab.rootId(childless), root);
+
+    const decisionId = await requestDecision(
+      host,
+      childless,
+      "Does a childless worker's question land under the goal root?",
+    );
+    const row = db
+      .prepare("SELECT thread_id, status FROM goal_decisions WHERE id = ?")
+      .get(decisionId) as { thread_id: string; status: string };
+    assert.equal(row.thread_id, root, "the decision must be owned by the goal row, not the caller");
+    assert.equal(row.status, "open");
+
+    const rootState = await callTool(host, "ultragoal_state", {}, root);
+    assert.equal(rootState.isError, false, rootState.text);
+    assert.deepEqual(openDecisionIds(rootState.text), [decisionId]);
+
+    // The child reads the same board through the same resolution.
+    const childState = await callTool(host, "ultragoal_state", {}, childless);
+    assert.equal(childState.isError, false, childState.text);
+    assert.deepEqual(openDecisionIds(childState.text), [decisionId]);
+  });
+
   it("refuses to return a decision row the goal cannot read back", () => {
     const host = registeredHost();
     const db = host.bb.storage.database();
-    // A store writing a caller-derived key persists the row under a thread the
-    // goal never reads. The owner guard must refuse that row instead of handing
-    // back an id the goal's own projection can never show.
+    const owner = "thr_decision_guard";
+    // The store only accepts an owner key that names a goal row, so give this
+    // thread a real goal and let the trigger hijack the persisted key instead.
+    db.prepare("UPDATE goals SET thread_id = ? WHERE thread_id = 'thr_sentinel'").run(owner);
     db.exec(`
       CREATE TRIGGER decision_owner_hijack AFTER INSERT ON goal_decisions
       BEGIN
@@ -256,14 +304,67 @@ describe("owner decision ownership", () => {
     `);
     const decisions = createDecisionStore(host.bb);
     assert.throws(
-      () => decisions.request("thr_decision_guard", { question: "Who owns this row?" }),
-      DecisionOwnerMismatchError,
+      () => decisions.request(owner, { question: "Who owns this row?" }),
+      (error: unknown) => {
+        assert.ok(error instanceof DecisionOwnerMismatchError);
+        assert.equal(error.persistedOwner, "thr_not_the_goal");
+        return true;
+      },
+    );
+    // The refused write is rolled back whole: no row under the goal and none
+    // under the hijack key either.
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS n FROM goal_decisions").get() as { n: number }).n,
+      0,
+      "a refused owner key must leave no open decision row behind",
+    );
+  });
+
+  it("rejects an owner key that names no goal row", () => {
+    const host = registeredHost();
+    const decisions = createDecisionStore(host.bb);
+    assert.throws(
+      () => decisions.request("thr_not_a_goal", { question: "Does a goal-less key persist?" }),
+      (error: unknown) => {
+        assert.ok(error instanceof DecisionOwnerMismatchError);
+        assert.equal(error.persistedOwner, null);
+        return true;
+      },
     );
     assert.equal(
-      db
-        .prepare("SELECT id FROM goal_decisions WHERE thread_id = 'thr_decision_guard'")
-        .get() as { id: string } | undefined,
-      undefined,
+      (
+        host.bb.storage.database().prepare("SELECT COUNT(*) AS n FROM goal_decisions").get() as {
+          n: number;
+        }
+      ).n,
+      0,
+    );
+  });
+
+  it("refuses to resolve a decision once its goal row is gone, naming the decision", async () => {
+    const host = registeredHost();
+    const root = "thr_decision_orphan";
+    await startGoal(host, root, "Prove a decision cannot be answered after its goal row is cleared");
+    const decisionId = await requestDecision(host, root, "Answer this before the goal is cleared?");
+    host.bb.storage.database().prepare("DELETE FROM goals WHERE thread_id = ?").run(root);
+
+    const resolved = await callTool(
+      host,
+      "resolve_decision",
+      { decision: decisionId, resolution: "answered", answer: "The goal is gone." },
+      root,
+    );
+    assert.equal(resolved.isError, true);
+    assert.match(resolved.text, new RegExp(decisionId));
+    // The refusal changed nothing: the decision is still open, not silently
+    // answered against a goal that no longer exists.
+    assert.equal(
+      (
+        host.bb.storage.database().prepare("SELECT status FROM goal_decisions WHERE id = ?").get(
+          decisionId,
+        ) as { status: string } | undefined
+      )?.status,
+      "open",
     );
   });
 });

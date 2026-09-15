@@ -271,9 +271,19 @@ describe("large-plan agent tool contracts", () => {
     );
   });
 
-  it("pins the decision id request_decision returns in ultragoal_state", async () => {
-    const host = registeredHost();
+  it("pins the decision id request_decision returns in ultragoal_state, from the root and a childless worker", async () => {
     const threadId = "thr_decision_contract";
+    const childThreadId = "thr_decision_contract_child";
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId: queried }) =>
+          makeThreadResponse({
+            id: queried,
+            status: "idle",
+            parentThreadId: queried === childThreadId ? threadId : null,
+          }),
+      },
+    });
     const started = await host.harness.behavior.callAgentTool(
       "ultragoal_start",
       { objective: "Pin the request_decision contract at the registered tool boundary" },
@@ -290,6 +300,19 @@ describe("large-plan agent tool contracts", () => {
     const decisionId = (JSON.parse(toolText(requested)) as { decision_id: string }).decision_id;
     assert.match(decisionId, /^dec_/);
 
+    // A worker with no collab row resolves its goal through the provider parent.
+    // The registered tool must key its decision by that goal, not by the id the
+    // caller happens to report.
+    const childRequested = await host.harness.behavior.callAgentTool(
+      "request_decision",
+      { question: "Does a childless worker's decision reach the goal's own state?" },
+      { threadId: childThreadId },
+    );
+    assert.equal(isToolError(childRequested), false, toolText(childRequested));
+    const childDecisionId = (JSON.parse(toolText(childRequested)) as { decision_id: string })
+      .decision_id;
+    assert.match(childDecisionId, /^dec_/);
+
     const state = await host.harness.behavior.callAgentTool("ultragoal_state", {}, { threadId });
     assert.equal(isToolError(state), false);
     const openDecisions = (JSON.parse(toolText(state)) as {
@@ -299,6 +322,14 @@ describe("large-plan agent tool contracts", () => {
       openDecisions.includes(decisionId),
       `ultragoal_state must project the decision request_decision returned: ${decisionId}`,
     );
+    assert.ok(
+      openDecisions.includes(childDecisionId),
+      `ultragoal_state must project a childless worker's decision: ${childDecisionId}`,
+    );
+    const childOwner = host.bb.storage.database()
+      .prepare("SELECT thread_id FROM goal_decisions WHERE id = ?")
+      .get(childDecisionId) as { thread_id: string };
+    assert.equal(childOwner.thread_id, threadId);
   });
 
   it("reconstructs a transferred Codex root with canonical tools and live instructions", async () => {

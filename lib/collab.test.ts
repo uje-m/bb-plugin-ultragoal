@@ -1,5 +1,8 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -8,9 +11,12 @@ import {
 import { COLLAB_TOOL_NAMES, createCollabStore } from "./collab.ts";
 
 const hosts: FakePluginHost[] = [];
+/** Throwaway checkout trees, so a warning test never leaves bytes behind. */
+const trees: string[] = [];
 
 afterEach(async () => {
   while (hosts.length > 0) await hosts.pop()!.harness.lifecycle.dispose();
+  while (trees.length > 0) await rm(trees.pop()!, { recursive: true, force: true });
 });
 
 function collabHost(options?: {
@@ -20,6 +26,8 @@ function collabHost(options?: {
   rootBranch?: string;
   /** Root environment that exists but names no branch at all. */
   rootEnvWithoutBranch?: boolean;
+  /** Root environment on-disk path: the tree a worker would be cut from. */
+  rootEnvPath?: string;
 }) {
   const stopped: string[] = [];
   const prompts: string[] = [];
@@ -54,7 +62,11 @@ function collabHost(options?: {
           prompts.push(args.prompt ?? "");
           spawnArgsSeen.push(args);
           return makeThreadResponse({
-            id: "thr_spawned",
+            // A real spawn mints a fresh thread id every time; keep the first
+            // one stable (triggers key on it) and make the rest unique, so a
+            // test that staffs the same root twice is not fighting the
+            // collab_agents primary key.
+            id: spawnCalls === 1 ? "thr_spawned" : `thr_spawned_${spawnCalls}`,
             parentThreadId: "thr_root",
             projectId: "proj",
             providerId: "acp-opencode",
@@ -88,6 +100,7 @@ function collabHost(options?: {
           branchName: options?.rootBranch ?? null,
           mergeBaseBranch: null,
           defaultBranch: "main",
+          path: options?.rootEnvPath ?? null,
         }),
       } as never,
     },
@@ -287,6 +300,287 @@ describe("scheduler-strict collaboration spawns", () => {
     assert.doesNotMatch(state.prompts[0]!, /npm test -- domain/);
     assert.match(state.prompts[0]!, /fnd_public_verifier/);
     assert.match(state.prompts[0]!, /DEFECT_COVERAGE/);
+  });
+
+  it("refuses to staff a slice whose finding was filed from another repository", async () => {
+    // The staffing path cuts the worker worktree from the GOAL's project. A
+    // finding filed from a different repository names a file that checkout has
+    // never contained, so the worker's only exits were slice_blocked or
+    // creating the file in the wrong repository and reporting done. Observed: a
+    // slice scoped to server.ts handed a worktree of a repo with no
+    // server.ts. Guarding the refusal, not the prompt wording.
+    const state = collabHost({
+      discovered: [
+        makeThreadResponse({
+          id: "thr_root",
+          projectId: "proj_omegacode",
+          providerId: "acp-opencode",
+          environmentId: null,
+          status: "idle",
+        }),
+      ],
+    });
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: () => ({
+        files: ["lib/collab.ts"],
+        linkedDefects: "LINKED DEFECTS: fnd_cross_repo",
+        findingProjectIds: ["proj_ultragoal"],
+      }),
+    });
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_collab",
+        item_id: "itm_cross_repo",
+        message: "SLICE (item_id=itm_cross_repo): fix the staffing path",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj_omegacode" },
+    );
+
+    assert.equal(
+      (result as { isError?: boolean }).isError,
+      true,
+      JSON.stringify(result),
+    );
+    const refusal = JSON.stringify(result);
+    assert.match(refusal, /proj_ultragoal/, "the refusal must name the project that owns the fix");
+    assert.match(refusal, /proj_omegacode/, "and the project this goal actually cuts from");
+    assert.equal(
+      state.spawnCalls(),
+      0,
+      "a worker must never receive a checkout that cannot contain its scoped files",
+    );
+  });
+
+  it("still staffs a finding filed from the project this goal cuts from", async () => {
+    // Positive control: a refusal that fired on every finding-derived slice
+    // would pass the test above and take all remediation staffing down with it.
+    // Recorded provenance that MATCHES must stay a normal spawn.
+    const state = collabHost();
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: () => ({
+        files: ["lib/collab.ts"],
+        linkedDefects: "LINKED DEFECTS: fnd_same_repo",
+        findingProjectIds: ["proj"],
+      }),
+    });
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_local",
+        item_id: "itm_same_repo",
+        message: "SLICE (item_id=itm_same_repo): fix it here",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.equal(
+      (result as { isError?: boolean }).isError ?? false,
+      false,
+      JSON.stringify(result),
+    );
+    assert.equal(state.spawnCalls(), 1);
+  });
+
+  it("staffs findings recorded before project provenance existed", async () => {
+    // Second positive control. Every finding filed before the column existed
+    // carries no project, and 170 live rows are in exactly that state. Absent
+    // provenance is not a mismatch: reading it as one would refuse the entire
+    // existing remediation backlog.
+    const state = collabHost();
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: () => ({
+        files: ["server.ts"],
+        linkedDefects: "LINKED DEFECTS: fnd_legacy",
+      }),
+    });
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_legacy",
+        item_id: "itm_legacy",
+        message: "SLICE (item_id=itm_legacy): legacy finding, no provenance",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.equal(
+      (result as { isError?: boolean }).isError ?? false,
+      false,
+      JSON.stringify(result),
+    );
+    assert.equal(state.spawnCalls(), 1);
+  });
+
+  it("warns but still staffs when a declared path is absent from the tree being cut", async () => {
+    // The in-plan instance, reproduced: a row declared
+    // `test/import-closure.test.ts`, which does not exist, while the real file
+    // is `test/host-only/import-closure.test.ts`. Existence cannot be a gate —
+    // 68 of 170 live findings name a path absent from their base branch and
+    // only 8 are cross-repository, so refusing on absence would refuse sixty
+    // correct stale-base slices to catch eight. It is still worth saying out
+    // loud before the worker spends a turn finding out, and worth NOT saying
+    // for the paths that do resolve.
+    const tree = await mkdtemp(join(tmpdir(), "ug-staffed-tree-"));
+    trees.push(tree);
+    await mkdir(join(tree, "test", "host-only"), { recursive: true });
+    await writeFile(join(tree, "test", "host-only", "import-closure.test.ts"), "// present\n");
+
+    const state = collabHost({ rootBranch: "integration", rootEnvPath: tree });
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: () => ({
+        files: ["test/import-closure.test.ts", "test/host-only/import-closure.test.ts"],
+        linkedDefects: "LINKED DEFECTS: fnd_wrong_path",
+      }),
+    });
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_import_closure",
+        item_id: "itm_wrong_path",
+        message: "SLICE (item_id=itm_wrong_path): fix the closure test",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.equal(
+      (result as { isError?: boolean }).isError ?? false,
+      false,
+      `a warning must not refuse the slice: ${JSON.stringify(result)}`,
+    );
+    assert.equal(state.spawnCalls(), 1, "the worker is staffed anyway");
+
+    const warning = state.host.harness.inspection.logEntries.find(
+      (entry) => entry.level === "warn" && entry.message.includes("declared path(s) absent"),
+    );
+    assert.ok(warning, JSON.stringify(state.host.harness.inspection.logEntries));
+    assert.match(warning.message, /test\/import-closure\.test\.ts/);
+    assert.match(warning.message, new RegExp(tree));
+    assert.doesNotMatch(
+      warning.message,
+      /host-only/,
+      "a declared path that resolves must not be reported as missing",
+    );
+  });
+
+  it("staffs a mixed provenance list when one recorded project is the goal's own", async () => {
+    // The field is a LIST because coalescing can link findings filed from
+    // different threads, so the two candidate rules are not equivalent: "staff
+    // when ANY recorded project matches" versus "refuse when ANY mismatches".
+    // This is the former — a goal serving its own project keeps working even
+    // when a sibling linked finding came from elsewhere — and it is pinned here
+    // because an over-broad refusal (refuse on any foreign id) satisfies the
+    // refusal test above and would stop legitimate multi-finding remediation.
+    //
+    // An explicitly EMPTY list is pinned in the same test: "recorded, but no
+    // project" proves no mismatch either, exactly like the omitted field the
+    // legacy control covers.
+    const state = collabHost();
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: (_root, itemId) =>
+        itemId === "itm_empty"
+          ? { files: ["lib/collab.ts"], linkedDefects: "LINKED DEFECTS: fnd_unknown", findingProjectIds: [] }
+          : {
+              files: ["lib/collab.ts"],
+              linkedDefects: "LINKED DEFECTS: fnd_here, fnd_elsewhere",
+              findingProjectIds: ["proj", "proj_ultragoal"],
+            },
+    });
+    collab.registerTools();
+
+    const mixed = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_mixed",
+        item_id: "itm_mixed",
+        message: "SLICE (item_id=itm_mixed): one finding is mine",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    const empty = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_empty",
+        item_id: "itm_empty",
+        message: "SLICE (item_id=itm_empty): provenance recorded empty",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+    assert.equal(
+      (mixed as { isError?: boolean }).isError ?? false,
+      false,
+      JSON.stringify(mixed),
+    );
+    assert.equal(
+      (empty as { isError?: boolean }).isError ?? false,
+      false,
+      JSON.stringify(empty),
+    );
+    assert.equal(state.spawnCalls(), 2);
+  });
+
+  it("refuses nothing when the goal's own project cannot be determined", async () => {
+    // Fail closed on proven MISMATCH, never on missing data. The scheduler's
+    // own staffing path passes no project of its own (spawnWorker → projectId:
+    // undefined), so a root thread that names no project leaves nothing to
+    // compare against: the guard stays silent rather than refusing a slice it
+    // has no evidence about.
+    const state = collabHost({
+      discovered: [
+        makeThreadResponse({
+          id: "thr_root",
+          // The fake host names a project for every thread unless told
+          // otherwise, and an EMPTY one is how "no cut project to compare
+          // against" is expressed here.
+          projectId: "",
+          providerId: "acp-opencode",
+          environmentId: null,
+          status: "idle",
+        }),
+      ],
+    });
+    let briefLookups = 0;
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => request.itemId ?? null,
+      itemBrief: () => {
+        briefLookups += 1;
+        return {
+          files: ["lib/collab.ts"],
+          linkedDefects: "LINKED DEFECTS: fnd_cross_repo",
+          findingProjectIds: ["proj_ultragoal"],
+        };
+      },
+    });
+
+    const result = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: "itm_unknown",
+      displayName: "Unknown Project",
+      message: "SLICE (item_id=itm_unknown): no cut project recorded",
+      maxWorkers: 1,
+    });
+    assert.ok("threadId" in result, JSON.stringify(result));
+    // Proves the guard RAN and stayed silent, rather than never being reached:
+    // without this, an implementation that skipped the provenance lookup on the
+    // scheduler path would pass the assertion above unchanged.
+    assert.equal(briefLookups, 1, "the brief — and so the provenance — was consulted");
+    assert.equal(state.spawnCalls(), 1);
   });
 
   it("names the root environment's branch in the worker brief, not a hardcoded main", async () => {

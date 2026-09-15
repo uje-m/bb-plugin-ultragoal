@@ -1380,3 +1380,106 @@ describe("automatic slice integration", () => {
     assert.match(requeued.step, /STRANDED WORK/);
   });
 });
+
+describe("cross-repo staffing provenance", () => {
+  function crossRepoHost() {
+    // The goal root stands in ONE project; a filer inside the tree stands in
+    // another. That is the whole incident: staffing cuts the worker worktree
+    // from the goal's project, so a finding filed against another repository
+    // scopes its slice to files that checkout has never contained.
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            projectId: threadId === "thr_foreign" ? "proj_ultragoal" : "proj_omegacode",
+            providerId: "acp-opencode",
+            environmentId: null,
+            status: "idle",
+          }),
+        list: () => [],
+        spawn: (args) =>
+          makeThreadResponse({
+            id: "thr_staffed",
+            projectId: "proj_omegacode",
+            providerId: "acp-opencode",
+            environmentId: null,
+            parentThreadId: "thr_root",
+            status: "active",
+          }),
+        update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        send: () => ({ ok: true }),
+        timeline: () => ({ rows: [] }),
+        interactions: { list: async () => [] },
+      },
+    });
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id = 'thr_root', status = 'active', max_workers = 2 WHERE thread_id = 'thr_sentinel'",
+    ).run();
+    // The filer is a goal-tree child holding no slice, so rootId() resolves the
+    // finding to the goal while its own thread project stays the foreign one.
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_foreign', 'thr_root', 'thr_root', '/root/filer', 1,
+        'The Filer', NULL, 'worker')
+    `).run();
+    return host;
+  }
+
+  it("captures the filing thread's project and refuses to staff that slice here", async () => {
+    // Both halves in one run, because either alone is inert: without capture
+    // the refusal has nothing to compare, and without the refusal the capture
+    // is a column nobody reads. Provenance is read host-side from the thread,
+    // never from the tool's arguments, so a filer cannot name its own repo.
+    const host = crossRepoHost();
+    const findings = createFindingStore(host.bb);
+
+    const filed = await host.harness.behavior.callAgentTool(
+      "report_finding",
+      {
+        title: "A finding whose file lives outside the goal's project",
+        file: "lib/collab.ts:750",
+        evidence: "lib/collab.ts exists only in the plugin repository.",
+      },
+      { threadId: "thr_foreign" },
+    );
+    assert.equal(isToolError(filed), false, JSON.stringify(filed));
+    // registerFinding schedules staffing with `void scheduleReady(...)`, so the
+    // spawn attempt it arms is still in flight when the tool returns. Drain that
+    // turn here, or it lands on the next test's already-closed database.
+    for (let index = 0; index < 8; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const finding = findings.remediationQueue("thr_root")[0]!;
+    assert.equal(
+      finding.projectId,
+      "proj_ultragoal",
+      "the filing thread's project is captured without being passed in",
+    );
+
+    // Staff the slice the plugin itself minted for this finding — that is the
+    // one whose brief carries the provenance, so a hand-made item would prove
+    // nothing about the real path.
+    const itemId = finding.itemId;
+    assert.ok(itemId, "a new finding is assigned its own fix slice");
+
+    const staffed = await host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "fix_cross_repo",
+        item_id: itemId,
+        message: `SLICE (item_id=${itemId}): fix the staffing path`,
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj_omegacode" },
+    );
+    assert.equal(isToolError(staffed), true, JSON.stringify(staffed));
+    const refusal = JSON.stringify(staffed);
+    assert.match(refusal, /proj_ultragoal/);
+    assert.match(refusal, /proj_omegacode/);
+  });
+});

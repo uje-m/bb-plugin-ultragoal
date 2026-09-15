@@ -18,6 +18,15 @@ const isToolError = (result: unknown): boolean =>
     ? (result as { isError?: boolean }).isError === true
     : false;
 
+// ultragoal_state answers with a JSON string while most tools answer with a
+// content block; both carry the tool's text payload.
+const toolText = (result: unknown): string =>
+  typeof result === "string"
+    ? result
+    : ((result as { content?: Array<{ text?: string }> }).content ?? [])
+        .map((part) => part.text ?? "")
+        .join("\n");
+
 afterEach(async () => {
   while (hosts.length > 0) await hosts.pop()!.harness.lifecycle.dispose();
 });
@@ -259,6 +268,36 @@ describe("large-plan agent tool contracts", () => {
         "SELECT status FROM goals WHERE thread_id = 'thr_codex'",
       ).get() as { status: string }).status,
       "complete",
+    );
+  });
+
+  it("pins the decision id request_decision returns in ultragoal_state", async () => {
+    const host = registeredHost();
+    const threadId = "thr_decision_contract";
+    const started = await host.harness.behavior.callAgentTool(
+      "ultragoal_start",
+      { objective: "Pin the request_decision contract at the registered tool boundary" },
+      { threadId },
+    );
+    assert.equal(isToolError(started), false);
+
+    const requested = await host.harness.behavior.callAgentTool(
+      "request_decision",
+      { question: "Does the tool surface read back the decision it persisted?" },
+      { threadId },
+    );
+    assert.equal(isToolError(requested), false);
+    const decisionId = (JSON.parse(toolText(requested)) as { decision_id: string }).decision_id;
+    assert.match(decisionId, /^dec_/);
+
+    const state = await host.harness.behavior.callAgentTool("ultragoal_state", {}, { threadId });
+    assert.equal(isToolError(state), false);
+    const openDecisions = (JSON.parse(toolText(state)) as {
+      goal: { openDecisions: Array<{ decision_id: string }> };
+    }).goal.openDecisions.map((decision) => decision.decision_id);
+    assert.ok(
+      openDecisions.includes(decisionId),
+      `ultragoal_state must project the decision request_decision returned: ${decisionId}`,
     );
   });
 

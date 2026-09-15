@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { rpcContract, type GoalAgent, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
+import { rpcContract, type GoalAgent, type GoalDecision, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
 import {
   accountGoalProgress,
   readThreadTokens,
@@ -1082,27 +1082,34 @@ export default function plugin(bb: BbPluginApi) {
   const decisionPromptBackoff = new Map<string, number>();
   const DECISION_PROMPT_BACKOFF_MS = 10 * 60_000;
 
+  // The goal that owns decisions for a caller. Decision rows are keyed by the
+  // goal's own thread id, so a caller-derived id (a worker's own thread, a
+  // stale root) must never reach the store as an owner key.
+  function decisionOwnerFor(threadId: string): StoredGoal | null {
+    return store.get(collab.rootId(threadId));
+  }
+
   async function applyDecisionAnswer(
-    rootThreadId: string,
+    goalThreadId: string,
     decisionId: string,
     answer: string,
   ): Promise<boolean> {
-    const resolved = decisions.resolve(rootThreadId, decisionId, "answered", answer);
+    const resolved = decisions.resolve(goalThreadId, decisionId, "answered", answer);
     if (!resolved) return false;
-    markGoalEvent(rootThreadId);
+    markGoalEvent(goalThreadId);
     decisionAborts.get(decisionId)?.abort();
-    const goal = store.get(rootThreadId);
-    if (goal) publish(rootThreadId, view(goal));
-    bb.log.info(`Owner decision ${decisionId} answered on ${rootThreadId}: ${answer.slice(0, 80)}`);
+    const goal = store.get(goalThreadId);
+    if (goal) publish(goalThreadId, view(goal));
+    bb.log.info(`Owner decision ${decisionId} answered on ${goalThreadId}: ${answer.slice(0, 80)}`);
     await sendSteering(
-      rootThreadId,
+      goalThreadId,
       `OWNER DECISION ANSWERED (${decisionId}): "${resolved.question}" -> ${answer}. Act on this now and resolve any dependent work.`,
-      (await threadIsRunning(bb, rootThreadId)) ? "steer" : "start",
+      (await threadIsRunning(bb, goalThreadId)) ? "steer" : "start",
     );
     return true;
   }
 
-  function raiseDecisionPrompt(rootThreadId: string, decisionId: string): void {
+  function raiseDecisionPrompt(goalThreadId: string, decisionId: string): void {
     if (decisionKeepers.has(decisionId) || decisionDismissed.has(decisionId)) return;
     const failedAt = decisionPromptBackoff.get(decisionId);
     if (failedAt != null && Date.now() - failedAt < DECISION_PROMPT_BACKOFF_MS) return;
@@ -1110,7 +1117,7 @@ export default function plugin(bb: BbPluginApi) {
     void (async () => {
       try {
         while (true) {
-          const current = decisions.get(rootThreadId, decisionId);
+          const current = decisions.get(goalThreadId, decisionId);
           if (!current || current.status !== "open") return;
           const controller = new AbortController();
           decisionAborts.set(decisionId, controller);
@@ -1124,7 +1131,7 @@ export default function plugin(bb: BbPluginApi) {
                 : current.question;
             result = await bb.ui.requestInput(
               {
-                threadId: rootThreadId,
+                threadId: goalThreadId,
                 rendererId: "owner-decision",
                 title,
                 payload: {
@@ -1132,7 +1139,7 @@ export default function plugin(bb: BbPluginApi) {
                   question: current.question,
                   context: current.context,
                   options: current.options,
-                  threadId: rootThreadId,
+                  threadId: goalThreadId,
                 },
                 timeoutMs: 60 * 60_000,
               },
@@ -1141,7 +1148,7 @@ export default function plugin(bb: BbPluginApi) {
           } catch (error) {
             decisionPromptBackoff.set(decisionId, Date.now());
             bb.log.warn(
-              `Owner-decision prompt failed on ${rootThreadId}: ${
+              `Owner-decision prompt failed on ${goalThreadId}: ${
                 error instanceof Error ? error.message : String(error)
               } (backing off 10m)`,
             );
@@ -1155,7 +1162,7 @@ export default function plugin(bb: BbPluginApi) {
               typeof raw === "string" ? raw : String((raw as { answer?: unknown })?.answer ?? "")
             ).trim();
             if (!answer) continue;
-            await applyDecisionAnswer(rootThreadId, decisionId, answer);
+            await applyDecisionAnswer(goalThreadId, decisionId, answer);
             return;
           }
           if (result.reason === "timeout") continue;
@@ -1174,9 +1181,9 @@ export default function plugin(bb: BbPluginApi) {
     })();
   }
 
-  function ensureDecisionPrompts(rootThreadId: string): void {
-    for (const decision of decisions.list(rootThreadId, "open")) {
-      raiseDecisionPrompt(rootThreadId, decision.id);
+  function ensureDecisionPrompts(goalThreadId: string): void {
+    for (const decision of decisions.list(goalThreadId, "open")) {
+      raiseDecisionPrompt(goalThreadId, decision.id);
     }
   }
 
@@ -3350,6 +3357,9 @@ export default function plugin(bb: BbPluginApi) {
       if (!accounted) {
         return { content: [{ type: "text", text: "no UltraGoal" }], isError: true };
       }
+      // Decisions are owned by the goal's own thread id; the gate must read the
+      // same key request_decision writes.
+      const owner = accounted.threadId;
       if (status === "complete") {
         if (!summary || summary.trim().length < 40) {
           return { content: [{ type: "text", text: "completion requires a substantive delivery summary" }], isError: true };
@@ -3361,13 +3371,17 @@ export default function plugin(bb: BbPluginApi) {
             isError: true,
           };
         }
-        const openDecisions = decisions.list(rootThreadId, "open");
+        const openDecisions = decisions.list(owner, "open");
         const openFindings = findings.list(rootThreadId, "open");
         if (openDecisions.length > 0 || openFindings.length > 0) {
+          const openDecisionText =
+            openDecisions.length > 0
+              ? `${openDecisions.length} owner decision(s) (${openDecisions.map((decision) => decision.id).join(", ")})`
+              : "0 owner decision(s)";
           return {
             content: [{
               type: "text",
-              text: `cannot complete: ${openDecisions.length} owner decision(s) and ${openFindings.length} open defect(s) remain`,
+              text: `cannot complete: ${openDecisionText} and ${openFindings.length} open defect(s) remain`,
             }],
             isError: true,
           };
@@ -3736,18 +3750,38 @@ export default function plugin(bb: BbPluginApi) {
       options: z.array(z.string()).optional().describe("Concrete answer options, if enumerable."),
     }),
     async execute({ question, context, options }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
-      const goal = store.get(rootThreadId);
+      const goal = decisionOwnerFor(threadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
         return {
           content: [{ type: "text", text: "no active UltraGoal on this thread tree" }],
           isError: true,
         };
       }
-      const decision = decisions.request(rootThreadId, { question, context, options });
-      bb.log.info(`Owner decision ${decision.id} requested on ${rootThreadId}: ${question.slice(0, 80)}`);
-      raiseDecisionPrompt(rootThreadId, decision.id);
-      void publishFresh(rootThreadId);
+      const owner = goal.threadId;
+      let requested: GoalDecision;
+      try {
+        requested = decisions.request(owner, { question, context, options });
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+          isError: true,
+        };
+      }
+      // Read the row back through the same owner key before reporting success:
+      // a decision the goal's own projection cannot see is not an open decision.
+      const decision = decisions.get(owner, requested.id);
+      if (!decision || decision.id !== requested.id || decision.status !== "open") {
+        return {
+          content: [{
+            type: "text",
+            text: `owner decision ${requested.id} is not open under goal ${owner} after persisting (read back ${decision ? decision.status : "nothing"}); refusing to report it as open`,
+          }],
+          isError: true,
+        };
+      }
+      bb.log.info(`Owner decision ${decision.id} requested on ${owner}: ${question.slice(0, 80)}`);
+      raiseDecisionPrompt(owner, decision.id);
+      void publishFresh(owner);
       return {
         content: [
           {
@@ -3773,8 +3807,18 @@ export default function plugin(bb: BbPluginApi) {
       answer: z.string().min(1).describe("The owner's answer verbatim, or why it is moot."),
     }),
     async execute({ decision, resolution, answer }, { threadId }) {
-      const rootThreadId = collab.rootId(threadId);
-      const resolved = decisions.resolve(rootThreadId, decision, resolution, answer);
+      const goal = decisionOwnerFor(threadId);
+      if (!goal) {
+        return {
+          content: [{
+            type: "text",
+            text: "no UltraGoal on this thread tree; an owner decision is always owned by a goal",
+          }],
+          isError: true,
+        };
+      }
+      const owner = goal.threadId;
+      const resolved = decisions.resolve(owner, decision, resolution, answer);
       if (!resolved) {
         return {
           content: [{ type: "text", text: `decision not found: ${decision}` }],
@@ -3782,8 +3826,8 @@ export default function plugin(bb: BbPluginApi) {
         };
       }
       decisionAborts.get(resolved.id)?.abort();
-      markGoalEvent(rootThreadId);
-      void publishFresh(rootThreadId);
+      markGoalEvent(owner);
+      void publishFresh(owner);
       return {
         content: [
           { type: "text", text: JSON.stringify({ decision_id: resolved.id, status: resolved.status }) },
@@ -4437,7 +4481,8 @@ export default function plugin(bb: BbPluginApi) {
         if (!decisionId || !answer) {
           return { exitCode: 1, stderr: "Usage: bb ultragoal decide <decision_id> <answer> [--thread <id>]" };
         }
-        const applied = await applyDecisionAnswer(threadId, decisionId, answer);
+        const owner = decisionOwnerFor(threadId);
+        const applied = owner ? await applyDecisionAnswer(owner.threadId, decisionId, answer) : false;
         if (!applied) return { exitCode: 1, stderr: `Decision not found: ${decisionId}` };
         return { exitCode: 0, stdout: `Decision ${decisionId} answered: ${answer}` };
       }

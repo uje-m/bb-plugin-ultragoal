@@ -40,6 +40,24 @@ _Avoid_: Unknown execution, inherited change
 A dispatched launch intent for which the provider has not yet emitted matching acceptance.
 _Avoid_: Assignment, launch blocked
 
+## Verifier enforcement
+
+**Enforced read-only execution environment**:
+A verifier execution environment whose selected provider and host combination is proven to deny file and command mutation for the verifier's lifetime. Approval-mode naming alone does not establish it.
+_Avoid_: Auto mode, approval gate, sandbox by name
+
+**Verifier capability proof**:
+Positive provider or host evidence, obtained before allocation, that the selected verifier execution can enforce the required read-only capability. A request echo is not proof.
+_Avoid_: Requested value, assumed support, configured mode
+
+**Pre-allocation verifier rejection**:
+The refusal of a verifier selection whose read-only capability is unavailable or unprovable, before reserving capacity, creating a worktree, or spawning a child.
+_Avoid_: Spawn failure, late validation, permission widening
+
+**Goal-scoped worker permission**:
+The permission policy one goal applies to its own workers. It is independent of the verifier policy and is never widened to accommodate a verifier provider.
+_Avoid_: Installation default, global permission
+
 ## Ownership and recovery
 
 **Assignment**:
@@ -69,3 +87,19 @@ _Avoid_: Quarantined attempt, ordinary pending
 **Attempt generation**:
 One initial launch and its bounded automatic retries, sharing one retry budget and one idempotent identity.
 _Avoid_: Scheduler pass, individual retry
+
+**Roll target revision**:
+The one execution revision an active rolling replacement is pinned to for its whole lifetime. A later settings edit does not retarget it.
+_Avoid_: Current revision, latest settings
+
+**Replacement mapping**:
+The durable per-worker record pairing each replaced worker with its successor, carrying the roll target revision and the successor's evidence state.
+_Avoid_: Change log, in-memory transition
+
+**Roll pause**:
+Stopping a rolling replacement without releasing ownership or capacity because dirty or external work, stop failure, or unknown evidence makes replacement unsafe.
+_Avoid_: Release, cancel
+
+**Frozen roll**:
+An owner-cancelled rolling replacement whose remaining ownership and slice context stay held. It neither releases nor redispatches work.
+_Avoid_: Aborted roll, released roll

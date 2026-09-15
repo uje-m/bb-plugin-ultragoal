@@ -37,7 +37,10 @@ function hostWithStore(pluginId: string, preCreateOldTable = false): { decisions
       );
     `);
   }
-  createGoalStore(host.bb);
+  const goals = createGoalStore(host.bb);
+  // An owner decision is keyed by a goal row and #38 fails closed without one,
+  // so a delivery test must own a real goal before it can request a decision.
+  goals.set({ threadId: "thr_root", objective: "Deliver answered decisions", status: "active" });
   return { decisions: createDecisionStore(host.bb) };
 }
 

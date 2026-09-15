@@ -134,7 +134,25 @@ export const goalDecisionSchema = z.object({
   createdAt: z.number().int(),
 });
 
-export const goalFindingStatusSchema = z.enum(["open", "fixed", "dismissed"]);
+/**
+ * `fixed` is reserved for a fix that is shown to be live where it must run:
+ * the slice's work verified onto this goal's base branch, or an explicit
+ * resolution with repository-checked evidence. A slice COMPLETING cannot show
+ * that — it can only attest — so its closures land in `fixed_unverified`.
+ *
+ * The distinction exists because one state conflated two different facts. An
+ * unlanded fix, and a fix merged somewhere the running install does not
+ * consume, were both recorded as plainly fixed; the only thing that could undo
+ * it was an integration failure, which work that never entered this
+ * repository's integration path can never produce. A reader of the finding
+ * alone concluded the gate was live.
+ */
+export const goalFindingStatusSchema = z.enum([
+  "open",
+  "fixed",
+  "fixed_unverified",
+  "dismissed",
+]);
 
 export const goalFindingSchema = z.object({
   id: z.string(),
@@ -173,6 +191,8 @@ export const goalSnapshotSchema = z.object({
     .object({
       open: z.number().int(),
       fixed: z.number().int(),
+      /** Attested fixed by a completed slice, with landing never verified. */
+      fixedUnverified: z.number().int().default(0),
       dismissed: z.number().int(),
       assignedDefects: z.number().int().default(0),
       awaitingAssignment: z.number().int().default(0),
@@ -181,6 +201,7 @@ export const goalSnapshotSchema = z.object({
     .default({
       open: 0,
       fixed: 0,
+      fixedUnverified: 0,
       dismissed: 0,
       assignedDefects: 0,
       awaitingAssignment: 0,

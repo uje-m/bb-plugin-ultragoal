@@ -932,8 +932,12 @@ describe("large-plan agent tool contracts", () => {
       ].join("\n"),
     });
     assert.equal(items.list("thr_brief").find((entry) => entry.id === item.id)!.status, "completed");
-    assert.equal(findings.get("thr_brief", first.id)!.status, "fixed");
-    assert.equal(findings.get("thr_brief", second.id)!.status, "fixed");
+    // ATTESTED, not fixed. The verifier proved the WORK; proving the work is not
+    // showing the fix is live where the install consumes it, which is the merge's
+    // job (see "squash-merges into the branch the worker environment declares",
+    // where the same closure is promoted to fixed by the integration itself).
+    assert.equal(findings.get("thr_brief", first.id)!.status, "fixed_unverified");
+    assert.equal(findings.get("thr_brief", second.id)!.status, "fixed_unverified");
     // The event deliberately publishes/steers through fire-and-forget hooks;
     // let those bounded promises settle before the fake database is disposed.
     for (let index = 0; index < 8; index += 1) {

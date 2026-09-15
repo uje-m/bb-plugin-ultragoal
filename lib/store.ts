@@ -450,6 +450,14 @@ export function createGoalStore(bb: BbPluginApi) {
     // thread named no project: absent provenance is not a mismatch, and reading
     // it as one would refuse the entire legacy remediation backlog.
     `ALTER TABLE goal_findings ADD COLUMN project_id TEXT`,
+    // `fixed` used to mean "a slice completed and its worker said so", with no
+    // landing ever shown. Every row still carrying it predates that distinction,
+    // and a reader of the finding alone would take it for a live fix — the exact
+    // misreading the `fixed_unverified` state exists to prevent. Relabelled
+    // conservatively, once: the register may under-claim a landing it cannot
+    // show, but it must never over-claim one. A finding whose landing IS already
+    // known can be re-resolved with the repository that holds it.
+    `UPDATE goal_findings SET status = 'fixed_unverified' WHERE status = 'fixed'`,
   ]);
 
   const select = db.prepare("SELECT * FROM goals WHERE thread_id = ?");

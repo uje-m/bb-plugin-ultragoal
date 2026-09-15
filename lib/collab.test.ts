@@ -739,6 +739,53 @@ describe("scheduler-strict collaboration spawns", () => {
     await collab.listForRoot("thr_root", { discover: true, refreshLimit: 8 });
     assert.deepEqual(state.stopped, ["thr_legacy_b"], "the tombstone prevents repeated adoption");
   });
+
+  it("answers a capacity-fenced spawn with the error union and stops the child it already made", async () => {
+    // The bundle-only hand patch guarded exactly this; a rebuild from source
+    // dropped it. The child thread exists the moment spawn() returns, and the
+    // durable insert is the only step the capacity fence can refuse — so the
+    // ABORT used to escape spawnWorker, handing the caller a rejection while
+    // the child kept running with no row: invisible to the fence, unretirable
+    // by discovery, and one more stranded per retry of the same path. The
+    // non-reservation insert is the reachable one (the scheduler path's
+    // `commit` re-checks occupancy against the same trigger).
+    const state = collabHost();
+    const db = state.host.bb.storage.database();
+    db.prepare(`
+      INSERT INTO collab_root_worker_caps (root_thread_id, max_workers, updated_at)
+      VALUES ('thr_root', 1, 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_holding', 'thr_root', 'thr_root', '/root/holding', 1,
+        'Capacity Holder', 'itm_holding', 'worker')
+    `).run();
+    const collab = createCollabStore(state.host.bb);
+
+    const result = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: null,
+      skipClaim: true,
+      maxWorkers: 1,
+      displayName: "Capacity Refuser",
+      message: "SLICE: an unclaimed spawn at a full root",
+    });
+
+    assert.ok(
+      "error" in result,
+      `a full root must answer the union, not reject: ${JSON.stringify(result)}`,
+    );
+    assert.match(result.error, /root worker capacity is full/i);
+    assert.equal(state.spawnCalls(), 1, "the child existed before persistence ran");
+    assert.deepEqual(state.stopped, ["thr_spawned"], "the orphaned child must be stopped");
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS n FROM collab_agents WHERE retired_at IS NULL").get() as { n: number }).n,
+      1,
+      "the capacity-fenced row must not be persisted",
+    );
+  });
 });
 
 describe("fleet management tool surface", () => {

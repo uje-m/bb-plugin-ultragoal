@@ -16,6 +16,14 @@ const MIN_WAIT_TIMEOUT_MS = 1_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
 
+/** The capacity fence is a BEFORE INSERT trigger, so it reports a refusal as a
+ * SQLite ABORT rather than a query result. A count taken before the insert
+ * cannot fence a concurrent legacy generation — catching the ABORT is the only
+ * race-free way to learn the durable write was rejected. */
+function isRootCapacityFull(error: unknown): boolean {
+  return error instanceof Error && /root worker capacity is full/.test(error.message);
+}
+
 const SPAWN_AGENT_DESCRIPTION = `
         Spawns an agent to work on the specified task. If your current task is \`/root/task1\` and you call ultragoal_spawn_agent with task_name "task_3" the agent will have canonical task name \`/root/task1/task_3\`.
 You are then able to refer to this agent as \`task_3\` or \`/root/task1/task_3\` interchangeably. However an agent \`/root/task2/task_3\` would only be able to communicate with this agent via its canonical name \`/root/task1/task_3\`.
@@ -908,27 +916,45 @@ export function createCollabStore(
         source_thread_id: null,
         last_verify_hash: null,
       };
-      if (reservationToken && requested) {
-        reservationCommitted = reservations.commit(
-          rootThreadId,
-          requested,
-          reservationToken,
-          () => {
-            insert.run(row);
-          },
-        );
-        if (!reservationCommitted) {
-          try {
-            await bb.sdk.threads.stop({ threadId: child.id });
-          } catch {
-            // The unowned child is still excluded from scheduler accounting.
+      try {
+        if (reservationToken && requested) {
+          reservationCommitted = reservations.commit(
+            rootThreadId,
+            requested,
+            reservationToken,
+            () => {
+              insert.run(row);
+            },
+          );
+          if (!reservationCommitted) {
+            try {
+              await bb.sdk.threads.stop({ threadId: child.id });
+            } catch {
+              // The unowned child is still excluded from scheduler accounting.
+            }
+            return {
+              error: `Scheduler reservation for ${requested} expired before worker persistence; spawned thread was stopped.`,
+            };
           }
-          return {
-            error: `Scheduler reservation for ${requested} expired before worker persistence; spawned thread was stopped.`,
-          };
+        } else {
+          insert.run(row);
         }
-      } else {
-        insert.run(row);
+      } catch (error) {
+        if (!isRootCapacityFull(error)) throw error;
+        // The child runs from the moment spawn() returns; the fence refuses
+        // only its durable row. Letting the ABORT escape hands the caller a
+        // rejection while the child keeps running with no row — invisible to
+        // the fence, unretirable by discovery, and one more stranded per retry
+        // of the same path. Stop it, then answer with the error union.
+        try {
+          await bb.sdk.threads.stop({ threadId: child.id });
+        } catch {
+          // A host that cannot stop the child still leaves no durable row, so
+          // the fence never admits the orphan.
+        }
+        return {
+          error: `Root worker capacity is full; refusing spawn of ${requested || child.id}.`,
+        };
       }
     if (strictItemClaim && requested) {
       const persisted = rowOf(child.id);

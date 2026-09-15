@@ -786,6 +786,42 @@ describe("scheduler-strict collaboration spawns", () => {
       "the capacity-fenced row must not be persisted",
     );
   });
+
+  it("guards the registered spawn tool too, not just the scheduler wrapper", async () => {
+    // ultragoal_spawn_agent calls spawnAgent directly, so a guard living in
+    // spawnWorker would pass the test above and leave the orchestrator's own
+    // path stranding children. Pin the shared entry point.
+    const state = collabHost();
+    const db = state.host.bb.storage.database();
+    db.prepare(`
+      INSERT INTO collab_root_worker_caps (root_thread_id, max_workers, updated_at)
+      VALUES ('thr_root', 1, 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_holding', 'thr_root', 'thr_root', '/root/holding', 1,
+        'Capacity Holder', 'itm_holding', 'worker')
+    `).run();
+    const collab = createCollabStore(state.host.bb);
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "tool_capacity_refuser",
+        item_id: "itm_tool",
+        message: "SLICE (item_id=itm_tool): spawn into a full root from the tool",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+
+    assert.equal((result as { isError?: boolean }).isError, true, JSON.stringify(result));
+    assert.match(JSON.stringify(result), /root worker capacity is full/i);
+    assert.deepEqual(state.stopped, ["thr_spawned"], "the tool's orphaned child must be stopped");
+  });
 });
 
 describe("fleet management tool surface", () => {

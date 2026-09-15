@@ -182,12 +182,13 @@ artifact; nothing in it was installed, restarted, deployed, or migrated.
 ## Verification
 
 A standalone Node check was written before the change and run against this
-worktree plus the fork tracker. It failed on the unreconciled state (37 of 47
-assertions) and passes after it, asserting: every bullet of each owner ruling
-appears verbatim in this document with its decision id and comment link; the
-seven vocabulary terms added to `CONTEXT.md` are present; exactly the eight
-program tickets are open with the upstream reference, dependency edge, and
-candidate-only manifest described above; every fenced file exists in the tree
-and matches its write claims and `maxChangedFiles`; #1 and #2 remain open with a
-reconciliation receipt; and no installation or deployment is claimed. The check
-is independent of the repository's own `npm test` and `npx tsc --noEmit` gates.
+worktree plus the fork tracker. On the unreconciled state it reported 166 passed
+and 38 failed assertions; it now passes 204 of 204, asserting: every bullet of
+each owner ruling appears verbatim in this document with its decision id and
+comment link; the eight vocabulary terms added to `CONTEXT.md` are present;
+exactly the eight program tickets are open with the upstream reference,
+dependency edge, and candidate-only manifest described above; every fenced file
+exists in the tree and matches its write claims and `maxChangedFiles`; #1 and #2
+remain open with a reconciliation receipt; and no installation or deployment is
+claimed. The check is independent of the repository's own `npm test` and
+`npx tsc --noEmit` gates.

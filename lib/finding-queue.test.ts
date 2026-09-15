@@ -108,6 +108,7 @@ describe("durable finding remediation queue", () => {
       note: "completed",
       findings: state.findings,
       items: state.items,
+      evidence: [{ findingId: ids[0]!, proof: "the slice's own gate passed" }],
     });
     assert.equal(closed.fixed, 1);
 
@@ -291,6 +292,10 @@ describe("durable finding remediation queue", () => {
       note: "completed with proof",
       findings: state.findings,
       items: state.items,
+      evidence: [
+        { findingId: primary.id, proof: "primary defect fixed" },
+        { findingId: valid.id, proof: "valid defect fixed" },
+      ],
     });
     assert.deepEqual(closed, { fixed: 2, requeuedMissing: 0, requeuedInvalid: 1 });
     assert.equal(state.findings.get("thr_root", primary.id)!.status, "fixed");

@@ -76,6 +76,38 @@ describe("filing warns when a slice has no gate", () => {
   });
 });
 
+describe("a completed slice closes only the defects its completion attests", () => {
+  it("leaves a linked finding open when the closure attests nothing for it", () => {
+    // The slice finished; the defect did not. This stamped EVERY open finding
+    // linked to the item, so an unlanded or cross-repo fix was recorded as
+    // closed the moment its item completed. The only undo, reopenForFailed
+    // Integration, fires on a merge failure — and work that was never on this
+    // repository's integration path can never produce one.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", rec.finding.id, "itm_1");
+    assert.equal(findings.markFixedByItem("thr_g", "itm_1", "slice reported done", []), 0);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.status, "open");
+  });
+
+  it("closes exactly the findings the completion attests", () => {
+    // A blank proof is not an attestation: a caller that passes the id and no
+    // evidence must not be able to bypass the guard with an empty string.
+    const findings = freshFindings();
+    const attested = findings.report("thr_g", { title: "attested", file: "a.ts:1", evidence: "e" });
+    const silent = findings.report("thr_g", { title: "silent", file: "b.ts:1", evidence: "e" });
+    findings.linkItem("thr_g", attested.finding.id, "itm_1");
+    findings.linkItem("thr_g", silent.finding.id, "itm_1");
+    const closed = findings.markFixedByItem("thr_g", "itm_1", "n", [
+      { findingId: attested.finding.id, proof: "npm test -- a passed" },
+      { findingId: silent.finding.id, proof: "   " },
+    ]);
+    assert.equal(closed, 1);
+    assert.equal(findings.get("thr_g", attested.finding.id)?.status, "fixed");
+    assert.equal(findings.get("thr_g", silent.finding.id)?.status, "open");
+  });
+});
+
 describe("a fix that never reached the base branch", () => {
   it("reopens findings this slice closed, because the fix is provably not there", () => {
     // Closure happens on the worker's report, BEFORE the merge is attempted.
@@ -84,7 +116,9 @@ describe("a fix that never reached the base branch", () => {
     const findings = freshFindings();
     const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
     findings.linkItem("thr_g", rec.finding.id, "itm_1");
-    findings.markFixedByItem("thr_g", "itm_1", "worker said so");
+    findings.markFixedByItem("thr_g", "itm_1", "worker said so", [
+      { findingId: rec.finding.id, proof: "the fix is on the slice branch" },
+    ]);
     assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed");
 
     const reopened = findings.reopenForFailedIntegration("thr_g", "itm_1", "merge conflict");
@@ -107,8 +141,8 @@ describe("a fix that never reached the base branch", () => {
     const other = findings.report("thr_g", { title: "other", file: "b.ts:1", evidence: "e" });
     findings.linkItem("thr_g", mine.finding.id, "itm_1");
     findings.linkItem("thr_g", other.finding.id, "itm_2");
-    findings.markFixedByItem("thr_g", "itm_1", "n");
-    findings.markFixedByItem("thr_g", "itm_2", "n");
+    findings.markFixedByItem("thr_g", "itm_1", "n", [{ findingId: mine.finding.id, proof: "p1" }]);
+    findings.markFixedByItem("thr_g", "itm_2", "n", [{ findingId: other.finding.id, proof: "p2" }]);
     findings.reopenForFailedIntegration("thr_g", "itm_1", "conflict");
     assert.equal(findings.get("thr_g", mine.finding.id)?.status, "open");
     assert.equal(findings.get("thr_g", other.finding.id)?.status, "fixed");
@@ -120,7 +154,9 @@ describe("a fix that never reached the base branch", () => {
     const findings = freshFindings();
     const rec = findings.report("thr_g", { title: "t", file: "a.ts:1", evidence: "e" });
     findings.linkItem("thr_g", rec.finding.id, "itm_1");
-    findings.markFixedByItem("thr_g", "itm_1", "n");
+    findings.markFixedByItem("thr_g", "itm_1", "n", [
+      { findingId: rec.finding.id, proof: "already on the branch" },
+    ]);
     assert.equal(findings.get("thr_g", rec.finding.id)?.status, "fixed");
   });
 });

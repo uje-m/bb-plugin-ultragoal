@@ -1832,13 +1832,23 @@ export default function plugin(bb: BbPluginApi) {
     return removed;
   }
 
-  function closeItemFindings(rootThreadId: string, itemId: string, note: string): number {
+  /** `evidence` is the completing report's per-defect proof. Closure is
+   * granted only for the defects it covers; a caller with nothing to attest
+   * (a pane or plan-patch completion, which the guards above admit only when
+   * no defect is linked) passes none, and closes none. */
+  function closeItemFindings(
+    rootThreadId: string,
+    itemId: string,
+    note: string,
+    evidence: readonly FindingAffirmativeEvidence[],
+  ): number {
     const result = closeFindingsForCompletedItem({
       threadId: rootThreadId,
       itemId,
       note,
       findings,
       items,
+      evidence,
     });
     if (result.requeuedInvalid > 0 || result.requeuedMissing > 0) {
       bb.log.warn(
@@ -2035,7 +2045,12 @@ export default function plugin(bb: BbPluginApi) {
     }
     items.setStatus(rootThreadId, itemId, "completed");
     markGoalEvent(rootThreadId);
-    const closed = closeItemFindings(rootThreadId, itemId, (report ?? "").trim().slice(-400));
+    const closed = closeItemFindings(
+      rootThreadId,
+      itemId,
+      (report ?? "").trim().slice(-400),
+      findingEvidence,
+    );
     if (closed > 0) {
       bb.log.info(`Closed ${closed} finding(s) fixed by slice ${itemId} on ${rootThreadId}`);
     }
@@ -2904,7 +2919,7 @@ export default function plugin(bb: BbPluginApi) {
       }
       items.setStatus(threadId, itemId, status);
       if (status === "completed") {
-        closeItemFindings(threadId, itemId, "Marked completed from the pane.");
+        closeItemFindings(threadId, itemId, "Marked completed from the pane.", []);
       }
       const goal = store.get(threadId);
       const next = goal ? await viewFresh(goal) : null;
@@ -3279,7 +3294,7 @@ export default function plugin(bb: BbPluginApi) {
         for (const item of patched.items) {
           if (item.status !== "completed") continue;
           if (beforeById.get(item.id)?.status === "completed") continue;
-          closeItemFindings(rootThreadId, item.id, "Marked completed through ultragoal_patch.");
+          closeItemFindings(rootThreadId, item.id, "Marked completed through ultragoal_patch.", []);
         }
         const added = patched.items.filter((item) => !beforeById.has(item.id)).length;
         const updated = patched.items.length - added;

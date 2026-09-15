@@ -148,18 +148,22 @@ export function healAutoMintedFindingDuplicates(input: {
 }
 
 /** Completion guard: invalid open links are detached before the remaining
- * exact-file links can be bulk-fixed for a completed work item. */
+ * exact-file links can be bulk-fixed for a completed work item. `evidence` is
+ * the completing report's per-defect proof: only the defects it attests are
+ * closed, so a slice that finished without addressing a linked defect cannot
+ * record that defect as fixed. */
 export function closeFindingsForCompletedItem(input: {
   threadId: string;
   itemId: string;
   note: string;
   findings: FindingStore;
   items: ItemStore;
+  evidence: readonly FindingAffirmativeEvidence[];
 }): FindingCompletionResult {
   const detached = detachStaleFindingLinks({ ...input, itemId: input.itemId });
   const item = input.items.list(input.threadId).find((entry) => entry.id === input.itemId);
   const fixed = item?.status === "completed"
-    ? input.findings.markFixedByItem(input.threadId, input.itemId, input.note)
+    ? input.findings.markFixedByItem(input.threadId, input.itemId, input.note, input.evidence)
     : 0;
   return { ...detached, fixed };
 }
@@ -209,6 +213,7 @@ export function reconcileFindingQueue(input: {
         threadId,
         itemId,
         "Recovered from persisted structured per-defect completion evidence.",
+        evidence,
       );
     } else {
       requeuedCompleted += findings.unlinkItems(

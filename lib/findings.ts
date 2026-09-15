@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { verifyAttribution, type CommitResolver } from "./attribution.js";
+import { missingLinkedDefectEvidenceIds, type FindingAffirmativeEvidence } from "./finding-brief.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { GoalFinding, GoalFindingStatus } from "../contract.js";
 
@@ -313,14 +314,33 @@ export function createFindingStore(bb: BbPluginApi) {
       return rows.length;
     },
 
-    /** A completed fix slice closes every finding that spawned it. */
-    markFixedByItem(threadId: string, itemId: string, note: string): number {
+    /**
+     * A completed fix slice closes the findings its completion attests — never
+     * every finding that happens to be linked to the item.
+     *
+     * "The slice finished" is not "the defect is fixed". Stamping every open
+     * link recorded an unlanded fix as closed the moment its item completed,
+     * and reopenForFailedIntegration could not undo it: that path fires on a
+     * merge failure, and a slice whose work never entered this repository's
+     * integration path never produces one. A linked defect the completion does
+     * not affirmatively cover stays open, where the queue can still reach it.
+     */
+    markFixedByItem(
+      threadId: string,
+      itemId: string,
+      note: string,
+      evidence: readonly FindingAffirmativeEvidence[],
+    ): number {
       const rows = (byItem.all(threadId, itemId) as FindingRow[]).filter(
         (row) => row.status === "open",
       );
+      const unattested = new Set(
+        missingLinkedDefectEvidenceIds(evidence, rows).map((id) => id.toLowerCase()),
+      );
+      const closing = rows.filter((row) => !unattested.has(row.id.toLowerCase()));
       db.transaction(() => {
         const updatedAt = Date.now();
-        for (const row of rows) {
+        for (const row of closing) {
           setStatus.run({
             thread_id: threadId,
             id: row.id,
@@ -330,7 +350,12 @@ export function createFindingStore(bb: BbPluginApi) {
           });
         }
       })();
-      return rows.length;
+      if (unattested.size > 0) {
+        bb.log.warn(
+          `Completion of ${itemId} on ${threadId} attested ${closing.length} of ${rows.length} linked finding(s); the rest stay open`,
+        );
+      }
+      return closing.length;
     },
 
     clear(threadId: string): void {

@@ -245,15 +245,22 @@ let snapshotDefaults: GoalSettingDefaults = {
 };
 
 /**
- * A host read that failed because the thread is definitively GONE (HTTP 404,
- * code `thread_not_found`), as opposed to a transient failure on which the
- * caller must keep failing closed.
+ * A host read that failed because the thread is definitively GONE (code
+ * `thread_not_found`), as opposed to any other failed read, on which the caller
+ * must keep failing closed.
  *
  * Duck-typed on purpose: the plugin's SDK client and the server's own error are
  * two bundles with two class identities, so neither `instanceof` nor the class
  * name crosses that boundary. The message is never matched either — the server
- * answers a different 404 with the same text under the code `invalid_request`,
- * so a text test would treat a bad request as missing work.
+ * answers a different 404 with the same "Thread not found" text under the code
+ * `invalid_request`, so a text test would treat a bad request as missing work.
+ *
+ * The CODE is what names the thread's absence, and a status that disagrees with
+ * it is not evidence of absence: a 404 carrying some other code is a request
+ * problem, and a `thread_not_found` behind a 500 came from a failing read, not a
+ * missing thread. Retiring on either would stop a worker that is still there, so
+ * they fail closed. A missing status is allowed because the in-process
+ * `ApiError` always carries one and the code alone is already definitive.
  */
 export function threadIsGone(error: unknown): boolean {
   if (error === null || typeof error !== "object") return false;
@@ -262,12 +269,12 @@ export function threadIsGone(error: unknown): boolean {
     code?: unknown;
     body?: unknown;
   };
-  if (status === 404 || code === "thread_not_found") return true;
-  return (
-    body !== null &&
-    typeof body === "object" &&
-    (body as { code?: unknown }).code === "thread_not_found"
-  );
+  const bodyCode =
+    body !== null && typeof body === "object"
+      ? (body as { code?: unknown }).code
+      : undefined;
+  if (code !== "thread_not_found" && bodyCode !== "thread_not_found") return false;
+  return status === undefined || status === 404;
 }
 
 /**

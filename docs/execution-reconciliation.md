@@ -199,4 +199,9 @@ read of `CONTEXT.md`, so all eight terms are present — seven asserted by the
 check and the eighth read directly. A separate addendum check of the cited
 issue comments, closing notes, ticket sourcing labels, and PR merge ancestry
 passes 106 of 106. Both checks are independent of the repository's own
-`npm test` and `npx tsc --noEmit` gates.
+`npm test` and `npx tsc --noEmit` gates. Both checks are committed here as
+`scripts/check-execution-reconciliation.mjs` and
+`scripts/check-execution-reconciliation-addendum.mjs`, and both read this
+worktree plus the fork tracker through `gh`. Their run logs are not committed,
+so the counts are reproduced by re-running the scripts rather than by reading a
+stored log.

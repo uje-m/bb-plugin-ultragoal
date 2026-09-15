@@ -47,6 +47,7 @@ function stores() {
       updated_at INTEGER NOT NULL,
       fix_files TEXT,
       check_cmd TEXT,
+      project_id TEXT,
       UNIQUE(thread_id, fingerprint)
     )
   `);

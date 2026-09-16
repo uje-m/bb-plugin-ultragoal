@@ -739,6 +739,187 @@ describe("scheduler-strict collaboration spawns", () => {
     await collab.listForRoot("thr_root", { discover: true, refreshLimit: 8 });
     assert.deepEqual(state.stopped, ["thr_legacy_b"], "the tombstone prevents repeated adoption");
   });
+
+  it("answers a capacity-fenced spawn with the error union and stops the child it already made", async () => {
+    // The bundle-only hand patch guarded exactly this; a rebuild from source
+    // dropped it. The child thread exists the moment spawn() returns, and the
+    // durable insert is the only step the capacity fence can refuse — so the
+    // ABORT used to escape spawnWorker, handing the caller a rejection while
+    // the child kept running with no row: invisible to the fence, unretirable
+    // by discovery, and one more stranded per retry of the same path. The
+    // non-reservation insert is the reachable one (the scheduler path's
+    // `commit` re-checks occupancy against the same trigger).
+    const state = collabHost();
+    const db = state.host.bb.storage.database();
+    db.prepare(`
+      INSERT INTO collab_root_worker_caps (root_thread_id, max_workers, updated_at)
+      VALUES ('thr_root', 1, 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_holding', 'thr_root', 'thr_root', '/root/holding', 1,
+        'Capacity Holder', 'itm_holding', 'worker')
+    `).run();
+    const collab = createCollabStore(state.host.bb);
+
+    const result = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: null,
+      skipClaim: true,
+      maxWorkers: 1,
+      displayName: "Capacity Refuser",
+      message: "SLICE: an unclaimed spawn at a full root",
+    });
+
+    assert.ok(
+      "error" in result,
+      `a full root must answer the union, not reject: ${JSON.stringify(result)}`,
+    );
+    assert.match(result.error, /root worker capacity is full/i);
+    assert.equal(state.spawnCalls(), 1, "the child existed before persistence ran");
+    assert.deepEqual(state.stopped, ["thr_spawned"], "the orphaned child must be stopped");
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS n FROM collab_agents WHERE retired_at IS NULL").get() as { n: number }).n,
+      1,
+      "the capacity-fenced row must not be persisted",
+    );
+  });
+
+  it("guards the registered spawn tool too, not just the scheduler wrapper", async () => {
+    // ultragoal_spawn_agent calls spawnAgent directly, so a guard living in
+    // spawnWorker would pass the test above and leave the orchestrator's own
+    // path stranding children. Pin the shared entry point.
+    const state = collabHost();
+    const db = state.host.bb.storage.database();
+    db.prepare(`
+      INSERT INTO collab_root_worker_caps (root_thread_id, max_workers, updated_at)
+      VALUES ('thr_root', 1, 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES ('thr_holding', 'thr_root', 'thr_root', '/root/holding', 1,
+        'Capacity Holder', 'itm_holding', 'worker')
+    `).run();
+    const collab = createCollabStore(state.host.bb);
+    collab.registerTools();
+
+    const result = await state.host.harness.behavior.callAgentTool(
+      "ultragoal_spawn_agent",
+      {
+        task_name: "tool_capacity_refuser",
+        item_id: "itm_tool",
+        message: "SLICE (item_id=itm_tool): spawn into a full root from the tool",
+        fork_turns: "none",
+      },
+      { threadId: "thr_root", projectId: "proj" },
+    );
+
+    assert.equal((result as { isError?: boolean }).isError, true, JSON.stringify(result));
+    assert.match(JSON.stringify(result), /root worker capacity is full/i);
+    assert.deepEqual(state.stopped, ["thr_spawned"], "the tool's orphaned child must be stopped");
+  });
+
+  it("releases the reservation and stops the child when a refused scheduler spawn cannot persist", async () => {
+    // The RESERVED path: spawnWorker acquires a token before bb is asked for a
+    // child, and the commit's own re-check refuses a spawn whose item gained a
+    // durable worker after acquisition. Two guards that already live in
+    // lib/collab.ts spawnAgent keep that refusal from burning the reservation —
+    // the `!reservationCommitted` branch stops the child bb already made, and
+    // the `finally` releases the token. Neither guard is added by this test;
+    // this is the regression pin that ties them to the invariant "a refused
+    // admission never consumes a reservation".
+    //
+    // The competing fact has to land in itemBrief: that hook runs after the
+    // pre-spawn itemHasWorker guard and before threads.spawn, i.e. inside the
+    // window the reservation covers, so the commit's under-lock re-check is the
+    // guard that refuses. Landed in claimItem instead, the pre-spawn guard
+    // answers first and the refusal under test is never reached.
+    const state = collabHost();
+    const db = state.host.bb.storage.database();
+    let armed = false;
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, args) => args.itemId,
+      itemBrief: () => {
+        if (!armed) {
+          armed = true;
+          // Exactly the race commit's re-check describes: an old generation
+          // finishes a prior spawn for the same item and wins it first.
+          db.prepare(`
+            INSERT INTO collab_agents (
+              thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+              display_name, item_id, role
+            ) VALUES ('thr_legacy', 'thr_root', 'thr_root', '/root/legacy', 1,
+              'Legacy Owner', 'itm_race', 'worker')
+          `).run();
+        }
+        return null;
+      },
+    });
+
+    const result = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: "itm_race",
+      maxWorkers: 2,
+      displayName: "Refused Scheduler",
+      message: "SLICE (item_id=itm_race): a row that landed first wins",
+    });
+
+    assert.ok(
+      "error" in result,
+      `a refused reservation must answer the {error} union, not reject: ${JSON.stringify(result)}`,
+    );
+    assert.deepEqual(
+      state.stopped,
+      ["thr_spawned"],
+      "the child bb made before persistence ran must be stopped",
+    );
+    assert.equal(
+      (db.prepare(
+        "SELECT COUNT(*) AS n FROM collab_agents WHERE thread_id = 'thr_spawned'",
+      ).get() as { n: number }).n,
+      0,
+      "the refused spawn must leave no durable row behind",
+    );
+    assert.equal(
+      (db.prepare(`
+        SELECT COUNT(*) AS n FROM collab_item_reservations
+        WHERE root_thread_id = 'thr_root' AND item_id = 'itm_race'
+      `).get() as { n: number }).n,
+      0,
+      "a refused admission must RELEASE the reservation, never consume it",
+    );
+
+    // The point of the test: the refusal must not burn the slice's only slot.
+    // Retiring the rival row frees the item, and the very next spawn of the
+    // SAME item through the SAME hooks must be admitted.
+    db.prepare("UPDATE collab_agents SET retired_at = ? WHERE thread_id = 'thr_legacy'").run(
+      Date.now(),
+    );
+    const second = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: "itm_race",
+      maxWorkers: 2,
+      displayName: "Refused Scheduler",
+      message: "SLICE (item_id=itm_race): retry once the rival retired",
+    });
+    assert.ok(
+      "threadId" in second,
+      `the slice must stay staffable after a refused admission: ${JSON.stringify(second)}`,
+    );
+    assert.equal(state.spawnCalls(), 2, "the retry must reach threads.spawn a second time");
+    assert.equal(
+      (db.prepare(`
+        SELECT COUNT(*) AS n FROM collab_agents
+        WHERE item_id = 'itm_race' AND retired_at IS NULL
+      `).get() as { n: number }).n,
+      1,
+      "exactly one live row may own the slice after the retry",
+    );
+  });
 });
 
 describe("fleet management tool surface", () => {

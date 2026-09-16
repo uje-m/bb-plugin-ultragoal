@@ -52,7 +52,7 @@ interface GoalRow {
 // The persistent record. Live fields (agentRunning, items, agents, now, next)
 // are computed per snapshot in server.ts, never stored.
 export interface StoredGoal
-  extends Omit<GoalSnapshot, "agentRunning" | "items" | "agents" | "now" | "next" | "findings" | "decisions" | "completionSummary" | "standingBrief"> {
+  extends Omit<GoalSnapshot, "agentRunning" | "items" | "agents" | "now" | "next" | "findings" | "decisions" | "undeliveredDecisions" | "completionSummary" | "standingBrief"> {
   lastSeenTokens: number | null;
   lastAccountedAt: number | null;
   lastContinueWasAutomatic: boolean;
@@ -458,6 +458,12 @@ export function createGoalStore(bb: BbPluginApi) {
     // show, but it must never over-claim one. A finding whose landing IS already
     // known can be re-resolved with the repository that holds it.
     `UPDATE goal_findings SET status = 'fixed_unverified' WHERE status = 'fixed'`,
+    // An owner answer is not delivered until the root has been told. Recording
+    // the answer used to be the whole transaction, so a steer refused with
+    // "thread is awaiting user interaction" left the answer durable and the
+    // root blind while `openDecisions` reported a clean board. Delivery state
+    // lives on the decision so the pulse can retry what never landed.
+    `ALTER TABLE goal_decisions ADD COLUMN delivered_at INTEGER`,
   ]);
 
   const select = db.prepare("SELECT * FROM goals WHERE thread_id = ?");

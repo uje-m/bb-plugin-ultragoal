@@ -115,6 +115,13 @@ export function formatGoalCard(goal: GoalSnapshot): string {
   if (goal.decisions.length > MAX_STATUS_DECISIONS) {
     lines.push(`NEEDS YOU: … ${goal.decisions.length - MAX_STATUS_DECISIONS} more decision(s) omitted`);
   }
+  // An answered decision that never reached the root is invisible in the open
+  // list, so it needs its own line: the board looks clean while work stalls.
+  for (const decision of goal.undeliveredDecisions.slice(0, MAX_STATUS_DECISIONS)) {
+    lines.push(
+      `DELIVERY PENDING: [${decision.id}] answer recorded but not yet delivered to the orchestrator — ${decision.answer ?? ""}`,
+    );
+  }
   if (
     goal.findings.open + goal.findings.fixed + goal.findings.fixedUnverified + goal.findings.dismissed >
     0
@@ -204,6 +211,13 @@ export function goalToolResponse(
               decision_id: decision.id,
               question: decision.question,
               options: decision.options,
+            })),
+            // Answered but not yet steered into the root: a stalled answer the
+            // status surface could not report before, so it read as healthy.
+            pendingDeliveryDecisions: goal.undeliveredDecisions.map((decision) => ({
+              decision_id: decision.id,
+              question: decision.question,
+              answer: decision.answer,
             })),
             openFindings: openFindings.slice(0, 20).map((finding) => ({
               finding_id: finding.id,

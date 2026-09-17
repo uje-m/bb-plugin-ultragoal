@@ -25,6 +25,7 @@ import { lastUserText, parseSlashGoal } from "./lib/slash.js";
 import { formatGoalCard, goalToolResponse, isUnfinished } from "./lib/status.js";
 import { COLLAB_TOOL_NAMES, createCollabStore } from "./lib/collab.js";
 import { createDecisionStore } from "./lib/decisions.js";
+import { decisionIdsInTimeline, deliverAnsweredDecisions } from "./lib/decision-delivery.js";
 import {
   createFindingStore,
   findingRegistrationCliMessage,
@@ -173,6 +174,7 @@ function snapshotOf(
   rootRunning: boolean,
   findings: GoalSnapshot["findings"],
   decisions: GoalSnapshot["decisions"],
+  undeliveredDecisions: GoalSnapshot["undeliveredDecisions"],
   standingBrief: GoalSnapshot["standingBrief"],
 ): GoalSnapshot {
   const itemList = items.list(goal.threadId);
@@ -220,6 +222,7 @@ function snapshotOf(
     standingBrief,
     findings,
     decisions,
+    undeliveredDecisions,
     completionSummary: goal.completionSummary,
   };
 }
@@ -706,6 +709,7 @@ export default function plugin(bb: BbPluginApi) {
       rootWorkingInline,
       findings.counts(goal.threadId),
       decisions.list(goal.threadId, "open"),
+      decisions.listUndelivered(goal.threadId),
       workerBriefs.getRecord(goal.threadId),
     );
   }
@@ -1221,6 +1225,54 @@ export default function plugin(bb: BbPluginApi) {
     return (await goalOwnerOfCaller(threadId))?.threadId ?? collab.rootId(threadId);
   }
 
+  // Delivery is retried, not fire-and-forget. A steer refused while the thread
+  // awaited the owner (a second decision card still open, an in-flight submit)
+  // used to leave the answer durable and undelivered with `openDecisions`
+  // empty, so the orchestrator could not tell a lost answer from a clean board.
+  // One in-flight pass per root collapses the inline answer path and the pulse
+  // sweep, so a retry can never double-steer the same answer.
+  const decisionDelivery = new Map<string, Promise<void>>();
+
+  async function deliverDecisionAnswers(rootThreadId: string): Promise<void> {
+    const existing = decisionDelivery.get(rootThreadId);
+    if (existing) return existing;
+    const run = (async () => {
+      const pending = decisions.listUndelivered(rootThreadId);
+      if (pending.length === 0) return;
+      // While another decision is open the thread is necessarily awaiting the
+      // owner's interaction and refuses every steer; skip the 409 and let the
+      // next pulse retry once the board is clear.
+      if (decisions.list(rootThreadId, "open").length > 0) return;
+      const rows = await readTimeline(rootThreadId);
+      const result = await deliverAnsweredDecisions({
+        pending,
+        seenInTimeline: decisionIdsInTimeline(
+          rows,
+          pending.map((decision) => decision.id),
+        ),
+        send: async (decision, message) =>
+          sendSteering(
+            rootThreadId,
+            message,
+            (await threadIsRunning(bb, rootThreadId)) ? "steer" : "start",
+          ),
+        markDelivered: (decision) => decisions.markDelivered(rootThreadId, decision.id),
+      });
+      if (result.delivered > 0 || result.alreadyDelivered > 0) {
+        void publishFresh(rootThreadId);
+      }
+      if (result.pending > 0) {
+        bb.log.warn(
+          `Owner decision delivery pending on ${rootThreadId}: ${result.pending} answered decision(s) could not reach the root yet`,
+        );
+      }
+    })().finally(() => {
+      decisionDelivery.delete(rootThreadId);
+    });
+    decisionDelivery.set(rootThreadId, run);
+    return run;
+  }
+
   async function applyDecisionAnswer(
     goalThreadId: string,
     decisionId: string,
@@ -1233,11 +1285,7 @@ export default function plugin(bb: BbPluginApi) {
     const goal = store.get(goalThreadId);
     if (goal) publish(goalThreadId, view(goal));
     bb.log.info(`Owner decision ${decisionId} answered on ${goalThreadId}: ${answer.slice(0, 80)}`);
-    await sendSteering(
-      goalThreadId,
-      `OWNER DECISION ANSWERED (${decisionId}): "${resolved.question}" -> ${answer}. Act on this now and resolve any dependent work.`,
-      (await threadIsRunning(bb, goalThreadId)) ? "steer" : "start",
-    );
+    await deliverDecisionAnswers(goalThreadId);
     return true;
   }
 
@@ -2965,6 +3013,7 @@ export default function plugin(bb: BbPluginApi) {
           continue;
         }
         ensureDecisionPrompts(threadId);
+        await deliverDecisionAnswers(threadId);
         await reviveErroredRoot(threadId);
         const restarted = await watchRootTurn(threadId);
         // A wedge restart already submitted one turn. A second start in the
@@ -4007,6 +4056,16 @@ export default function plugin(bb: BbPluginApi) {
       }
       decisionAborts.get(resolved.id)?.abort();
       markGoalEvent(owner);
+      // The root resolved this on the owner's behalf and already holds the
+      // answer in-band. A worker relaying one does not, so it stays pending and
+      // the sweep delivers it — no answered decision goes undelivered either way.
+      if (resolved.status === "answered") {
+        if (threadId === owner) {
+          decisions.markDelivered(owner, resolved.id);
+        } else {
+          void deliverDecisionAnswers(owner);
+        }
+      }
       void publishFresh(owner);
       return {
         content: [

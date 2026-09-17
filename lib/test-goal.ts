@@ -84,6 +84,7 @@ export function makeLargeGoal(count = 1_000): GoalSnapshot {
       remediationWorkItems: 42,
     },
     decisions: [],
+    undeliveredDecisions: [],
     completionSummary: null,
   };
 }

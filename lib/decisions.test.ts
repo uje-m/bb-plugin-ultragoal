@@ -487,3 +487,123 @@ describe("owner decision ownership", () => {
     );
   });
 });
+
+describe("owner decision delivery", () => {
+  const deliveredAtOf = (host: FakePluginHost, id: string): number | null =>
+    (
+      host.bb.storage.database()
+        .prepare("SELECT delivered_at FROM goal_decisions WHERE id = ?")
+        .get(id) as { delivered_at: number | null } | undefined
+    )?.delivered_at ?? null;
+
+  it("marks the root's own resolution delivered and delivers a worker's relay only once the root is steered", async () => {
+    const root = "thr_delivery_root";
+    const worker = "thr_delivery_relay";
+    let steerRefusal: string | null = null;
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            status: "active",
+            parentThreadId: threadId === worker ? root : null,
+          }),
+        send: async () => {
+          if (steerRefusal) throw new Error(steerRefusal);
+          return { ok: true };
+        },
+      },
+    });
+    const drain = async () => {
+      for (let index = 0; index < 5; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    await startGoal(host, root, "Prove delivery is recorded only after the root is steered");
+
+    // The root answered a ruling it asked itself: it already holds the answer
+    // in-band, so the resolution IS the delivery and no steer is owed.
+    const inBand = await requestDecision(host, root, "Does the root's own resolution deliver itself?");
+    const resolvedInBand = await callTool(
+      host,
+      "resolve_decision",
+      { decision: inBand, resolution: "answered", answer: "Yes" },
+      root,
+    );
+    assert.equal(resolvedInBand.isError, false, resolvedInBand.text);
+    assert.notEqual(
+      deliveredAtOf(host, inBand),
+      null,
+      "the root holds an answer it resolved itself, so it is delivered",
+    );
+
+    // A worker relaying the owner's answer does not give the root the answer.
+    // This one still has a card open, so the thread refuses every steer and the
+    // answer must stay durably undelivered rather than read as a clean board.
+    const openCard = await requestDecision(host, root, "Is a second card still open?");
+    const relayed = await requestDecision(host, worker, "Does a worker's relay reach the root?");
+    const relay = await callTool(
+      host,
+      "resolve_decision",
+      { decision: relayed, resolution: "answered", answer: "Relayed yes" },
+      worker,
+    );
+    assert.equal(relay.isError, false, relay.text);
+    await drain();
+    assert.equal(
+      deliveredAtOf(host, relayed),
+      null,
+      "a worker's relay must not be marked delivered before the root is steered",
+    );
+    assert.equal(deliveredAtOf(host, openCard), null, "an unanswered card is never delivered");
+
+    const stalled = JSON.parse(
+      (await callTool(host, "ultragoal_state", {}, root)).text,
+    ) as {
+      goal: {
+        openDecisions: Array<{ decision_id: string }>;
+        pendingDeliveryDecisions: Array<{ decision_id: string; answer: string | null }>;
+      };
+    };
+    assert.deepEqual(
+      stalled.goal.openDecisions.map((decision) => decision.decision_id),
+      [openCard],
+      "the open card is the only thing the board reports as waiting",
+    );
+    assert.deepEqual(stalled.goal.pendingDeliveryDecisions, [
+      { decision_id: relayed, question: "Does a worker's relay reach the root?", answer: "Relayed yes" },
+    ]);
+
+    // The steer starts working and the second answer is recorded from the CLI:
+    // the sweep retries BOTH durable rows, so the relay the root never received
+    // reaches it on the retry instead of being stranded as an answered row.
+    steerRefusal = "thread is awaiting user interaction";
+    const cliRefused = await host.harness.behavior.runCli([
+      "decide",
+      openCard,
+      "Answered while delivery was down",
+      "--thread",
+      root,
+    ]);
+    assert.equal(cliRefused.exitCode, 0, cliRefused.stderr ?? "");
+    assert.equal(
+      deliveredAtOf(host, relayed),
+      null,
+      "a refused steer leaves every answer durable and undelivered",
+    );
+
+    steerRefusal = null;
+    const cli = await host.harness.behavior.runCli(["decide", openCard, "Retry landed", "--thread", root]);
+    assert.equal(cli.exitCode, 0, cli.stderr ?? "");
+    assert.notEqual(
+      deliveredAtOf(host, relayed),
+      null,
+      "the retried relay must be recorded as delivered once the root is steered",
+    );
+    assert.notEqual(deliveredAtOf(host, openCard), null);
+    const settledBoard = JSON.parse(
+      (await callTool(host, "ultragoal_state", {}, root)).text,
+    ) as { goal: { pendingDeliveryDecisions: unknown[] } };
+    assert.deepEqual(settledBoard.goal.pendingDeliveryDecisions, []);
+  });
+});

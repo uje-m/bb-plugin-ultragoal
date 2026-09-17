@@ -517,6 +517,166 @@ describe("large-plan agent tool contracts", () => {
     );
   });
 
+  it("staffs intake with add_slice on an owner message, and defers while the root is full", async () => {
+    // The intake courier is the plugin's own child: maybeIntakeUserMessage reads
+    // the goal thread's timeline on every thread.active and staffs a triage
+    // agent for the newest owner message. The test above covers what a courier
+    // may DO once it exists; this one covers the spawn itself, because two
+    // regressions there are invisible everywhere else — a cursor advanced for a
+    // message no courier ever read drops the owner's request for good, and a
+    // courier staffed while the root is full is refused by the capacity fence
+    // only AFTER its child thread exists.
+    let rows: Array<Record<string, unknown>> = [];
+    let spawnRefusal: string | null = null;
+    const spawned: Array<{ id: string; prompt: string }> = [];
+    const host = registeredHost({
+      threads: {
+        get: ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "codex",
+            // No environment: the spawn must not depend on live host worktree
+            // provisioning, which the fake host cannot perform.
+            environmentId: null,
+            parentThreadId: threadId === "thr_intake_root" ? null : "thr_intake_root",
+            status: "active",
+          }),
+        list: () => [],
+        timeline: ({ threadId }) => ({
+          rows: threadId === "thr_intake_root" ? (rows as never[]) : [],
+        }),
+        spawn: (args) => {
+          if (spawnRefusal) throw new Error(spawnRefusal);
+          const id = `thr_intake_${spawned.length + 1}`;
+          spawned.push({ id, prompt: args.prompt ?? "" });
+          return makeThreadResponse({
+            id,
+            projectId: "proj",
+            providerId: "codex",
+            environmentId: null,
+            parentThreadId: "thr_intake_root",
+            status: "active",
+          });
+        },
+        output: () => ({ output: null }),
+        stop: () => ({ ok: true }),
+        update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        interactions: { list: async () => [], resolve: async () => ({}) },
+      },
+    });
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id = 'thr_intake_root', status = 'active', max_workers = 1 WHERE thread_id = 'thr_sentinel'",
+    ).run();
+    const cursor = () =>
+      (
+        db.prepare("SELECT intake_row_id FROM goals WHERE thread_id = 'thr_intake_root'").get() as {
+          intake_row_id: string | null;
+        }
+      ).intake_row_id;
+    const settle = async () => {
+      for (let index = 0; index < 20; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    const ownerRow = (id: string, text: string) => ({
+      kind: "conversation",
+      role: "user",
+      id,
+      text,
+    });
+    const active = () => ({
+      thread: makeThreadResponse({ id: "thr_intake_root", status: "active" }),
+    });
+
+    // The first owner message only baselines the durable cursor: replaying a
+    // goal's whole history on its first active event would staff one courier
+    // per historical message.
+    rows = [ownerRow("row_1", "kick off")];
+    await host.harness.behavior.emitThreadEvent("thread.active", active());
+    await settle();
+    // Compare emptiness by length: assert.deepEqual is typed `asserts actual is T`,
+    // so its [] expectation would narrow `spawned` to never[] for the rest of the
+    // test and every later `spawned[0].id` would stop typechecking.
+    assert.equal(spawned.length, 0, "baselining must not staff an intake courier");
+    assert.equal(cursor(), "row_1", "the baseline cursor must be durable");
+
+    // A full root defers the courier and leaves the owner's message queued: the
+    // fence refuses the courier's durable row after its child already exists,
+    // and a cursor moved past a message nobody read is a request dropped for
+    // good, with no error anywhere.
+    rows = [...rows, ownerRow("row_2", "Owner request: add the /to-tickets plan to the PWA work")];
+    db.prepare("UPDATE goals SET max_workers = 0 WHERE thread_id = 'thr_intake_root'").run();
+    await host.harness.behavior.emitThreadEvent("thread.active", active());
+    await settle();
+    assert.equal(spawned.length, 0, "a full root must not staff an intake courier");
+    assert.equal(cursor(), "row_1", "a deferred owner message stays queued, never skipped");
+
+    // Capacity returns: the same message staffs the courier, whose brief is the
+    // only thing that names the filing tool it must call.
+    db.prepare("UPDATE goals SET max_workers = 1 WHERE thread_id = 'thr_intake_root'").run();
+    await host.harness.behavior.emitThreadEvent("thread.active", active());
+    await settle();
+    assert.equal(spawned.length, 1, "an owner request must staff exactly one intake courier");
+    assert.match(
+      spawned[0].prompt,
+      /add_slice call/,
+      "the courier's brief orders an add_slice call",
+    );
+    assert.match(
+      spawned[0].prompt,
+      /add the \/to-tickets plan to the PWA work/,
+      "the courier must be handed the owner's own words",
+    );
+    assert.equal(cursor(), "row_2", "the cursor advances only once the courier exists");
+
+    // A spawn that fails must not consume the message either — the cursor
+    // tracks the courier, not the message. This is the other half of #36: the
+    // pre-fence code advanced the cursor first, so a spawn that threw lost the
+    // owner's request with no error the owner could ever see, and no later pass
+    // would retry it.
+    spawnRefusal = "the host refused the intake spawn";
+    // Room for the retry's courier: the first one already occupies a slot.
+    db.prepare("UPDATE goals SET max_workers = 2 WHERE thread_id = 'thr_intake_root'").run();
+    rows = [...rows, ownerRow("row_3", "Owner request: retire the stale PWA branch")];
+    await host.harness.behavior.emitThreadEvent("thread.active", active());
+    await settle();
+    assert.equal(spawned.length, 1, "a failed spawn must not add a courier");
+    assert.equal(cursor(), "row_2", "a failed spawn leaves the owner's message queued");
+
+    spawnRefusal = null;
+    await host.harness.behavior.emitThreadEvent("thread.active", active());
+    await settle();
+    assert.equal(spawned.length, 2, "the retried message must staff the courier");
+    assert.equal(cursor(), "row_3", "the retry advances the cursor once the courier exists");
+
+    // The spawned courier — not an injected row — is the surface that must
+    // carry add_slice, and its call must land on the root's plan.
+    const intake = await host.harness.behavior.resolveAgentConfiguration(
+      context("codex", spawned[0].id),
+    );
+    assert.ok(
+      intake.tools.map((tool) => tool.name).includes("add_slice"),
+      "the brief orders add_slice, so the spawned courier must be able to call it",
+    );
+    const items = createItemStore(host.bb);
+    const filed = await host.harness.behavior.callAgentTool(
+      "add_slice",
+      { step: "Owner request: add the /to-tickets plan to the PWA work" },
+      { threadId: spawned[0].id },
+    );
+    assert.equal(isToolError(filed), false);
+    assert.deepEqual(
+      items.list("thr_intake_root").map((item) => item.step),
+      ["Owner request: add the /to-tickets plan to the PWA work"],
+    );
+
+    // add_slice publishes and kicks the scheduler on a floating promise; drain
+    // it here so the fake host is not disposed under a live database write.
+    await settle();
+  });
+
   it("audits stale finding links on the first startup pulse", async () => {
     const host = registeredHost();
     const db = host.bb.storage.database();

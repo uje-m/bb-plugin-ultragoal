@@ -40,4 +40,27 @@ describe("bounded goal reads", () => {
     assert.doesNotMatch(card, /COMPLETED_BODY_/);
     assert.ok(card.length < 30_000, `status card was ${card.length} chars`);
   });
+
+  it("reports an answered-but-undelivered decision instead of an empty board", () => {
+    const goal = makeLargeGoal();
+    goal.decisions = [];
+    goal.undeliveredDecisions = [
+      {
+        id: "dec_lost",
+        question: "Authorize the launch?",
+        context: null,
+        options: ["Yes", "No"],
+        status: "answered",
+        answer: "Yes",
+        createdAt: 1,
+        deliveredAt: null,
+      },
+    ];
+    const parsed = JSON.parse(goalToolResponse(goal)) as any;
+    assert.deepEqual(parsed.goal.openDecisions, []);
+    assert.deepEqual(parsed.goal.pendingDeliveryDecisions, [
+      { decision_id: "dec_lost", question: "Authorize the launch?", answer: "Yes" },
+    ]);
+    assert.match(formatGoalCard(goal), /DELIVERY PENDING: \[dec_lost\]/);
+  });
 });

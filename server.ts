@@ -2491,93 +2491,155 @@ export default function plugin(bb: BbPluginApi) {
   // the orchestrator noticing a message. Provenance filters keep it honest:
   // composer-origin user rows only (no inter-thread sends, no child-outcome
   // system rows, none of the plugin's own [ultragoal]-marked steers).
+  //
+  // One pass per root owns the timeline read AND the dispatch. The dispatch has
+  // no AbortSignal, so a stuck pass cannot be told from a slow one: a claim is
+  // taken synchronously, released only by the pass that took it, and never
+  // taken over — a takeover would either lose the row the stuck pass was
+  // dispatching or staff it twice. A reload clears the map; every queued row is
+  // still named by the durable cursor.
+  const intakePasses = new Map<string, { rowId: string | null; startedAt: number }>();
+
   async function maybeIntakeUserMessage(
     rootThreadId: string,
-    rows: readonly unknown[],
-  ): Promise<void> {
-    if (transferLocked(rootThreadId)) return;
-    const goal = store.get(rootThreadId);
-    if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) return;
-    let latest: { id: string; text: string } | null = null;
-    for (const raw of rows) {
-      const row = raw as {
-        kind?: string;
-        role?: string;
-        text?: string;
-        id?: string;
-        senderThreadId?: string | null;
-        systemMessageKind?: string;
-      };
-      if (row?.kind !== "conversation" || row.role !== "user") continue;
-      if (row.senderThreadId) continue;
-      if (row.systemMessageKind && row.systemMessageKind !== "unlabeled") continue;
-      const text = row.text?.trim() ?? "";
-      if (!text || text.startsWith("[bb ") || text.startsWith("[ultragoal]")) continue;
-      latest = { id: String(row.id ?? ""), text };
-    }
-    if (!latest || !latest.id) return;
-    const seen = goal.intakeRowId;
-    if (seen === latest.id) return;
-    // First-ever sighting for this goal baselines without replaying history;
-    // the cursor is durable, so a plugin reload never skips a message again.
-    if (seen === null) {
-      store.setIntakeRow(rootThreadId, latest.id);
-      return;
-    }
-    if (parseSlashGoal(latest.text)) {
-      store.setIntakeRow(rootThreadId, latest.id);
-      return;
-    }
-    const maxWorkers = view(goal).settings.maxWorkers;
-    const occupancy = reservations.occupancy(rootThreadId);
-    // The fence counts every durable row, so a full root refuses the courier's
-    // insert AFTER its child thread exists — leaving an orphan with no row. Read
-    // the fence first: a full root then costs a log line, and the owner's
-    // message stays queued for the next pass instead of being dropped.
-    if (occupancy >= maxWorkers) {
-      bb.log.warn(
-        `Intake on ${rootThreadId} deferred: root worker capacity is full (${occupancy}/${maxWorkers}); the owner message stays queued`,
+    loadRows: () => Promise<readonly unknown[]>,
+  ): Promise<"admitted" | "deferred" | "ignored"> {
+    const outstanding = intakePasses.get(rootThreadId);
+    if (outstanding) {
+      bb.log.info(
+        `Intake pass on ${rootThreadId} deferred: ${
+          outstanding.rowId ? `owner row ${outstanding.rowId}` : "the timeline read"
+        } has been outstanding for ${Math.max(
+          0,
+          Math.round((Date.now() - outstanding.startedAt) / 1000),
+        )}s`,
       );
-      return;
+      return "deferred";
     }
-    // The cursor advances only once the courier exists. Advancing it first is
-    // how an owner's message was dropped for good: the spawn is exactly what can
-    // fail (the capacity fence refuses a full root), and a cursor already past
-    // the message means no later pass ever retries it.
-    let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
+    const claim = { rowId: null as string | null, startedAt: Date.now() };
+    intakePasses.set(rootThreadId, claim);
     try {
-      result = await collab.spawnWorker({
-        parentThreadId: rootThreadId,
-        itemId: null,
-        maxWorkers,
-        skipClaim: true,
-        // Fixed name: the slug must start with intake_ so idle cleanup matches.
-        displayName: "Intake Courier",
-        message: [
-          "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
-          "The goal owner just sent the message below to the goal thread. File every actionable item through the formal tools:",
-          "- Each DEFECT they describe: one report_finding call (title = the defect in one sentence; file = the best area path you can determine by reading the repo read-only; evidence = the owner's words plus any quick read-only verification). Duplicates are fingerprint-deduped — file without fear.",
-          "- Each FEATURE/UX request: one add_slice call (step starts 'Owner UX:' or 'Owner request:', self-contained, narrow or empty files).",
-          "- Questions or decisions only the owner can answer are NOT yours to file; skip them.",
-          "If nothing is actionable, do nothing. End your turn when filing is complete — do not call slice_done (you hold no slice), do not implement fixes, do not message anyone.",
-          "OWNER MESSAGE:",
-          latest.text,
-        ].join("\n\n"),
-      });
-    } catch (error) {
-      bb.log.warn(
-        `Intake spawn failed on ${rootThreadId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return;
+      if (transferLocked(rootThreadId)) return "ignored";
+      const goal = store.get(rootThreadId);
+      if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
+        return "ignored";
+      }
+      const owners: Array<{ id: string; text: string }> = [];
+      for (const raw of await loadRows()) {
+        const row = raw as {
+          kind?: string;
+          role?: string;
+          text?: string;
+          id?: string;
+          senderThreadId?: string | null;
+          systemMessageKind?: string;
+        };
+        if (row?.kind !== "conversation" || row.role !== "user") continue;
+        if (row.senderThreadId) continue;
+        if (row.systemMessageKind && row.systemMessageKind !== "unlabeled") continue;
+        const text = row.text?.trim() ?? "";
+        if (!text || text.startsWith("[bb ") || text.startsWith("[ultragoal]")) continue;
+        const id = String(row.id ?? "");
+        // A row the timeline cannot name cannot be remembered by the cursor.
+        if (!id) continue;
+        owners.push({ id, text });
+      }
+      const latest = owners[owners.length - 1];
+      if (!latest) return "ignored";
+      const seen = goal.intakeRowId;
+      if (seen === latest.id) return "ignored";
+      // First-ever sighting for this goal baselines without replaying history;
+      // the cursor is durable, so a plugin reload never skips a message again.
+      if (seen === null) {
+        store.setIntakeRow(rootThreadId, latest.id);
+        return "ignored";
+      }
+      const seenIndex = owners.findIndex((row) => row.id === seen);
+      // Walk everything the cursor has not admitted, oldest first. While a
+      // deferral is pending the cursor stays on the last admitted row, so the
+      // queue after it is exactly the undispatched rows; once the cursor row has
+      // rotated out of the timeline window the newest row is the only one this
+      // pass can attribute as undispatched.
+      const pending = seenIndex >= 0 ? owners.slice(seenIndex + 1) : [latest];
+      const maxWorkers = view(goal).settings.maxWorkers;
+      // The fence reads the materialized cap, not goals.max_workers: refresh it
+      // before the pre-check, exactly as the scheduler does before staffing. A
+      // stale cap makes the pre-check pass while the trigger refuses, which
+      // costs an orphan child instead of a log line.
+      if (!collab.setWorkerCap(rootThreadId, maxWorkers)) {
+        bb.log.warn(
+          `Intake on ${rootThreadId} deferred: root worker capacity could not be materialized; owner row ${pending[0]!.id} stays queued`,
+        );
+        return "deferred";
+      }
+      let staffed = false;
+      for (const row of pending) {
+        // A slash command is a goal control the root already received: it is
+        // consumed, never triaged, and never carries a courier.
+        if (parseSlashGoal(row.text)) {
+          store.setIntakeRow(rootThreadId, row.id);
+          continue;
+        }
+        // The fence counts every durable row, so a full root refuses the courier's
+        // insert AFTER its child thread exists — leaving an orphan with no row. Read
+        // the fence first: a full root then costs a log line, and the whole
+        // remaining queue stays queued for the next pass instead of being dropped.
+        const occupancy = reservations.occupancy(rootThreadId);
+        if (occupancy >= maxWorkers) {
+          bb.log.warn(
+            `Intake on ${rootThreadId} deferred: root worker capacity is full (${occupancy}/${maxWorkers}); owner row ${row.id} stays queued`,
+          );
+          return "deferred";
+        }
+        claim.rowId = row.id;
+        // The cursor advances only once the courier exists. Advancing it first is
+        // how an owner's message was dropped for good: the spawn is exactly what can
+        // fail (the capacity fence refuses a full root), and a cursor already past
+        // the message means no later pass ever retries it.
+        let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
+        try {
+          result = await collab.spawnWorker({
+            parentThreadId: rootThreadId,
+            itemId: null,
+            maxWorkers,
+            skipClaim: true,
+            // Fixed name: the slug must start with intake_ so idle cleanup matches.
+            displayName: "Intake Courier",
+            message: [
+              "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
+              "The goal owner just sent the message below to the goal thread. File every actionable item through the formal tools:",
+              "- Each DEFECT they describe: one report_finding call (title = the defect in one sentence; file = the best area path you can determine by reading the repo read-only; evidence = the owner's words plus any quick read-only verification). Duplicates are fingerprint-deduped — file without fear.",
+              "- Each FEATURE/UX request: one add_slice call (step starts 'Owner UX:' or 'Owner request:', self-contained, narrow or empty files).",
+              "- Questions or decisions only the owner can answer are NOT yours to file; skip them.",
+              "If nothing is actionable, do nothing. End your turn when filing is complete — do not call slice_done (you hold no slice), do not implement fixes, do not message anyone.",
+              "OWNER MESSAGE:",
+              row.text,
+            ].join("\n\n"),
+          });
+        } catch (error) {
+          bb.log.warn(
+            `Intake spawn failed on ${rootThreadId}: ${
+              error instanceof Error ? error.message : String(error)
+            }; owner row ${row.id} stays queued`,
+          );
+          return "deferred";
+        }
+        if ("error" in result) {
+          bb.log.warn(
+            `Intake spawn failed on ${rootThreadId}: ${result.error}; owner row ${row.id} stays queued`,
+          );
+          return "deferred";
+        }
+        store.setIntakeRow(rootThreadId, row.id);
+        staffed = true;
+        bb.log.info(
+          `Intake ${result.nickname} (${result.threadId}) triaging owner message on ${rootThreadId}`,
+        );
+      }
+      return staffed ? "admitted" : "ignored";
+    } finally {
+      if (intakePasses.get(rootThreadId) === claim) intakePasses.delete(rootThreadId);
     }
-    if ("error" in result) {
-      bb.log.warn(`Intake spawn failed on ${rootThreadId}: ${result.error}`);
-      return;
-    }
-    store.setIntakeRow(rootThreadId, latest.id);
-    bb.log.info(`Intake ${result.nickname} (${result.threadId}) triaging owner message on ${rootThreadId}`);
   }
 
   async function nudgeRoot(rootId: string): Promise<void> {
@@ -3013,6 +3075,21 @@ export default function plugin(bb: BbPluginApi) {
           continue;
         }
         ensureDecisionPrompts(threadId);
+        // Retry every owner row a capacity full or failed spawn left queued. The
+        // pass is detached, never awaited: it awaits an unbounded host spawn, and
+        // one wedged root must not stop every later root in this sweep. Its own
+        // claim dedupes it against an intake pass already in flight for the root.
+        void maybeIntakeUserMessage(threadId, () => readTimeline(threadId))
+          .then((outcome) => {
+            if (outcome !== "ignored") bb.log.info(`Intake pass on ${threadId}: ${outcome}`);
+          })
+          .catch((error) => {
+            bb.log.warn(
+              `Intake pass failed on ${threadId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
         await deliverDecisionAnswers(threadId);
         await reviveErroredRoot(threadId);
         const restarted = await watchRootTurn(threadId);
@@ -4316,13 +4393,17 @@ export default function plugin(bb: BbPluginApi) {
     if (rootId && rootId !== thread.id) void publishFresh(rootId);
     const rows = await readTimeline(thread.id);
     await applyUserSlash(thread.id, lastUserText(rows));
-    void maybeIntakeUserMessage(thread.id, rows).catch((error) => {
-      bb.log.warn(
-        `Intake pass failed on ${thread.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
+    void maybeIntakeUserMessage(thread.id, async () => rows)
+      .then((outcome) => {
+        if (outcome !== "ignored") bb.log.info(`Intake pass on ${thread.id}: ${outcome}`);
+      })
+      .catch((error) => {
+        bb.log.warn(
+          `Intake pass failed on ${thread.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   });
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {

@@ -2064,3 +2064,276 @@ describe("cross-repo staffing provenance", () => {
     assert.match(refusal, /proj_omegacode/);
   });
 });
+
+describe("reload-safe courier reconciliation", () => {
+  /**
+   * A goal root whose crew exists only as durable rows, and whose host answers a
+   * per-thread status. This is the reload case #35 is about: no `thread.idle`
+   * event is ever emitted, so only the pulse's durable sweep can retire a row.
+   */
+  function courierRoot(options: {
+    rootId: string;
+    reads?: Record<string, "idle" | "missing" | "unreadable" | "active">;
+    rows?: Array<Record<string, unknown>>;
+    maxWorkers?: number;
+  }) {
+    const reads = options.reads ?? {};
+    const spawned: Array<{ id: string; prompt: string }> = [];
+    const archived: string[] = [];
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) => {
+          if (threadId === options.rootId) {
+            return makeThreadResponse({
+              id: threadId,
+              projectId: "proj",
+              providerId: "codex",
+              environmentId: null,
+              parentThreadId: null,
+              status: "active",
+            });
+          }
+          const read = reads[threadId] ?? "active";
+          if (read === "missing") {
+            throw Object.assign(new Error("HTTP 404: thread not found"), {
+              status: 404,
+              code: "thread_not_found",
+            });
+          }
+          if (read === "unreadable") throw new Error("host read failed");
+          return makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "codex",
+            environmentId: null,
+            parentThreadId: options.rootId,
+            status: read,
+          });
+        },
+        list: () => [],
+        timeline: ({ threadId }) => ({
+          rows: (threadId === options.rootId ? (options.rows ?? []) : []) as never[],
+        }),
+        spawn: async (args) => {
+          const id = `thr_courier_${spawned.length + 1}`;
+          spawned.push({ id, prompt: args.prompt ?? "" });
+          return makeThreadResponse({
+            id,
+            projectId: "proj",
+            providerId: "codex",
+            environmentId: null,
+            parentThreadId: options.rootId,
+            status: "active",
+          });
+        },
+        output: () => ({ output: null }),
+        stop: () => ({ ok: true }),
+        // Retirement archives the row it retires. An unstubbed sdk path throws
+        // synchronously, which would abort the sweep's candidate loop rather
+        // than let it reconcile the rest.
+        archive: async ({ threadId }) => {
+          archived.push(threadId);
+          return { archivedThreadIds: [threadId], ok: true as const };
+        },
+        send: () => ({ ok: true }),
+        update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        interactions: { list: async () => [], resolve: async () => ({}) },
+      },
+    });
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id = ?, status = 'active', max_workers = ?, last_continue_at = ? WHERE thread_id = 'thr_sentinel'",
+    ).run(options.rootId, options.maxWorkers ?? 4, Date.now());
+    const seed = (args: {
+      id: string;
+      taskName: string;
+      displayName: string | null;
+      createdAt: number;
+      role?: string;
+    }) => {
+      db.prepare(`
+        INSERT INTO collab_agents (
+          thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+          display_name, item_id, role
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+      `).run(
+        args.id,
+        options.rootId,
+        options.rootId,
+        args.taskName,
+        args.createdAt,
+        args.displayName,
+        args.role ?? "worker",
+      );
+    };
+    const rowsWhere = (sql: string) =>
+      (
+        db
+          .prepare(
+            `SELECT thread_id FROM collab_agents WHERE root_thread_id = ? AND ${sql} ORDER BY thread_id`,
+          )
+          .all(options.rootId) as Array<{ thread_id: string }>
+      ).map((row) => row.thread_id);
+    const liveRows = () => rowsWhere("retired_at IS NULL");
+    const retiredRows = () => rowsWhere("retired_at IS NOT NULL");
+    const occupancy = () =>
+      createItemReservationStore(db).occupancy(options.rootId);
+    const logs = () => host.harness.inspection.logEntries.map((entry) => entry.message);
+    const settle = async () => {
+      for (let index = 0; index < 40; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    /** One deterministic sweep of the 20s progress pulse (no timers in tests). */
+    const pulse = async () => {
+      const service = host.harness.behavior.runService("progress-pulse");
+      await settle();
+      service.controller.abort();
+      await service.done;
+      await settle();
+    };
+    return { host, db, spawned, archived, seed, liveRows, retiredRows, occupancy, logs, pulse };
+  }
+
+  it("retires a settled courier with no idle event and leaves an itemless non-courier alone", async () => {
+    const root = courierRoot({
+      rootId: "thr_courier_settled",
+      reads: { thr_settled_courier: "idle", thr_itemless_child: "idle" },
+    });
+    root.seed({
+      id: "thr_settled_courier",
+      taskName: "/root/intake_courier_settled1",
+      displayName: "Intake Courier",
+      createdAt: 1,
+    });
+    // A discovered child is itemless too. It is not the plugin's courier, and
+    // #19 forbids retiring it for being itemless.
+    root.seed({
+      id: "thr_itemless_child",
+      taskName: "/root/discovered_child_9zz",
+      displayName: "Discovered Child",
+      createdAt: 1,
+    });
+
+    await root.pulse();
+
+    assert.deepEqual(root.retiredRows(), ["thr_settled_courier"], "a settled courier is reconciled durably");
+    assert.deepEqual(root.liveRows(), ["thr_itemless_child"], "an itemless non-courier worker is never swept");
+    assert.ok(
+      root.archived.includes("thr_settled_courier"),
+      `the retired courier is archived too: ${JSON.stringify(root.archived)}`,
+    );
+    assert.ok(
+      root.logs().some((message) => message.includes("Retired finished worker thr_settled_courier")),
+      `the sweep says which row it retired: ${JSON.stringify(root.logs())}`,
+    );
+  });
+
+  it("leaves a courier lookalike with another display name alone", async () => {
+    const root = courierRoot({
+      rootId: "thr_courier_lookalike",
+      reads: { thr_lookalike: "idle" },
+    });
+    root.seed({
+      id: "thr_lookalike",
+      taskName: "/root/intake_courier_diagnostics",
+      displayName: "Intake Courier Diagnostics",
+      createdAt: 1,
+    });
+
+    await root.pulse();
+
+    assert.deepEqual(root.liveRows(), ["thr_lookalike"], "a shared name prefix is not an identity");
+    assert.deepEqual(root.retiredRows(), []);
+  });
+
+  it("retains a courier younger than its provisioning grace even when the host reads settled", async () => {
+    const root = courierRoot({
+      rootId: "thr_courier_fresh",
+      reads: { thr_fresh_courier: "idle" },
+    });
+    root.seed({
+      id: "thr_fresh_courier",
+      taskName: "/root/intake_courier_fresh1",
+      displayName: "Intake Courier",
+      createdAt: Date.now(),
+    });
+
+    await root.pulse();
+
+    assert.deepEqual(
+      root.liveRows(),
+      ["thr_fresh_courier"],
+      "a settled status cannot tell provisioning from a finished triage",
+    );
+    assert.deepEqual(root.retiredRows(), []);
+  });
+
+  it("retires an authoritatively missing courier and retains a transiently unreadable one", async () => {
+    const root = courierRoot({
+      rootId: "thr_courier_authority",
+      reads: { thr_unreadable_courier: "unreadable", thr_missing_courier: "missing" },
+    });
+    // The unreadable row is seeded first: its failed read must not abort the
+    // sweep before the missing row behind it is confirmed and retired.
+    root.seed({
+      id: "thr_unreadable_courier",
+      taskName: "/root/intake_courier_unread1",
+      displayName: "Intake Courier",
+      createdAt: 1,
+    });
+    root.seed({
+      id: "thr_missing_courier",
+      taskName: "/root/intake_courier_missing1",
+      displayName: "Intake Courier",
+      createdAt: 1,
+    });
+
+    await root.pulse();
+
+    assert.deepEqual(
+      root.retiredRows(),
+      ["thr_missing_courier"],
+      "a 404 is proof of absence; a failed read is not",
+    );
+    assert.deepEqual(root.liveRows(), ["thr_unreadable_courier"]);
+  });
+
+  it("frees the slot a settled courier held so the queued owner row staffs a new one", async () => {
+    const ownerRow = (id: string, text: string) => ({
+      kind: "conversation",
+      role: "user",
+      id,
+      text,
+    });
+    const root = courierRoot({
+      rootId: "thr_courier_capacity",
+      reads: { thr_stale_courier: "idle" },
+      rows: [ownerRow("row_1", "kick off"), ownerRow("row_2", "Owner request: file this")],
+      maxWorkers: 1,
+    });
+    root.seed({
+      id: "thr_stale_courier",
+      taskName: "/root/intake_courier_stale2",
+      displayName: "Intake Courier",
+      createdAt: 1,
+    });
+    // Baseline the cursor on row_1: only rows after it dispatch.
+    root.db.prepare("UPDATE goals SET intake_row_id = 'row_1' WHERE thread_id = ?").run("thr_courier_capacity");
+    assert.equal(root.occupancy(), 1, "the settled courier holds the root's only slot");
+
+    await root.pulse();
+
+    assert.deepEqual(root.liveRows(), [], "the reconciled courier released its slot");
+    assert.equal(root.occupancy(), 0, "capacity is free again once the row is retired");
+
+    await root.pulse();
+
+    assert.equal(
+      root.spawned.length,
+      1,
+      `the queued owner row must staff a courier once the slot is free: ${JSON.stringify(root.logs())}`,
+    );
+    assert.match(root.spawned[0].prompt, /Owner request: file this/);
+  });
+});

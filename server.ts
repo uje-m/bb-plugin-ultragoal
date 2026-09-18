@@ -280,6 +280,22 @@ export function threadIsGone(error: unknown): boolean {
   return status === undefined || status === 404;
 }
 
+/** The durable row shape the retirement sweep judges: identity comes from
+ * taskName/displayName/role, and age from createdAt, because neither the
+ * projected crew nor the host status alone can answer either question. */
+export interface RetirementCandidateRow {
+  threadId: string;
+  itemId: string | null;
+  role: string | null;
+  taskName: string;
+  displayName: string | null;
+  createdAt: number;
+}
+
+/** A courier younger than this may still be provisioning; a settled status
+ * alone cannot tell "before its first turn" from "finished triage". */
+const INTAKE_COURIER_GRACE_MS = 2 * 60_000;
+
 /**
  * Durable worker rows the retirement sweep must consider, read from the durable
  * rows rather than from the projected crew: the projection drops every worker
@@ -288,31 +304,41 @@ export function threadIsGone(error: unknown): boolean {
  *
  * A row holds a capacity slot while belonging to no open slice in two ways —
  * a finished worker whose slice is closed or gone from the plan
- * ({@link finishedWorkerRetirementCandidates}), and a row with no item at all,
- * which is how intake couriers and discovered children are created by design.
- * Nothing item-keyed can ever retire the second kind, so on a cap-10 goal five
- * of them halved effective capacity and the fence admitted nothing.
+ * ({@link finishedWorkerRetirementCandidates}), and the plugin's own intake
+ * courier, which is created with no item by design. Nothing item-keyed can ever
+ * retire the courier, so on a cap-10 goal five of them halved effective capacity
+ * and the fence admitted nothing.
+ *
+ * The courier class is identity, not emptiness: an itemless child the plugin
+ * did not spawn (a discovered child, a natively spawned one, a row whose slice
+ * linkage was lost) is never a candidate, and a courier younger than
+ * {@link INTAKE_COURIER_GRACE_MS} is still provisioning. `now` is the caller's
+ * clock, not a second read, so one sweep judges every row at one instant.
  *
  * Being a candidate is not a decision: the caller confirms each row's host and
  * still refuses to retire anything that reads as live.
  */
 export function retirementCandidates(
   rootThreadId: string,
-  rows: readonly { threadId: string; itemId: string | null; role: string | null }[],
+  rows: readonly RetirementCandidateRow[],
   items: readonly Pick<GoalItem, "id" | "status">[],
   hasLiveVerifier: (workerThreadId: string) => boolean,
+  now: number,
 ): string[] {
   // A row for the root itself is never a worker to retire, whatever it holds.
   const workers = rows.filter((row) => row.threadId !== rootThreadId);
-  const itemless = workers
+  const couriers = workers
     .filter(
-      (row) => row.role !== "verifier" && !row.itemId && !hasLiveVerifier(row.threadId),
+      (row) =>
+        isIntakeCourier(row) &&
+        !hasLiveVerifier(row.threadId) &&
+        now - row.createdAt >= INTAKE_COURIER_GRACE_MS,
     )
     .map((row) => row.threadId);
   return [
     ...new Set([
       ...finishedWorkerRetirementCandidates(workers, items, hasLiveVerifier),
-      ...itemless,
+      ...couriers,
     ]),
   ];
 }
@@ -1771,6 +1797,7 @@ export default function plugin(bb: BbPluginApi) {
             now,
             RESCUE_AFTER_MS,
           ),
+        now,
       );
       const retired = new Set<string>();
       for (const workerThreadId of candidates) {

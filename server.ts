@@ -23,7 +23,7 @@ import {
 } from "./lib/prompts.js";
 import { lastUserText, parseSlashGoal } from "./lib/slash.js";
 import { formatGoalCard, goalToolResponse, isUnfinished } from "./lib/status.js";
-import { COLLAB_TOOL_NAMES, createCollabStore } from "./lib/collab.js";
+import { COLLAB_TOOL_NAMES, createCollabStore, INTAKE_COURIER_DISPLAY_NAME, isIntakeCourier } from "./lib/collab.js";
 import { createDecisionStore } from "./lib/decisions.js";
 import { decisionIdsInTimeline, deliverAnsweredDecisions } from "./lib/decision-delivery.js";
 import {
@@ -2603,8 +2603,11 @@ export default function plugin(bb: BbPluginApi) {
             itemId: null,
             maxWorkers,
             skipClaim: true,
-            // Fixed name: the slug must start with intake_ so idle cleanup matches.
-            displayName: "Intake Courier",
+            // The shared courier identity: the idle branch and the durable
+            // retirement sweep both match this name and the slug derived from
+            // it, so a restored row stays recognizable without the spawn site
+            // hand-writing a prefix for the cleaners to guess at.
+            displayName: INTAKE_COURIER_DISPLAY_NAME,
             message: [
               "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
               "The goal owner just sent the message below to the goal thread. File every actionable item through the formal tools:",
@@ -4421,7 +4424,14 @@ export default function plugin(bb: BbPluginApi) {
       if (approved > 0) return;
     }
     if (parentRoot && parentRoot !== thread.id && !pendingInteraction) {
-      if (child.role !== "verifier" && child.task_name.includes("/intake_")) {
+      if (
+        isIntakeCourier({
+          taskName: child.task_name,
+          displayName: child.display_name,
+          itemId: child.item_id,
+          role: child.role,
+        })
+      ) {
         void releaseWorkerRuntime(thread.id);
         collab.forget(thread.id);
         void publishFresh(parentRoot);

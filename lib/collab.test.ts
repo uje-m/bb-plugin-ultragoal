@@ -8,7 +8,8 @@ import {
   makeThreadResponse,
   type FakePluginHost,
 } from "@get-bb/plugin-sdk/testing";
-import { COLLAB_TOOL_NAMES, createCollabStore } from "./collab.ts";
+import { COLLAB_TOOL_NAMES, createCollabStore, INTAKE_COURIER_DISPLAY_NAME, INTAKE_COURIER_SLUG, isIntakeCourier, isIntakeCourierTaskName } from "./collab.ts";
+import { slugFromName } from "./names.ts";
 
 const hosts: FakePluginHost[] = [];
 /** Throwaway checkout trees, so a warning test never leaves bytes behind. */
@@ -937,6 +938,118 @@ describe("fleet management tool surface", () => {
 
   it("keeps ultragoal_interrupt_agent, which is different from giving work up", () => {
     assert.ok((COLLAB_TOOL_NAMES as readonly string[]).includes("ultragoal_interrupt_agent"));
+  });
+});
+
+describe("intake courier identity", () => {
+  it("accepts the row spawnWorker really creates and rejects every near miss", async () => {
+    const state = collabHost();
+    const collab = createCollabStore(state.host.bb);
+    const spawned = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: null,
+      skipClaim: true,
+      maxWorkers: 4,
+      displayName: INTAKE_COURIER_DISPLAY_NAME,
+      message: "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
+    });
+    assert.ok(!("error" in spawned), JSON.stringify(spawned));
+
+    // The identity must describe what the spawn side really emits, read back
+    // from durable state rather than from the spawn arguments — the predicate
+    // is a reload path and never sees the arguments.
+    const persisted = state.host.bb.storage.database().prepare(
+      "SELECT task_name, display_name, item_id, role FROM collab_agents WHERE thread_id = ?",
+    ).get(spawned.threadId) as {
+      task_name: string;
+      display_name: string | null;
+      item_id: string | null;
+      role: string | null;
+    };
+    assert.match(
+      persisted.task_name,
+      new RegExp(`^/root/${INTAKE_COURIER_SLUG}_[0-9a-z]+$`),
+      "the courier's task name is the spawn format the predicate anchors to",
+    );
+    assert.equal(persisted.display_name, INTAKE_COURIER_DISPLAY_NAME);
+    assert.equal(persisted.item_id, null);
+    assert.equal(persisted.role, "worker");
+    const durable = collab.durableRowsForRoot("thr_root").find(
+      (row) => row.threadId === spawned.threadId,
+    );
+    assert.ok(durable, "the courier row is a durable row of its root");
+    assert.equal(durable.displayName, INTAKE_COURIER_DISPLAY_NAME);
+    assert.equal(typeof durable.createdAt, "number");
+    assert.equal(
+      isIntakeCourier({
+        taskName: durable.taskName,
+        displayName: durable.displayName,
+        itemId: durable.itemId,
+        role: durable.role,
+      }),
+      true,
+      "the exact row the plugin's intake spawn creates is a courier",
+    );
+
+    // Every near miss the incident class contains. A discovered or natively
+    // spawned child is itemless too, and an orchestrator can name a real slice
+    // with the same words — neither may inherit the courier's lifecycle.
+    const nearMisses: Array<{ why: string; row: Parameters<typeof isIntakeCourier>[0] }> = [
+      {
+        why: "an itemless worker the plugin did not spawn is not a courier",
+        row: {
+          taskName: "/root/discovered_child_9zz",
+          displayName: "Discovered Child",
+          itemId: null,
+          role: "worker",
+        },
+      },
+      {
+        why: "a verifier wearing the courier's name is not a courier",
+        row: {
+          taskName: persisted.task_name,
+          displayName: INTAKE_COURIER_DISPLAY_NAME,
+          itemId: null,
+          role: "verifier",
+        },
+      },
+      {
+        why: "a differing display name is not the plugin's courier",
+        row: {
+          taskName: `/root/${INTAKE_COURIER_SLUG}_diagnostics`,
+          displayName: "Intake Courier Diagnostics",
+          itemId: null,
+          role: "worker",
+        },
+      },
+      {
+        why: "sharing the slug words without the spawn format is not a courier",
+        row: {
+          taskName: "/root/intake_triage",
+          displayName: INTAKE_COURIER_DISPLAY_NAME,
+          itemId: null,
+          role: "worker",
+        },
+      },
+      {
+        why: "an item-holding worker with the courier name is not a courier",
+        row: {
+          taskName: persisted.task_name,
+          displayName: INTAKE_COURIER_DISPLAY_NAME,
+          itemId: "itm_held",
+          role: "worker",
+        },
+      },
+    ];
+    for (const { why, row } of nearMisses) assert.equal(isIntakeCourier(row), false, why);
+
+    // The identity is one value: the slug the predicate matches is derived from
+    // the name the spawn passes, so a rename can never leave the cleaner behind.
+    assert.equal(slugFromName(INTAKE_COURIER_DISPLAY_NAME), INTAKE_COURIER_SLUG);
+    assert.equal(isIntakeCourierTaskName(`/root/${INTAKE_COURIER_SLUG}_abc123`), true);
+    assert.equal(isIntakeCourierTaskName(`/root/${INTAKE_COURIER_SLUG}`), false);
+    assert.equal(isIntakeCourierTaskName("/root/intake_triage"), false);
+    assert.equal(isIntakeCourierTaskName("/root/intake_courierish_abc"), false);
   });
 });
 

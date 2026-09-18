@@ -1521,7 +1521,7 @@ export function createCollabStore(
           const deadline = Date.now() + timeout;
           const updated: string[] = [];
           await Promise.all(
-            rows.map(async (row) => {
+            rows.map(async (row): Promise<void> => {
               const remaining = Math.max(1, deadline - Date.now());
               try {
                 await bb.sdk.threads.wait({

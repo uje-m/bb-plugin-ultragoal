@@ -69,6 +69,102 @@ function registeredTools() {
   );
 }
 
+// One goal root and its intake surface for the cursor/queue/claim cases below.
+// Only observable behavior is exposed: courier prompts, the durable cursor and
+// the inspection log — never the shape of the intake pass itself.
+function intakeRoot(rootId: string) {
+  const state = {
+    rows: [] as Array<Record<string, unknown>>,
+    spawned: [] as Array<{ id: string; prompt: string }>,
+    spawnCalls: 0,
+    gate: null as Promise<void> | null,
+    refusal: null as string | null,
+  };
+  const host = registeredHost({
+    threads: {
+      get: async ({ threadId }) =>
+        makeThreadResponse({
+          id: threadId,
+          projectId: "proj",
+          providerId: "codex",
+          // No environment: the spawn must not depend on live host worktree
+          // provisioning, which the fake host cannot perform.
+          environmentId: null,
+          parentThreadId: threadId === rootId ? null : rootId,
+          status: "active",
+        }),
+      list: () => [],
+      timeline: ({ threadId }) => ({
+        rows: (threadId === rootId ? state.rows : []) as never[],
+      }),
+      spawn: async (args) => {
+        state.spawnCalls += 1;
+        if (state.gate) await state.gate;
+        if (state.refusal) throw new Error(state.refusal);
+        const id = `thr_intake_${state.spawned.length + 1}`;
+        state.spawned.push({ id, prompt: args.prompt ?? "" });
+        return makeThreadResponse({
+          id,
+          projectId: "proj",
+          providerId: "codex",
+          environmentId: null,
+          parentThreadId: rootId,
+          status: "active",
+        });
+      },
+      output: () => ({ output: null }),
+      stop: () => ({ ok: true }),
+      send: () => ({ ok: true }),
+      update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+      interactions: { list: async () => [], resolve: async () => ({}) },
+    },
+  });
+  const db = host.bb.storage.database();
+  // last_continue_at is fresh so the pulse's own progress check-in is not due:
+  // these cases measure the intake retry, not the steady-state steering.
+  db.prepare(
+    "UPDATE goals SET thread_id = ?, status = 'active', max_workers = 1, last_continue_at = ? WHERE thread_id = 'thr_sentinel'",
+  ).run(rootId, Date.now());
+  const cursor = () =>
+    (
+      db.prepare("SELECT intake_row_id FROM goals WHERE thread_id = ?").get(rootId) as {
+        intake_row_id: string | null;
+      }
+    ).intake_row_id;
+  const setCap = (maxWorkers: number) => {
+    db.prepare("UPDATE goals SET max_workers = ? WHERE thread_id = ?").run(maxWorkers, rootId);
+  };
+  const logs = () => host.harness.inspection.logEntries.map((entry) => entry.message);
+  /** Let every detached continuation reach its next await before asserting. */
+  const settle = async () => {
+    for (let index = 0; index < 40; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+  const ownerRow = (id: string, text: string) => ({
+    kind: "conversation",
+    role: "user",
+    id,
+    text,
+  });
+  const ownerEvent = async () => {
+    const result = await host.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: rootId, status: "active" }),
+    });
+    await settle();
+    return result;
+  };
+  /** One deterministic sweep of the 20s progress pulse (no timers in tests). */
+  const pulse = async () => {
+    const service = host.harness.behavior.runService("progress-pulse");
+    await settle();
+    service.controller.abort();
+    await service.done;
+    await settle();
+  };
+  return { host, state, cursor, setCap, logs, settle, ownerRow, ownerEvent, pulse };
+}
+
 describe("large-plan agent tool contracts", () => {
   it("accepts paged ultragoal_state reads and caps them at 100 rows", () => {
     const tool = registeredTools().get("ultragoal_state")!;
@@ -675,6 +771,160 @@ describe("large-plan agent tool contracts", () => {
     // add_slice publishes and kicks the scheduler on a floating promise; drain
     // it here so the fake host is not disposed under a live database write.
     await settle();
+  });
+
+  it("defers every queued owner row on a full root and keeps the cursor on the last admitted row", async () => {
+    const { state, cursor, setCap, logs, ownerRow, ownerEvent } = intakeRoot("thr_queue_full");
+
+    state.rows = [ownerRow("row_1", "kick off")];
+    await ownerEvent();
+    assert.equal(state.spawned.length, 0, "baselining must not staff an intake courier");
+    assert.equal(cursor(), "row_1");
+
+    // Two owner rows arrive while the root is full. Neither may be lost, read as
+    // triaged, or silently superseded by the newer row.
+    state.rows = [
+      ...state.rows,
+      ownerRow("row_2", "Owner request: first queued request"),
+      ownerRow("row_3", "Owner request: second queued request"),
+    ];
+    setCap(0);
+    await ownerEvent();
+    assert.equal(state.spawned.length, 0, "a full root must not staff an intake courier");
+    assert.equal(cursor(), "row_1", "a deferred owner row must stay queued");
+    assert.ok(
+      logs().includes("Intake pass on thr_queue_full: deferred"),
+      `a deferred pass must expose its outcome by name: ${JSON.stringify(logs())}`,
+    );
+    assert.ok(
+      logs().some(
+        (message) => message.includes("capacity is full") && message.includes("row_2 stays queued"),
+      ),
+      `the first queued row must be named as still queued: ${JSON.stringify(logs())}`,
+    );
+  });
+
+  it("drains every queued owner row in order from the progress pulse once capacity returns", async () => {
+    const { state, cursor, setCap, logs, ownerRow, ownerEvent, pulse } = intakeRoot("thr_queue_drain");
+
+    state.rows = [ownerRow("row_1", "kick off")];
+    await ownerEvent();
+    state.rows = [
+      ...state.rows,
+      ownerRow("row_2", "Owner request: first queued request"),
+      ownerRow("row_3", "Owner request: second queued request"),
+    ];
+    setCap(0);
+    await ownerEvent();
+    assert.equal(state.spawned.length, 0, "a full root must not staff an intake courier");
+
+    // Capacity returns and the owner goes quiet: the progress pulse is the only
+    // remaining retry path, and it must triage EVERY queued row.
+    setCap(3);
+    await pulse();
+    assert.equal(
+      state.spawned.length,
+      2,
+      `every queued owner row must be triaged: ${JSON.stringify(logs())}`,
+    );
+    assert.match(state.spawned[0]!.prompt, /owner request: first queued request/i);
+    assert.match(state.spawned[1]!.prompt, /owner request: second queued request/i);
+    assert.equal(cursor(), "row_3", "the cursor advances to the last admitted owner row");
+    assert.ok(
+      logs().includes("Intake pass on thr_queue_drain: admitted"),
+      `an admitted pass must name the root in its outcome line: ${JSON.stringify(logs())}`,
+    );
+  });
+
+  it("staffs exactly one courier when two intake passes overlap", async () => {
+    const { state, cursor, logs, settle, ownerRow, ownerEvent, pulse } = intakeRoot("thr_overlap");
+
+    state.rows = [ownerRow("row_1", "kick off")];
+    await ownerEvent();
+    state.rows = [...state.rows, ownerRow("row_2", "Owner request: one courier only")];
+    let release!: () => void;
+    state.gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    // Two active events arrive while the first dispatch is still in flight: the
+    // second pass must not dispatch the row the first pass already owns.
+    await ownerEvent();
+    await ownerEvent();
+    assert.equal(
+      state.spawnCalls,
+      1,
+      "an overlapping intake pass must not dispatch a row another pass owns",
+    );
+    assert.ok(
+      logs().includes("Intake pass on thr_overlap: deferred"),
+      `the overlapping pass must report the claim: ${JSON.stringify(logs())}`,
+    );
+
+    release();
+    state.gate = null;
+    await settle();
+    await pulse();
+    assert.equal(state.spawnCalls, 1, "one owner row means one dispatch, however the passes arrive");
+    assert.equal(state.spawned.length, 1, "one owner row means one courier");
+    assert.equal(cursor(), "row_2", "the cursor advances once, after the courier exists");
+  });
+
+  it("contains a refused intake spawn and retries the queued owner row exactly once", async () => {
+    const { state, cursor, logs, ownerRow, ownerEvent } = intakeRoot("thr_refusal");
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      state.rows = [ownerRow("row_1", "kick off")];
+      await ownerEvent();
+      state.rows = [...state.rows, ownerRow("row_2", "Owner request: survive a refused spawn")];
+      state.refusal = "the host refused the intake spawn";
+      const event = await ownerEvent();
+      assert.equal(
+        (event.errors ?? []).length,
+        0,
+        "the detached intake pass must not reject into the event dispatch",
+      );
+      assert.equal(rejections.length, 0, "no intake rejection may escape the plugin boundary");
+      assert.equal(state.spawned.length, 0, "a refused spawn must not add a courier");
+      assert.equal(cursor(), "row_1", "a refused spawn leaves the owner row queued");
+      assert.ok(
+        logs().some(
+          (message) => message.includes("Intake spawn failed") && message.includes("row_2 stays queued"),
+        ),
+        `a refusal must name the queued row: ${JSON.stringify(logs())}`,
+      );
+
+      state.refusal = null;
+      await ownerEvent();
+      assert.equal(state.spawned.length, 1, "the queued owner row must be retryable");
+      assert.equal(state.spawnCalls, 2, "the retry dispatches exactly once more");
+      assert.equal(cursor(), "row_2", "the retry advances the cursor once the courier exists");
+      assert.equal(rejections.length, 0, "the retry must not leak a rejection either");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  it("dispatches the newest owner row when the cursor row left the timeline window", async () => {
+    const { state, cursor, ownerRow, ownerEvent } = intakeRoot("thr_rotated");
+
+    state.rows = [ownerRow("row_1", "kick off")];
+    await ownerEvent();
+    assert.equal(cursor(), "row_1");
+
+    state.rows = [];
+    await ownerEvent();
+    assert.equal(state.spawned.length, 0, "an empty timeline staffs nothing");
+
+    // The cursor row is no longer in the window the host returns. Losing the row
+    // must not hide the newest one: it is the only row this pass can attribute.
+    state.rows = [ownerRow("row_9", "Owner request: after the window rotated")];
+    await ownerEvent();
+    assert.equal(state.spawned.length, 1, "the newest owner row is still attributable");
+    assert.match(state.spawned[0]!.prompt, /after the window rotated/);
+    assert.equal(cursor(), "row_9");
   });
 
   it("audits stale finding links on the first startup pulse", async () => {
@@ -1729,7 +1979,7 @@ describe("cross-repo staffing provenance", () => {
             status: "idle",
           }),
         list: () => [],
-        spawn: (args) =>
+        spawn: () =>
           makeThreadResponse({
             id: "thr_staffed",
             projectId: "proj_omegacode",

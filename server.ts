@@ -1079,31 +1079,43 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function scheduleReady(rootThreadId: string): Promise<void> {
-    if (transferLocked(rootThreadId)) return;
-    const goal = store.get(rootThreadId);
-    if (
-      !goal ||
-      (goal.status !== "active" && goal.status !== "budget_limited" && goal.status !== "blocked")
-    ) {
-      return;
-    }
-    // Record the trigger BEFORE the re-entrancy check: a trigger that arrives
-    // mid-pass must leave the row dirty. The in-memory set only marks the pass,
-    // it never drops work.
-    scheduleGenerations.request(rootThreadId, Date.now());
-    if (scheduling.has(rootThreadId)) return;
-    scheduling.add(rootThreadId);
+    // Best-effort pass: callers invoke this detached, so a host or SDK failure
+    // that lands after they returned must not surface as an unhandled rejection.
+    // The durable generation is only serviced at the end of a completed pass, so
+    // a failed one stays owed and the next trigger (or reload) services it.
     try {
-      for (;;) {
-        const serviced = scheduleGenerations.requested(rootThreadId);
-        await runSchedulingPass(rootThreadId);
-        // One pass per outstanding generation: a trigger that landed mid-pass
-        // leaves the row dirty and owes exactly one more pass, never a timer or
-        // a recursion. A pass that staffs nothing cannot dirty the row itself.
-        if (!scheduleGenerations.service(rootThreadId, serviced, Date.now())) break;
+      if (transferLocked(rootThreadId)) return;
+      const goal = store.get(rootThreadId);
+      if (
+        !goal ||
+        (goal.status !== "active" && goal.status !== "budget_limited" && goal.status !== "blocked")
+      ) {
+        return;
       }
-    } finally {
-      scheduling.delete(rootThreadId);
+      // Record the trigger BEFORE the re-entrancy check: a trigger that arrives
+      // mid-pass must leave the row dirty. The in-memory set only marks the pass,
+      // it never drops work.
+      scheduleGenerations.request(rootThreadId, Date.now());
+      if (scheduling.has(rootThreadId)) return;
+      scheduling.add(rootThreadId);
+      try {
+        for (;;) {
+          const serviced = scheduleGenerations.requested(rootThreadId);
+          await runSchedulingPass(rootThreadId);
+          // One pass per outstanding generation: a trigger that landed mid-pass
+          // leaves the row dirty and owes exactly one more pass, never a timer or
+          // a recursion. A pass that staffs nothing cannot dirty the row itself.
+          if (!scheduleGenerations.service(rootThreadId, serviced, Date.now())) break;
+        }
+      } finally {
+        scheduling.delete(rootThreadId);
+      }
+    } catch (error) {
+      bb.log.warn(
+        `Scheduling pass failed on ${rootThreadId}; its generation stays owed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

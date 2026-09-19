@@ -4167,11 +4167,20 @@ export default function plugin(bb: BbPluginApi) {
       }
       decisionAborts.get(resolved.id)?.abort();
       markGoalEvent(owner);
-      // The root resolved this on the owner's behalf and already holds the
-      // answer in-band. A worker relaying one does not, so it stays pending and
-      // the sweep delivers it — no answered decision goes undelivered either way.
+      // The guarded store answers with the row as committed — the FIRST
+      // resolution — so a non-null result is not proof this call wrote it. Only
+      // a resolution carrying exactly what this caller supplied is held in-band
+      // by the root, and only that one may be marked delivered: a conflicting
+      // second answer or withdrawal writes nothing, and marking the row
+      // delivered here would strand the committed answer, since listUndelivered
+      // drops it and the root would only ever know the answer it supplied.
+      const committedHere =
+        resolved.status === resolution && resolved.answer === (answer.trim() || null);
+      // A worker relaying an answer, or a caller whose resolution lost the
+      // race, does not put the committed answer in the root's hands: it stays
+      // pending until the sweep steers it.
       if (resolved.status === "answered") {
-        if (threadId === owner) {
+        if (committedHere && threadId === owner) {
           decisions.markDelivered(owner, resolved.id);
         } else {
           void deliverDecisionAnswers(owner);
@@ -4180,7 +4189,14 @@ export default function plugin(bb: BbPluginApi) {
       void publishFresh(owner);
       return {
         content: [
-          { type: "text", text: JSON.stringify({ decision_id: resolved.id, status: resolved.status }) },
+          {
+            type: "text",
+            text: JSON.stringify({
+              decision_id: resolved.id,
+              status: resolved.status,
+              answer: resolved.answer,
+            }),
+          },
         ],
       };
     },

@@ -989,23 +989,16 @@ export default function plugin(bb: BbPluginApi) {
     return lines.join("\n\n");
   }
 
-  /** Durable event types the worker classifier reads. Ruling #4: this
-   * projection is the only admissible classification source. */
+  /** Durable event types the worker classifier reads — ruling #4's only
+   * admissible classification source. */
   const WORKER_GENERATION_EVENTS = [
-    "client/turn/requested",
-    "turn/input/accepted",
-    "turn/completed",
-    "system/thread/interrupted",
-    "system/thread-provisioning",
+    "client/turn/requested", "turn/input/accepted", "turn/completed",
+    "system/thread/interrupted", "system/thread-provisioning",
   ] as const;
 
-  /**
-   * The durable classification of one worker's latest request generation.
-   * `failed` and `deleted` are authoritative host death signals: the projection
-   * only labels which release applies, so an unreadable one cannot veto a thread
-   * the host has already pronounced dead. Every other unreadable classification
-   * is `evidence_unavailable`, which quarantines.
-   */
+  /** Classify one worker's latest request generation. `failed` and `deleted`
+   * are authoritative host death signals, so unreadable evidence cannot veto
+   * them; every other unreadable classification quarantines. */
   async function workerGeneration(
     workerThreadId: string,
     options: { failed?: boolean; deleted?: boolean } = {},
@@ -1047,10 +1040,9 @@ export default function plugin(bb: BbPluginApi) {
     );
   }
 
-  /** Hydration reconciliation: a stop that landed while this plugin generation
-   * was not listening is still durable in the event projection. Classify every
-   * durable worker row once and release the stop/abort/failure generations;
-   * ordinary idle, stop-pending, running and unreadable ones keep their slot. */
+  /** Hydration: a stop that landed while this plugin generation was not
+   * listening is still durable. Release the stop/abort/failure generations;
+   * ordinary idle, pending, running and unreadable ones keep their slot. */
   async function reconcileDurableGenerations(rootThreadId: string): Promise<void> {
     for (const row of collab.durableRowsForRoot(rootThreadId)) {
       if (row.role === "verifier" || !row.itemId) continue;
@@ -1060,15 +1052,12 @@ export default function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** A plugin reload starts with an empty in-memory cache while durable
-   * collaboration rows and their BB threads remain alive. Scheduling must
-   * rebuild that ownership view before it calculates slots or decides an
-   * in-progress item was abandoned. */
+  /** A reload starts with an empty in-memory cache while durable rows and their
+   * threads stay alive, so scheduling rebuilds that ownership view first. */
   async function hydrateSchedulerOwnership(rootThreadId: string): Promise<boolean> {
     if (agentCache.has(rootThreadId)) return true;
     try {
-      // Reconcile BEFORE building the ownership view: a worker released here
-      // must not be projected as a holder for the rest of this pass.
+      // Reconcile first: a worker released here must not project as a holder.
       await reconcileDurableGenerations(rootThreadId);
       const listed = await collab.listForRoot(rootThreadId, {
         discover: true,
@@ -1098,9 +1087,9 @@ export default function plugin(bb: BbPluginApi) {
     ) {
       return;
     }
-    // Durably record the trigger BEFORE the re-entrancy check. A trigger that
-    // arrives while a pass is in flight must leave the row dirty for that pass
-    // to service; the in-memory set only marks the pass, it never drops work.
+    // Record the trigger BEFORE the re-entrancy check: a trigger that arrives
+    // mid-pass must leave the row dirty. The in-memory set only marks the pass,
+    // it never drops work.
     scheduleGenerations.request(rootThreadId, Date.now());
     if (scheduling.has(rootThreadId)) return;
     scheduling.add(rootThreadId);
@@ -1110,8 +1099,7 @@ export default function plugin(bb: BbPluginApi) {
         await runSchedulingPass(rootThreadId);
         // One pass per outstanding generation: a trigger that landed mid-pass
         // leaves the row dirty and owes exactly one more pass, never a timer or
-        // a recursion. A pass that staffs nothing cannot dirty the row itself,
-        // so this always settles.
+        // a recursion. A pass that staffs nothing cannot dirty the row itself.
         if (!scheduleGenerations.service(rootThreadId, serviced, Date.now())) break;
       }
     } finally {
@@ -1138,12 +1126,10 @@ export default function plugin(bb: BbPluginApi) {
         list.filter((item) => item.status !== "completed").map((item) => item.id),
       );
       // Plan against the fence's unit of account, never against the projected
-      // crew. `acquire` and the capacity triggers count every durable row plus
-      // every live reservation; a planner that counted fewer — the projection
-      // drops item-less rows whose host is not live — asked for spawns the
-      // fence refused, and STAFF_RETRY_MS turned each refusal into a five-minute
-      // penalty box per ready slice. The retirement sweep in healStalls owns the
-      // rows this count includes and the projection does not.
+      // crew: `acquire` and the capacity triggers count every durable row plus
+      // every live reservation, while the projection drops item-less rows whose
+      // host is not live. The retirement sweep in healStalls owns the rows this
+      // count includes and the projection does not.
       let slots = freeSlots(maxWorkers, reservations.occupancy(rootThreadId));
       if (slots <= 0) return;
       const completedIds = new Set(

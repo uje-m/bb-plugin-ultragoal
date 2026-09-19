@@ -101,9 +101,12 @@ export function createDecisionStore(bb: BbPluginApi) {
       throw new DecisionOwnerMismatchError(row.thread_id, row.id, persistedOwner ?? null);
     }
   });
+  // The open-status guard lives in the UPDATE, so the check and the write are
+  // one atomic statement: a competing resolution that arrives second matches no
+  // row and changes nothing, with no read-then-write window in JavaScript.
   const resolveStmt = db.prepare(`
     UPDATE goal_decisions SET status = @status, answer = @answer, answered_at = @answered_at
-    WHERE thread_id = @thread_id AND id = @id
+    WHERE thread_id = @thread_id AND id = @id AND status = 'open'
   `);
   const clearStmt = db.prepare("DELETE FROM goal_decisions WHERE thread_id = ?");
   const markDeliveredStmt = db.prepare(
@@ -160,14 +163,21 @@ export function createDecisionStore(bb: BbPluginApi) {
       markDeliveredStmt.run({ thread_id: threadId, id, delivered_at: Date.now() });
     },
 
+    /**
+     * Resolve an open decision; the first valid resolution wins atomically.
+     * An identical retry or a conflicting resolution writes nothing and returns
+     * the row as committed — the FIRST resolution's status and answer — because
+     * callers rely on the non-null shape and read `null` as "no such decision"
+     * (applyDecisionAnswer returns false, resolve_decision reports "decision
+     * not found", the CLI prints "Decision not found"). An id no row owns
+     * still resolves to null.
+     */
     resolve(
       threadId: string,
       id: string,
       status: "answered" | "withdrawn",
       answer: string,
     ): GoalDecision | null {
-      const existing = this.get(threadId, id);
-      if (!existing) return null;
       resolveStmt.run({
         thread_id: threadId,
         id,

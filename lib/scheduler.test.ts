@@ -1029,6 +1029,47 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     assert.equal(store.release("thr_s8", "itm_aged", token!), false, "commit consumed the claim");
   });
 
+  it("reclaims a reservation left by a generation that died before the worker row landed", async () => {
+    const f = liveGoal("thr_s9", 2);
+    const item = f.add("Slice: killed mid-spawn", "pending", ["src/killed.ts"]);
+    // The dead generation acquired the reservation and was gone before its
+    // worker row landed: no owner, no token holder, and no clock may free it.
+    const deadGeneration = createItemReservationStore(f.db);
+    assert.ok(deadGeneration.acquire("thr_s9", item.id, 2));
+    const reloaded = await reloadHost(f.host);
+    const liveDb = reloaded.bb.storage.database();
+    const reservationCount = () =>
+      (liveDb
+        .prepare("SELECT COUNT(*) AS n FROM collab_item_reservations WHERE root_thread_id = ?")
+        .get("thr_s9") as { n: number }).n;
+    assert.equal(reservationCount(), 1, "the dead generation's reservation survives the reload");
+    assert.equal(
+      createItemReservationStore(liveDb).acquire("thr_s9", item.id, 2),
+      null,
+      "without a reconcile the slice could never be acquired again",
+    );
+    await f.pulse(reloaded);
+    assert.equal(f.spawnsFor(item.id).length, 1, "the next pass reclaims the orphan and staffs the slice once");
+    assert.equal(reservationCount(), 0, "the unreachable reservation is gone");
+    assert.deepEqual(
+      liveDb
+        .prepare(
+          `SELECT thread_id, item_id FROM collab_agents
+           WHERE root_thread_id = 'thr_s9' AND retired_at IS NULL
+             AND COALESCE(role, 'worker') != 'verifier'`,
+        )
+        .all(),
+      [{ thread_id: f.spawnsFor(item.id)[0]!.threadId, item_id: item.id }],
+      "exactly one durable owner, and it is the worker this pass staffed",
+    );
+    assert.equal(
+      (liveDb.prepare("SELECT status FROM goal_items WHERE id = ?").get(item.id) as { status: string })
+        .status,
+      "in_progress",
+      "the reclaimed slice is staffed rather than left ready",
+    );
+  });
+
   it("releases a reliable stop and an abort-before-acceptance exactly once each", async () => {
     const f = liveGoal("thr_s3", 2);
     const aborted = f.add("Slice: aborted before acceptance", "in_progress", ["src/abort.ts"]);

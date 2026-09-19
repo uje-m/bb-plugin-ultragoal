@@ -1134,6 +1134,17 @@ export default function plugin(bb: BbPluginApi) {
       if (!collab.setWorkerCap(rootThreadId, maxWorkers)) return;
       if (!(await hydrateSchedulerOwnership(rootThreadId))) return;
       if (maxWorkers <= 0) return;
+      // A process killed between a reservation's `acquire` and its worker-row
+      // insert leaves a row with no owner: no durable worker, no spawn still in
+      // flight. It consumes a root slot for good and makes every later
+      // `acquire` for that slice refuse. Reclaim it here — pass entry — and hand
+      // a slice the dead spawn had already claimed back to ready, so this pass
+      // can staff it. Deliberately not time-keyed: a reservation a live worker
+      // or an in-flight spawn still holds is never touched.
+      for (const itemId of collab.reclaimItemReservations(rootThreadId)) {
+        const claimed = items.list(rootThreadId).find((row) => row.id === itemId);
+        if (claimed?.status === "in_progress") items.setStatus(rootThreadId, itemId, "pending");
+      }
       const agents = agentCache.get(rootThreadId) ?? [];
       const list = items.list(rootThreadId);
       const openItemIds = new Set(

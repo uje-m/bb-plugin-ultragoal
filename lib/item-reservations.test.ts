@@ -272,6 +272,64 @@ describe("durable scheduler item reservations", () => {
     }
   });
 
+  it("reclaims a reservation left by a generation that died before the worker row landed", () => {
+    const { first, second } = connections();
+    try {
+      const deadGeneration = createItemReservationStore(first);
+      const newGeneration = createItemReservationStore(second);
+      assert.ok(deadGeneration.acquire("thr_root", "itm_killed", 1));
+      assert.equal(
+        newGeneration.acquire("thr_root", "itm_killed", 1),
+        null,
+        "the orphan row blocks every later acquire for its item",
+      );
+      assert.deepEqual(
+        newGeneration.reclaimUnheld("thr_root"),
+        ["itm_killed"],
+        "a new generation reclaims a row no owner can reach",
+      );
+      assert.equal(newGeneration.occupancy("thr_root"), 0, "the orphan's slot is free again");
+      assert.ok(
+        newGeneration.acquire("thr_root", "itm_killed", 1),
+        "the slice is staffable on the next pass instead of never again",
+      );
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
+  it("never reclaims a reservation a live worker or an in-flight spawn holds", () => {
+    const { first, second } = connections();
+    try {
+      const spawn = createItemReservationStore(second);
+      assert.ok(spawn.acquire("thr_root", "itm_in_flight", 2));
+      assert.ok(spawn.acquire("thr_root", "itm_owned", 2));
+      first.prepare(`
+        INSERT INTO collab_agents (thread_id, root_thread_id, item_id, role)
+        VALUES ('thr_owner', 'thr_root', 'itm_owned', 'worker')
+      `).run();
+      assert.deepEqual(
+        spawn.reclaimUnheld("thr_root"),
+        [],
+        "a spawn still in flight in this generation keeps its reservation",
+      );
+      assert.deepEqual(
+        createItemReservationStore(first).reclaimUnheld("thr_root"),
+        ["itm_in_flight"],
+        "a second generation drops the unreachable row and never the live worker's item",
+      );
+      assert.equal(
+        (first.prepare("SELECT COUNT(*) AS n FROM collab_agents").get() as { n: number }).n,
+        1,
+        "reclaiming never touches a worker row",
+      );
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
   it("fences revival or adoption updates after the root slot is full", () => {
     const { first, second } = connections();
     try {

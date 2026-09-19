@@ -5,10 +5,16 @@ type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 
 /**
  * Reservations do not expire: a slot is released by `release`, consumed by
- * `commit`, or retired when an authoritative host signal proves the launch dead
- * — never by a clock. `expires_at` survives only as a column the shared
+ * `commit`, or retired when an authoritative signal proves the launch dead —
+ * never by a clock. `expires_at` survives only as a column the shared
  * migration's capacity triggers still count, written beyond any clock, so the
  * fence counts every reservation instead of reviving time as an authority.
+ *
+ * "Proves the launch dead" includes `reclaimUnheld`: a row with no live worker
+ * and no spawn in flight in the reclaiming generation is treated as ownerless.
+ * A spawn in another generation loses its reservation and fails closed in
+ * `commit` — the fence the token exists for — rather than ever becoming a
+ * second owner.
  */
 const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 
@@ -142,6 +148,11 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
  * pass a process-local availability check and spawn the same work item.
  */
 export function createItemReservationStore(db: PluginDatabase) {
+  /** Tokens this store instance acquired and has not yet committed or released:
+   * a spawn of its own may still land with them. Process-local, and deliberately
+   * never time-keyed — a token that is in flight is proof a spawn may still
+   * land, and the only truthful way to stop believing it is the spawn ending. */
+  const inFlight = new Set<string>();
   const acquireStmt = db.prepare(`
     INSERT OR IGNORE INTO collab_item_reservations (
       root_thread_id, item_id, claim_token, created_at, expires_at, slot_limit
@@ -173,6 +184,9 @@ export function createItemReservationStore(db: PluginDatabase) {
   );
   const reservation = db.prepare(
     "SELECT claim_token, slot_limit FROM collab_item_reservations WHERE root_thread_id = ? AND item_id = ?",
+  );
+  const heldRows = db.prepare(
+    "SELECT item_id, claim_token FROM collab_item_reservations WHERE root_thread_id = ?",
   );
   const liveWorker = db.prepare(`
     SELECT 1 FROM collab_agents
@@ -241,13 +255,56 @@ export function createItemReservationStore(db: PluginDatabase) {
           expires_at: NO_EXPIRY,
           slot_limit: slotLimit,
         });
-        return result.changes === 1 ? token : null;
+        if (result.changes !== 1) return null;
+        inFlight.add(token);
+        return token;
       });
       return txn.immediate();
     },
 
     release(rootThreadId: string, itemId: string, token: string): boolean {
-      return releaseStmt.run(rootThreadId, itemId, token).changes === 1;
+      try {
+        return releaseStmt.run(rootThreadId, itemId, token).changes === 1;
+      } finally {
+        inFlight.delete(token);
+      }
+    },
+
+    /**
+     * Reclaim reservations no owner can reach: the item has no live worker row
+     * and no spawn of this store instance still holds the token.
+     *
+     * A process killed between `acquire` and the worker insert leaves exactly
+     * that row. It consumes a root slot forever — `occupancy` counts it and the
+     * capacity triggers do too — and `acquire` for the item can never succeed
+     * again, because `INSERT OR IGNORE` finds the row and changes nothing.
+     *
+     * Non-temporal by construction: a slot a worker holds, or a spawn that may
+     * still land, is never touched however much time passes; only a row with
+     * neither is dropped. A spawn in another generation that loses its
+     * reservation this way fails closed in `commit`, which is the fence the
+     * token exists for. A spawn whose promise never settles keeps its token
+     * reserved until the process restarts: fail-closed, never a double owner.
+     *
+     * Returns the item ids whose reservation was dropped, so the caller can
+     * return a slice the dead spawn had already claimed to the queue.
+     */
+    reclaimUnheld(rootThreadId: string): string[] {
+      const txn = db.transaction((): string[] => {
+        const reclaimed: string[] = [];
+        for (const row of heldRows.all(rootThreadId) as Array<{
+          item_id: string;
+          claim_token: string;
+        }>) {
+          if (inFlight.has(row.claim_token)) continue;
+          if (liveWorker.get(rootThreadId, row.item_id)) continue;
+          if (releaseStmt.run(rootThreadId, row.item_id, row.claim_token).changes === 1) {
+            reclaimed.push(row.item_id);
+          }
+        }
+        return reclaimed;
+      });
+      return txn.immediate();
     },
 
     /** Drop every reservation for the item. Explicit owner release only: a
@@ -288,7 +345,11 @@ export function createItemReservationStore(db: PluginDatabase) {
         }
         return true;
       });
-      return txn.immediate();
+      try {
+        return txn.immediate();
+      } finally {
+        inFlight.delete(token);
+      }
     },
 
     /**

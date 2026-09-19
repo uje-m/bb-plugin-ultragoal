@@ -316,6 +316,13 @@ export function createCollabStore(
     return reservations.isHeld(rootThreadId, itemId, exceptReservation);
   }
 
+  /** Drop reservations no owner can reach — see
+   * `createItemReservationStore.reclaimUnheld`. Goes through this store's own
+   * handle, so a spawn this process still has in flight is never reclaimed. */
+  function reclaimItemReservations(rootThreadId: string): string[] {
+    return reservations.reclaimUnheld(rootId(rootThreadId));
+  }
+
   /** The one atomic release-and-requeue: in a single IMMEDIATE transaction it
    * retires the worker row (tombstone its item, set `retired_at`), drops its
    * reservation and hands a still-open slice back. A completed slice is never
@@ -1119,6 +1126,7 @@ export function createCollabStore(
     rootId,
     rowOf,
     itemHasWorker,
+    reclaimItemReservations,
     setWorkerCap(rootThreadId: string, maxWorkers: number): boolean {
       return reservations.setCap(rootId(rootThreadId), maxWorkers);
     },

@@ -70,16 +70,35 @@ function registeredTools() {
 }
 
 // One goal root and its intake surface for the cursor/queue/claim cases below.
-// Only observable behavior is exposed: courier prompts, the durable cursor and
-// the inspection log — never the shape of the intake pass itself.
-function intakeRoot(rootId: string) {
-  const state = {
-    rows: [] as Array<Record<string, unknown>>,
-    spawned: [] as Array<{ id: string; prompt: string }>,
-    spawnCalls: 0,
-    gate: null as Promise<void> | null,
-    refusal: null as string | null,
+// Extra roots share the same seam: `threads.timeline` and `threads.spawn` route
+// by the parent root, so a single pulse sweeps each root with its own rows and
+// dispatch state. Only observable behavior is exposed: courier prompts, the
+// durable cursor and the inspection log — never the shape of the intake pass
+// itself.
+type IntakeRootState = {
+  rows: Array<Record<string, unknown>>;
+  spawned: Array<{ id: string; prompt: string }>;
+  spawnCalls: number;
+  gate: Promise<void> | null;
+  refusal: string | null;
+};
+
+function intakeRoot(rootId: string, extraRootIds: string[] = []) {
+  const rootStates = new Map<string, IntakeRootState>(
+    [rootId, ...extraRootIds].map((id) => [
+      id,
+      { rows: [], spawned: [], spawnCalls: 0, gate: null, refusal: null },
+    ]),
+  );
+  // The primary root keeps the plain `state` handle the single-root cases use.
+  const state = rootStates.get(rootId)!;
+  const rootState = (id: string) => {
+    const value = rootStates.get(id);
+    if (!value) throw new Error(`unknown intake root ${id}`);
+    return value;
   };
+  const parents = new Map<string, string>();
+  let spawns = 0;
   const host = registeredHost({
     threads: {
       get: async ({ threadId }) =>
@@ -90,25 +109,29 @@ function intakeRoot(rootId: string) {
           // No environment: the spawn must not depend on live host worktree
           // provisioning, which the fake host cannot perform.
           environmentId: null,
-          parentThreadId: threadId === rootId ? null : rootId,
+          parentThreadId: parents.get(threadId) ?? (rootStates.has(threadId) ? null : rootId),
           status: "active",
         }),
       list: () => [],
       timeline: ({ threadId }) => ({
-        rows: (threadId === rootId ? state.rows : []) as never[],
+        rows: (rootStates.get(threadId)?.rows ?? []) as never[],
       }),
       spawn: async (args) => {
-        state.spawnCalls += 1;
-        if (state.gate) await state.gate;
-        if (state.refusal) throw new Error(state.refusal);
-        const id = `thr_intake_${state.spawned.length + 1}`;
-        state.spawned.push({ id, prompt: args.prompt ?? "" });
+        const target = rootStates.get(String(args.parentThreadId ?? ""));
+        if (!target) throw new Error(`unexpected intake spawn for ${String(args.parentThreadId)}`);
+        target.spawnCalls += 1;
+        if (target.gate) await target.gate;
+        if (target.refusal) throw new Error(target.refusal);
+        spawns += 1;
+        const id = `thr_intake_${spawns}`;
+        target.spawned.push({ id, prompt: args.prompt ?? "" });
+        parents.set(id, String(args.parentThreadId ?? rootId));
         return makeThreadResponse({
           id,
           projectId: "proj",
           providerId: "codex",
           environmentId: null,
-          parentThreadId: rootId,
+          parentThreadId: String(args.parentThreadId ?? rootId),
           status: "active",
         });
       },
@@ -125,14 +148,24 @@ function intakeRoot(rootId: string) {
   db.prepare(
     "UPDATE goals SET thread_id = ?, status = 'active', max_workers = 1, last_continue_at = ? WHERE thread_id = 'thr_sentinel'",
   ).run(rootId, Date.now());
-  const cursor = () =>
+  // Every extra root is its own active goal row; one pulse sweeps all of them.
+  for (const extraRootId of extraRootIds) {
+    db.prepare(
+      `INSERT INTO goals (thread_id, objective, status, reason, created_at, updated_at, started_at,
+        turn_count, max_turns, max_minutes, last_continue_at, last_assistant_hash, intake_row_id, max_workers)
+       SELECT ?, objective || ' extra', 'active', reason, created_at, updated_at, started_at,
+        turn_count, max_turns, max_minutes, ?, last_assistant_hash, NULL, 1
+       FROM goals WHERE thread_id = ?`,
+    ).run(extraRootId, Date.now(), rootId);
+  }
+  const cursor = (threadId = rootId) =>
     (
-      db.prepare("SELECT intake_row_id FROM goals WHERE thread_id = ?").get(rootId) as {
+      db.prepare("SELECT intake_row_id FROM goals WHERE thread_id = ?").get(threadId) as {
         intake_row_id: string | null;
       }
     ).intake_row_id;
-  const setCap = (maxWorkers: number) => {
-    db.prepare("UPDATE goals SET max_workers = ? WHERE thread_id = ?").run(maxWorkers, rootId);
+  const setCap = (maxWorkers: number, threadId = rootId) => {
+    db.prepare("UPDATE goals SET max_workers = ? WHERE thread_id = ?").run(maxWorkers, threadId);
   };
   const logs = () => host.harness.inspection.logEntries.map((entry) => entry.message);
   /** Let every detached continuation reach its next await before asserting. */
@@ -147,9 +180,9 @@ function intakeRoot(rootId: string) {
     id,
     text,
   });
-  const ownerEvent = async () => {
+  const ownerEvent = async (threadId = rootId) => {
     const result = await host.harness.behavior.emitThreadEvent("thread.active", {
-      thread: makeThreadResponse({ id: rootId, status: "active" }),
+      thread: makeThreadResponse({ id: threadId, status: "active" }),
     });
     await settle();
     return result;
@@ -162,7 +195,8 @@ function intakeRoot(rootId: string) {
     await service.done;
     await settle();
   };
-  return { host, state, cursor, setCap, logs, settle, ownerRow, ownerEvent, pulse };
+  const never = () => new Promise<void>(() => {});
+  return { host, state, rootState, cursor, setCap, logs, settle, ownerRow, ownerEvent, pulse, never };
 }
 
 describe("large-plan agent tool contracts", () => {
@@ -925,6 +959,150 @@ describe("large-plan agent tool contracts", () => {
     assert.equal(state.spawned.length, 1, "the newest owner row is still attributable");
     assert.match(state.spawned[0]!.prompt, /after the window rotated/);
     assert.equal(cursor(), "row_9");
+  });
+
+  // Issue #34's two blockers were defects of a STALE-CLAIM TAKEOVER, and this
+  // base deliberately has no takeover: a pass owns its claim to completion and
+  // the 20s pulse only ever detaches it. The two cases below pin that shape, so
+  // the rejected takeover fails them the moment it returns. The brief's
+  // "failure-after-takeover" therefore maps onto the same sequence without a
+  // takeover: a dispatch left outstanding past any staleness a takeover would
+  // key on, with later owner events and a pulse arriving, is never re-dispatched
+  // — and when it finally FAILS, the owner row stays retryable exactly once.
+  // The "never-resolving iteration" companion pins the sweep side: a dispatch
+  // that never settles cannot wedge the pulse for later roots.
+  // Observables only: spawn calls, courier prompts, the durable intake_row_id
+  // cursor and the inspection log — never the shape of the claim map.
+  it("never takes over an outstanding dispatch and retries the owner row exactly once after its late failure", async () => {
+    const { state, cursor, logs, settle, ownerRow, ownerEvent, pulse } =
+      intakeRoot("thr_late_failure");
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      state.rows = [ownerRow("row_1", "kick off")];
+      await ownerEvent();
+      assert.equal(cursor(), "row_1", "the first owner row baselines the cursor");
+
+      // A queued owner row arrives and its dispatch is held outstanding. The
+      // claim is taken before the spawn, so every later pass must defer: a
+      // takeover here is what consumed this row for good in the retired run.
+      state.rows = [
+        ...state.rows,
+        ownerRow("row_2", "Owner request: survive a late dispatch failure"),
+      ];
+      let release!: () => void;
+      state.gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const outstanding = await ownerEvent();
+      assert.equal(state.spawnCalls, 1, "the queued row is dispatched once");
+      assert.equal(cursor(), "row_1", "the cursor cannot move before the courier exists");
+
+      // However long the dispatch stays outstanding — an owner event and a
+      // pulse, with nothing settling it — no later pass may take the claim
+      // over, dispatch the row a second time, or move the cursor past it.
+      const deferred = await ownerEvent();
+      await pulse();
+      assert.equal(
+        state.spawnCalls,
+        1,
+        "an outstanding dispatch must never be taken over or re-dispatched",
+      );
+      assert.equal(state.spawned.length, 0, "no courier exists while the dispatch is outstanding");
+      assert.equal(cursor(), "row_1", "the queued row stays the cursor's next row");
+      assert.ok(
+        logs().includes("Intake pass on thr_late_failure: deferred"),
+        `later passes must defer behind the claim: ${JSON.stringify(logs())}`,
+      );
+
+      // The outstanding dispatch fails LATE. The failure is contained, the row
+      // is still queued, and the cursor cannot move.
+      state.refusal = "the host refused the intake spawn (late)";
+      release();
+      state.gate = null;
+      await settle();
+      assert.equal(
+        (outstanding.errors ?? []).length,
+        0,
+        "a late dispatch failure must not reject into the event that started it",
+      );
+      assert.equal(
+        (deferred.errors ?? []).length,
+        0,
+        "a deferred pass must not reject into the event that triggered it",
+      );
+      assert.equal(rejections.length, 0, "no intake rejection may escape the plugin boundary");
+      assert.ok(
+        logs().some(
+          (message) =>
+            message.includes("Intake spawn failed") && message.includes("row_2 stays queued"),
+        ),
+        `a late failure must name the row as still queued: ${JSON.stringify(logs())}`,
+      );
+      assert.equal(cursor(), "row_1", "a late failure must not consume the queued row");
+
+      // The very next pass retries it exactly once: one courier carrying the
+      // queued row, one cursor advance, no leak.
+      state.refusal = null;
+      await pulse();
+      assert.equal(state.spawnCalls, 2, "the late-failed dispatch is retried exactly once");
+      assert.equal(state.spawned.length, 1, "exactly one courier is staffed");
+      assert.match(
+        state.spawned[0]!.prompt,
+        /survive a late dispatch failure/i,
+        "the retried courier carries the queued row",
+      );
+      assert.equal(cursor(), "row_2", "the cursor advances once, after the courier exists");
+      assert.equal(rejections.length, 0, "the retry must not leak a rejection either");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  it("keeps sweeping later roots while one root's dispatch never settles", async () => {
+    const { state, rootState, cursor, setCap, logs, ownerRow, ownerEvent, pulse, never } =
+      intakeRoot("thr_stuck_root", ["thr_later_root"]);
+
+    // Root A baselines, then queues a row whose dispatch never settles. The
+    // outstanding claim is exactly what a takeover would key on.
+    state.rows = [ownerRow("a_1", "kick off")];
+    await ownerEvent();
+    state.rows = [...state.rows, ownerRow("a_2", "Owner request: never settles")];
+    state.gate = never();
+    await ownerEvent();
+    assert.equal(state.spawnCalls, 1, "root A's dispatch is outstanding");
+
+    // Root B baselines and defers its queued row while its own capacity is
+    // full, so the pulse is its only retry path.
+    const later = rootState("thr_later_root");
+    later.rows = [ownerRow("b_1", "kick off")];
+    await ownerEvent("thr_later_root");
+    later.rows = [...later.rows, ownerRow("b_2", "Owner request: drain behind a stuck root")];
+    setCap(0, "thr_later_root");
+    await ownerEvent("thr_later_root");
+    assert.equal(later.spawnCalls, 0, "root B defers while full");
+    setCap(1, "thr_later_root");
+
+    // One pulse must resolve — it never awaits an intake dispatch — and root
+    // B's queued row staffs its courier in that same sweep. A wedged root A
+    // would otherwise stop every later root's revival, progress, reconciliation
+    // and accounting.
+    await pulse();
+    assert.equal(
+      later.spawnCalls,
+      1,
+      `a never-settling root must not stop a later root's intake retry: ${JSON.stringify(logs())}`,
+    );
+    assert.equal(later.spawned.length, 1, "root B staffs exactly one courier");
+    assert.match(later.spawned[0]!.prompt, /drain behind a stuck root/i);
+    assert.equal(cursor("thr_later_root"), "b_2", "root B's cursor advances after its courier");
+    assert.equal(
+      state.spawnCalls,
+      1,
+      "root A is never taken over while its dispatch is outstanding",
+    );
+    assert.equal(cursor(), "a_1", "root A's queued row is retained, not consumed");
   });
 
   it("audits stale finding links on the first startup pulse", async () => {

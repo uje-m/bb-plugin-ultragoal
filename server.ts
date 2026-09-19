@@ -2522,9 +2522,13 @@ export default function plugin(bb: BbPluginApi) {
   // One pass per root owns the timeline read AND the dispatch. The dispatch has
   // no AbortSignal, so a stuck pass cannot be told from a slow one: a claim is
   // taken synchronously, released only by the pass that took it, and never
-  // taken over — a takeover would either lose the row the stuck pass was
-  // dispatching or staff it twice. A reload clears the map; every queued row is
-  // still named by the durable cursor.
+  // taken over. A pass that never settles therefore defers that root's queued
+  // rows until the plugin reloads: the claim is in-memory, every later pass
+  // returns "deferred", and the durable cursor keeps naming the queued row so
+  // the next run retries it. A takeover could only be safe with an AbortSignal
+  // on the host spawn or durable admission of non-contiguous rows, neither of
+  // which exists here; without them it would either lose the row the stuck pass
+  // was dispatching or staff it twice.
   const intakePasses = new Map<string, { rowId: string | null; startedAt: number }>();
 
   async function maybeIntakeUserMessage(

@@ -35,15 +35,12 @@ export interface ThreadEventsReadArgs {
   order?: "asc" | "desc";
   limit?: string;
   afterSeq?: string;
-  /**
-   * Read the whole filtered range up to the newest matching event observed
-   * before paging (the high-water mark) instead of one page.
-   */
+  /** Page through to the newest matching event seen before paging (high-water mark). */
   throughHighWater?: boolean;
 }
 
 /** A page is a bare array or an `{events|items}` wrapper; anything else is a
- * malformed read, never an empty one. */
+ * malformed read, never an empty page. */
 function rowsOfPage(result: unknown): Array<Record<string, unknown>> | null {
   let page: unknown = result;
   if (!Array.isArray(page)) {
@@ -51,18 +48,12 @@ function rowsOfPage(result: unknown): Array<Record<string, unknown>> | null {
     page = Array.isArray(wrapped.events) ? wrapped.events : wrapped.items;
   }
   if (!Array.isArray(page)) return null;
-  const rows: Array<Record<string, unknown>> = [];
-  for (const row of page) {
-    if (!row || typeof row !== "object") return null;
-    rows.push(row as Record<string, unknown>);
-  }
-  return rows;
+  return page.every((row) => Boolean(row) && typeof row === "object")
+    ? (page as Array<Record<string, unknown>>)
+    : null;
 }
 
-async function readEventPage(
-  bb: BbPluginApi,
-  args: ThreadEventsReadArgs,
-): Promise<ThreadEventsRead> {
+async function readEventPage(bb: BbPluginApi, args: ThreadEventsReadArgs): Promise<ThreadEventsRead> {
   try {
     const rows = rowsOfPage(
       await bb.sdk.threads.events.list({
@@ -73,8 +64,7 @@ async function readEventPage(
         afterSeq: args.afterSeq,
       } as never),
     );
-    if (rows === null) return { ok: false, reason: "malformed event page" };
-    return { ok: true, events: rows };
+    return rows === null ? { ok: false, reason: "malformed event page" } : { ok: true, events: rows };
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
   }
@@ -82,61 +72,48 @@ async function readEventPage(
 
 /**
  * The one event reader this plugin classifies from. An SDK error, a malformed
- * page, or a history it could not page through to the high-water mark is a
- * FAILED read, never an empty one: "no evidence" and "evidence of nothing" are
- * different answers and only the caller may decide to treat them alike.
- * Filtering and paging args (`types`, `order`, `afterSeq`, `limit`, bare-array
- * or `{events|items}` shape) behave exactly as the SDK exposes them.
+ * page, or a history it could not page to the high-water mark is a FAILED read,
+ * never an empty one: "no evidence" and "evidence of nothing" differ, and only
+ * the caller may treat them alike. Args behave exactly as the SDK exposes them.
  */
 export async function readThreadEvents(
   bb: BbPluginApi,
   args: ThreadEventsReadArgs,
 ): Promise<ThreadEventsRead> {
   if (!args.throughHighWater) return readEventPage(bb, args);
-  const newest = await readEventPage(bb, {
-    threadId: args.threadId,
-    types: args.types,
-    order: "desc",
-    limit: "1",
-  });
+  const filter = { threadId: args.threadId, types: args.types };
+  const newest = await readEventPage(bb, { ...filter, order: "desc", limit: "1" });
   if (!newest.ok) return newest;
-  const newestRow = newest.events[0];
-  // A row this reader cannot place on the sequence line is unreadable evidence,
-  // not the top of an empty history.
-  const mark = newestRow === undefined ? 0 : numericSeq(newestRow);
+  const mark = newest.events[0] === undefined ? 0 : numericSeq(newest.events[0]);
   if (mark === null) return { ok: false, reason: "event page carried no numeric sequence" };
   const events: Array<Record<string, unknown>> = [];
   let cursor = args.afterSeq ?? "0";
-  // A cursor already at or past the mark has nothing left to read.
   let complete = mark === 0 || Number(cursor) >= mark;
   for (let page = 0; page < MAX_PAGES_PER_SYNC && !complete; page += 1) {
     const read = await readEventPage(bb, {
-      threadId: args.threadId,
-      types: args.types,
+      ...filter,
       order: "asc",
       afterSeq: cursor,
       limit: String(PAGE_SIZE),
     });
     if (!read.ok) return read;
-    const rows = read.events;
-    if (rows.length === 0) break;
-    const last = numericSeq(rows.at(-1));
+    if (read.events.length === 0) break;
+    const last = numericSeq(read.events.at(-1));
     if (last === null) return { ok: false, reason: "event page carried no numeric sequence" };
-    events.push(...rows);
+    events.push(...read.events);
     cursor = String(last);
     if (last >= mark) complete = true;
   }
-  if (!complete) {
-    return {
-      ok: false,
-      reason: `event history truncated before sequence ${mark} after ${MAX_PAGES_PER_SYNC} pages`,
-    };
-  }
-  return { ok: true, events };
+  return complete
+    ? { ok: true, events }
+    : {
+        ok: false,
+        reason: `event history truncated before sequence ${mark} after ${MAX_PAGES_PER_SYNC} pages`,
+      };
 }
 
-/** Fail-silent page read for the native-task liveness scan, which must degrade
- * to "no visible tasks" rather than take its caller down with it. */
+/** Fail-silent read for the native-task liveness scan, which degrades to "no
+ * visible tasks" rather than taking its caller down. */
 async function listEvents(
   bb: BbPluginApi,
   args: ThreadEventsReadArgs,
@@ -149,8 +126,7 @@ function seqOf(row: Record<string, unknown>): number {
   return numericSeq(row) ?? 0;
 }
 
-/** The row's sequence, or null when the row cannot be placed on the sequence
- * line at all (which the strict reader treats as a malformed page). */
+/** The row's sequence, or null when it cannot be placed on the sequence line. */
 function numericSeq(row: unknown): number | null {
   if (!row || typeof row !== "object") return null;
   const seq = (row as Record<string, unknown>).seq;

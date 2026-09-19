@@ -426,8 +426,9 @@ export function orphanInProgressIds(
 
 /**
  * What the durable event projection says about one worker's latest request
- * generation. Only three of these permit releasing the slice; the rest retain
- * or quarantine it, and elapsed time never changes that.
+ * generation. Only `first_request_aborted`, `stopped_after_acceptance` and a
+ * terminal `failed` release the slice; the rest retain or quarantine it, and
+ * elapsed time never changes that.
  */
 export type WorkerGeneration =
   | "never_dispatched"
@@ -440,15 +441,13 @@ export type WorkerGeneration =
   | "failed"
   | "evidence_unavailable";
 
-const RELEASING_WORKER_GENERATIONS: ReadonlySet<WorkerGeneration> = new Set([
-  "first_request_aborted",
-  "stopped_after_acceptance",
-  "failed",
-]);
-
 /** Whether this generation relinquishes assignment and capacity. */
 export function releasesWorkerGeneration(generation: WorkerGeneration): boolean {
-  return RELEASING_WORKER_GENERATIONS.has(generation);
+  return (
+    generation === "first_request_aborted" ||
+    generation === "stopped_after_acceptance" ||
+    generation === "failed"
+  );
 }
 
 const MANUAL_STOP_REASON = "manual-stop";
@@ -465,16 +464,14 @@ function eventData(event: Record<string, unknown>): Record<string, unknown> {
 
 /**
  * Classify ONE request generation from durable events (ruling #4). The latest
- * `client/turn/requested` opens the generation; a `manual-stop` belongs to the
- * interval it falls in; acceptance is joined to that request by
- * `requestId === clientRequestId`, never by timing, and stays decisive even
- * when it is sequenced after the stop. `host-daemon-restarted` and
- * `provider-turn-idle` are not user stops.
- *
- * A negative "not accepted" claim is finalized only once the host status is no
- * longer starting/active/stopping: while it is, the answer is that the stop is
- * still settling. Unreadable evidence (`events === null`) and an unreadable
- * host status classify as unavailable, which quarantines.
+ * `client/turn/requested` opens it, a `manual-stop` belongs to the interval it
+ * falls in, and acceptance joins that request by `requestId === clientRequestId`
+ * — never by timing, and it stays decisive when sequenced after the stop.
+ * `host-daemon-restarted` and `provider-turn-idle` are not user stops. A
+ * negative "not accepted" claim is final only once the host status is no
+ * longer starting/active/stopping: until then the stop is still settling.
+ * Unreadable evidence or host status classifies as unavailable, which
+ * quarantines.
  */
 export function classifyWorkerGeneration(input: {
   status: string | null;
@@ -488,39 +485,34 @@ export function classifyWorkerGeneration(input: {
   if (input.deleted === true) return "failed";
   const status = input.status;
   if (status === "stopping") return "stop_pending";
-
-  const requests = input.events.filter((event) => event.type === "client/turn/requested");
-  const latest = requests.at(-1);
+  const latest = input.events.filter((event) => event.type === "client/turn/requested").at(-1);
   const requestId = latest ? eventData(latest).requestId : null;
-  const inGeneration = (event: Record<string, unknown>): boolean =>
-    latest !== undefined && latest !== null && eventSeq(event) > eventSeq(latest);
+  const after = (event: Record<string, unknown>): boolean =>
+    latest != null && eventSeq(event) > eventSeq(latest);
   const stopped = input.events.some(
     (event) =>
       event.type === "system/thread/interrupted" &&
       eventData(event).reason === MANUAL_STOP_REASON &&
-      inGeneration(event),
+      after(event),
   );
   const accepted =
     typeof requestId === "string" &&
     input.events.some(
       (event) =>
-        event.type === "turn/input/accepted" &&
-        eventData(event).clientRequestId === requestId,
+        event.type === "turn/input/accepted" && eventData(event).clientRequestId === requestId,
     );
   if (input.failed === true) {
     return stopped ? (accepted ? "stopped_after_acceptance" : "first_request_aborted") : "failed";
   }
   if (status === null) return "evidence_unavailable";
   if (status === "active" || status === "starting" || status === "provisioning") {
-    if (stopped) return "stop_pending";
-    return accepted ? "running_accepted" : "running_unconfirmed";
+    return stopped ? "stop_pending" : accepted ? "running_accepted" : "running_unconfirmed";
   }
   if (stopped) return accepted ? "stopped_after_acceptance" : "first_request_aborted";
   if (status === "error") return "failed";
-  const completed = input.events.some(
-    (event) => event.type === "turn/completed" && inGeneration(event),
-  );
-  if (completed) return "ordinary_idle";
-  if (latest === undefined || latest === null) return "never_dispatched";
+  if (input.events.some((event) => event.type === "turn/completed" && after(event))) {
+    return "ordinary_idle";
+  }
+  if (latest == null) return "never_dispatched";
   return accepted ? "running_accepted" : "running_unconfirmed";
 }

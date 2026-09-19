@@ -989,14 +989,19 @@ export default function plugin(bb: BbPluginApi) {
     return lines.join("\n\n");
   }
 
-  /** Durable event types the worker classifier reads — ruling #4's only
-   * admissible classification source. */
+  /** Durable event types the classifier reads — ruling #4's only admissible
+   * classification source. */
   const WORKER_GENERATION_EVENTS = [
     "client/turn/requested", "turn/input/accepted", "turn/completed",
     "system/thread/interrupted", "system/thread-provisioning",
   ] as const;
 
-  /** Classify one worker's latest request generation. `failed` and `deleted`
+  /** The tail of a worker's event history is the window a request generation
+   * lives in: an event outside it is older than the request it would contradict,
+   * so dropping the oldest end can only retain ownership, never release it. */
+  const WORKER_GENERATION_WINDOW = 200;
+
+  /** Classify one worker's current request generation. `failed` and `deleted`
    * are authoritative host death signals, so unreadable evidence cannot veto
    * them; every other unreadable classification quarantines. */
   async function workerGeneration(
@@ -1013,8 +1018,7 @@ export default function plugin(bb: BbPluginApi) {
     const read = await readThreadEvents(bb, {
       threadId: workerThreadId,
       types: WORKER_GENERATION_EVENTS,
-      order: "asc",
-      throughHighWater: true,
+      newest: WORKER_GENERATION_WINDOW,
     });
     if (!read.ok) return authoritative ? "failed" : "evidence_unavailable";
     return classifyWorkerGeneration({
@@ -1027,16 +1031,18 @@ export default function plugin(bb: BbPluginApi) {
 
   /** Give exactly one releasing generation back to the queue. The atomic
    * transition lives in `collab.releaseAssignment`; publishing and scheduling
-   * happen only when it committed, through `onReleased`. */
+   * happen only when it retired a row, through `onReleased`. */
   function releaseWorkerSlice(
     rootThreadId: string,
     workerThreadId: string,
     reason: string,
   ): void {
     const outcome = collab.releaseAssignment(rootThreadId, workerThreadId, reason);
-    if (!outcome.released) return;
+    if (!outcome.retired) return;
     bb.log.info(
-      `Released slice ${outcome.itemId ?? "(none)"} held by ${workerThreadId} on ${rootThreadId}: ${reason}`,
+      `Released slice ${outcome.itemId ?? "(none)"} held by ${workerThreadId} on ${rootThreadId}: ${reason}${
+        outcome.released ? "" : " (slice already closed; row retired without requeue)"
+      }`,
     );
   }
 
@@ -1228,7 +1234,7 @@ export default function plugin(bb: BbPluginApi) {
         // launching, and the 15s/1m/5m ladder is the only pacing. A generation
         // that ended in a durable block returns null, so no pass — pulse
         // included — can restart an exhausted slice.
-        if (launchAttempts.begin(rootThreadId, item.id, now) === null) continue;
+        if (!launchAttempts.begin(rootThreadId, item.id, now)) continue;
         try {
           result = await collab.spawnWorker({
             parentThreadId: rootThreadId,
@@ -4874,7 +4880,7 @@ export default function plugin(bb: BbPluginApi) {
         releaseWorkerSlice(
           deletedChild.root_thread_id,
           thread.id,
-          `deleted (${await workerGeneration(thread.id, { deleted: true })})`,
+          `deleted (${await workerGeneration(thread.id, { failed: true })})`,
         );
       }
       markGoalEvent(deletedChild.root_thread_id);
@@ -5143,21 +5149,36 @@ export default function plugin(bb: BbPluginApi) {
           }
         }
         const released: string[] = [];
-        for (const { threadId: workerId, itemId } of plan.release) {
+        const skipped: string[] = [];
+        for (const { threadId: workerId } of plan.release) {
           // One atomic transition: retire the row, drop its reservation and
           // requeue the slice — or leave the assignment exactly as it was.
           const outcome = collab.releaseAssignment(threadId, workerId, "owner release");
+          if (!outcome.retired) {
+            skipped.push(`${workerId} (no live assignment)`);
+            continue;
+          }
+          await bb.sdk.threads.archive({ threadId: workerId }).catch(() => undefined);
+          if (!outcome.released) {
+            skipped.push(`${workerId} (its item is already closed)`);
+            continue;
+          }
           // An explicit owner action also ends a launch-blocked generation.
           if (outcome.itemId) launchAttempts.clear(threadId, outcome.itemId);
-          await bb.sdk.threads.archive({ threadId: workerId }).catch(() => undefined);
-          released.push(itemId ? `${workerId} -> ${itemId}` : workerId);
+          released.push(outcome.itemId ? `${workerId} -> ${outcome.itemId}` : workerId);
         }
         markGoalEvent(threadId);
         return {
           exitCode: 0,
-          stdout: hold
-            ? `Released ${released.length} slice(s) and held ${target} out of scheduling: ${released.join(", ")}. Editing the item lifts the hold.`
-            : `Released ${released.length} slice(s) back to pending: ${released.join(", ")}`,
+          stdout: [
+            released.length
+              ? `Released ${released.length} slice(s) back to pending: ${released.join(", ")}.`
+              : "Released no slices back to pending.",
+            skipped.length ? `No slice was requeued for: ${skipped.join(", ")}.` : "",
+            hold ? `Held ${target} out of scheduling. Editing the item lifts the hold.` : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
         };
       }
 

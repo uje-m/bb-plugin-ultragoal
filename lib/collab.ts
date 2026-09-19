@@ -317,31 +317,34 @@ export function createCollabStore(
   }
 
   /** The one atomic release-and-requeue: in a single IMMEDIATE transaction it
-   * retires the worker row (tombstone its item, set `retired_at`), deletes its
-   * reservation and hands the slice back. A completed slice is never reopened
-   * and an already-retired row releases nothing, so a duplicate stop/abort/
-   * failure event observes the released state and does nothing. */
+   * retires the worker row (tombstone its item, set `retired_at`), drops its
+   * reservation and hands a still-open slice back. A completed slice is never
+   * reopened, but its dead row is still retired — otherwise a deleted or failed
+   * worker keeps a root slot until the next stall sweep. An already-retired row
+   * does nothing, so a duplicate stop/abort/failure event observes the released
+   * state. */
   function releaseAssignment(
     rootThreadId: string,
     workerThreadId: string,
     reason: string,
-  ): { released: boolean; itemId: string | null } {
-    const txn = db.transaction((): { released: boolean; itemId: string | null } => {
-      const row = byThread.get(workerThreadId) as CollabRow | undefined;
-      if (!row || row.root_thread_id !== rootThreadId) return { released: false, itemId: null };
-      const itemId = row.item_id ?? null;
-      if (itemId && hooks?.itemStatus?.(rootThreadId, itemId) === "completed") {
-        return { released: false, itemId };
-      }
-      removeRow.run({ thread_id: workerThreadId, retired_at: Date.now() });
-      if (itemId) {
-        reservations.releaseItem(rootThreadId, itemId);
-        hooks?.releaseItem?.(rootThreadId, itemId, reason);
-      }
-      return { released: true, itemId };
-    });
+  ): { retired: boolean; released: boolean; itemId: string | null } {
+    const txn = db.transaction(
+      (): { retired: boolean; released: boolean; itemId: string | null } => {
+        const row = byThread.get(workerThreadId) as CollabRow | undefined;
+        if (!row || row.root_thread_id !== rootThreadId) {
+          return { retired: false, released: false, itemId: null };
+        }
+        const itemId = row.item_id ?? null;
+        const closed =
+          itemId !== null && hooks?.itemStatus?.(rootThreadId, itemId) === "completed";
+        removeRow.run({ thread_id: workerThreadId, retired_at: Date.now() });
+        if (itemId) reservations.releaseItem(rootThreadId, itemId);
+        if (itemId && !closed) hooks?.releaseItem?.(rootThreadId, itemId, reason);
+        return { retired: true, released: !closed, itemId };
+      },
+    );
     const outcome = txn.immediate();
-    if (outcome.released) hooks?.onReleased?.(rootThreadId, outcome.itemId);
+    if (outcome.retired) hooks?.onReleased?.(rootThreadId, outcome.itemId);
     return outcome;
   }
 
@@ -351,13 +354,16 @@ export function createCollabStore(
   async function releaseSlice(
     workerThreadId: string,
     reason: string,
-  ): Promise<{ released: boolean; itemId: string | null; error?: string }> {
+  ): Promise<{ retired: boolean; released: boolean; itemId: string | null; error?: string }> {
     const row = rowOf(workerThreadId);
-    if (!row) return { released: false, itemId: null, error: "no live worker row" };
+    if (!row) {
+      return { retired: false, released: false, itemId: null, error: "no live worker row" };
+    }
     try {
       await bb.sdk.threads.stop({ threadId: workerThreadId });
     } catch (error) {
       return {
+        retired: false,
         released: false,
         itemId: row.item_id ?? null,
         error: `threads.stop failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1653,13 +1659,13 @@ export function createCollabStore(
             return { content: [{ type: "text", text: `Agent not found: ${target}` }], isError: true };
           }
           const outcome = await releaseSlice(agent.thread_id, reason);
-          if (!outcome.released) {
+          if (!outcome.retired) {
             return {
               content: [{
                 type: "text",
-                text: outcome.error
-                  ? `Could not release ${agent.thread_id}: ${outcome.error}. Its slice stays quarantined until the stop succeeds.`
-                  : `${agent.thread_id} holds no releaseable slice (already retired, or its slice is closed).`,
+                text: `Could not release ${agent.thread_id}: ${
+                  outcome.error ?? "it holds no live assignment"
+                }. Its slice stays quarantined until the stop succeeds.`,
               }],
               isError: true,
             };
@@ -1667,7 +1673,14 @@ export function createCollabStore(
           return {
             content: [{
               type: "text",
-              text: JSON.stringify({ released_item: outcome.itemId, agent: agent.thread_id, reason }),
+              text: JSON.stringify({
+                released_item: outcome.released ? outcome.itemId : null,
+                note: outcome.released
+                  ? null
+                  : "its slice was already closed; retired the worker row without reopening it",
+                agent: agent.thread_id,
+                reason,
+              }),
             }],
           };
         },

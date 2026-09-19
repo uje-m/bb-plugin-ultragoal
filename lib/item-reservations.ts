@@ -12,24 +12,9 @@ type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
  */
 const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 
-/**
- * Launch-retry ladder: the initial attempt plus retries at 15s, 1m and 5m, then
- * a durable blocked record. Exhaustion is a state, not a loop.
- */
+/** Initial attempt plus retries at 15s, 1m and 5m, then a durable block — which
+ * is a state, not a loop. */
 export const LAUNCH_RETRY_DELAYS_MS: readonly number[] = [15_000, 60_000, 300_000];
-const MAX_LAUNCH_ATTEMPTS = LAUNCH_RETRY_DELAYS_MS.length + 1;
-
-export interface LaunchAttemptRecord {
-  attemptCount: number;
-  nextDueAt: number | null;
-  blockedAt: number | null;
-}
-
-interface AttemptRow {
-  attempt_count: number;
-  next_due_at: number | null;
-  blocked_at: number | null;
-}
 
 /** Durable launch-attempt generation per (root, item), owned here rather than in
  * the shared migration list, which records progress by array index. */
@@ -60,34 +45,36 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
   );
 
   return {
-    /**
-     * Consume one attempt, recorded BEFORE dispatch so a crash mid-launch burns
-     * an attempt instead of double-launching. Null while the generation is not
-     * due and while it is durably blocked. `now` is the caller's clock.
-     */
-    begin(rootThreadId: string, itemId: string, now: number): LaunchAttemptRecord | null {
-      const txn = db.transaction((): LaunchAttemptRecord | null => {
-        const row = read.get(rootThreadId, itemId) as AttemptRow | undefined;
+    /** Consume one attempt, recorded BEFORE dispatch so a crash mid-launch burns
+     * an attempt instead of double-launching. False while the generation is not
+     * due and while it is durably blocked. `now` is the caller's clock. */
+    begin(rootThreadId: string, itemId: string, now: number): boolean {
+      const txn = db.transaction((): boolean => {
+        const row = read.get(rootThreadId, itemId) as
+          | { attempt_count: number; next_due_at: number | null; blocked_at: number | null }
+          | undefined;
         if (!row) {
-          const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[0]!;
-          insert.run(rootThreadId, itemId, now, now, nextDueAt);
-          return { attemptCount: 1, nextDueAt, blockedAt: null };
+          insert.run(rootThreadId, itemId, now, now, now + LAUNCH_RETRY_DELAYS_MS[0]!);
+          return true;
         }
-        if (row.blocked_at !== null) return null;
-        if (row.next_due_at !== null && row.next_due_at > now) return null;
+        if (row.blocked_at !== null) return false;
+        if (row.next_due_at !== null && row.next_due_at > now) return false;
         const attemptCount = row.attempt_count + 1;
-        if (attemptCount >= MAX_LAUNCH_ATTEMPTS) {
-          advance.run(MAX_LAUNCH_ATTEMPTS, now, null, now, rootThreadId, itemId);
-          return { attemptCount: MAX_LAUNCH_ATTEMPTS, nextDueAt: null, blockedAt: now };
-        }
-        const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[attemptCount - 1]!;
-        advance.run(attemptCount, now, nextDueAt, null, rootThreadId, itemId);
-        return { attemptCount, nextDueAt, blockedAt: null };
+        const exhausted = attemptCount > LAUNCH_RETRY_DELAYS_MS.length;
+        advance.run(
+          attemptCount,
+          now,
+          exhausted ? null : now + LAUNCH_RETRY_DELAYS_MS[attemptCount - 1]!,
+          exhausted ? now : null,
+          rootThreadId,
+          itemId,
+        );
+        return true;
       });
       return txn.immediate();
     },
 
-    /** The launch landed, or an owner explicitly requeued the slice. */
+    /** The launch landed, or an explicit owner action requeued the slice. */
     clear(rootThreadId: string, itemId: string): void {
       clear.run(rootThreadId, itemId);
     },
@@ -95,7 +82,7 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
 }
 
 /** Durable scheduling generation per root: every trigger advances
- * `requested_seq`, and a trigger that lands while a pass is in flight leaves the
+ * `requested_seq`, so a trigger that lands while a pass is in flight leaves the
  * row dirty instead of being dropped by a process-local flag. */
 export function createSchedulerGenerationStore(db: PluginDatabase) {
   db.exec(`
@@ -106,14 +93,14 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
       updated_at INTEGER NOT NULL
     )
   `);
-  const request = db.prepare(`
+  const requestStmt = db.prepare(`
     INSERT INTO collab_scheduler_generations (root_thread_id, requested_seq, serviced_seq, updated_at)
     VALUES (?, 1, 0, ?)
     ON CONFLICT(root_thread_id) DO UPDATE SET
       requested_seq = requested_seq + 1,
       updated_at = excluded.updated_at
   `);
-  const service = db.prepare(
+  const serviceStmt = db.prepare(
     "UPDATE collab_scheduler_generations SET serviced_seq = ?, updated_at = ? WHERE root_thread_id = ? AND serviced_seq < ?",
   );
   const read = db.prepare(
@@ -127,13 +114,9 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
   };
 
   return {
-    /** Advance the dirty generation and report the value to service. */
-    request(rootThreadId: string, now: number): number {
-      const txn = db.transaction((): number => {
-        request.run(rootThreadId, now);
-        return sequence(rootThreadId).requested;
-      });
-      return txn.immediate();
+    /** Advance the dirty generation this trigger owes a pass for. */
+    request(rootThreadId: string, now: number): void {
+      requestStmt.run(rootThreadId, now);
     },
 
     requested(rootThreadId: string): number {
@@ -144,7 +127,7 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
      * still outstanding, which owes exactly one follow-up pass. */
     service(rootThreadId: string, servicedSeq: number, now: number): boolean {
       const txn = db.transaction((): boolean => {
-        service.run(servicedSeq, now, rootThreadId, servicedSeq);
+        serviceStmt.run(servicedSeq, now, rootThreadId, servicedSeq);
         const current = sequence(rootThreadId);
         return current.requested > current.serviced;
       });

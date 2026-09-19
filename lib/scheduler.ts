@@ -449,7 +449,6 @@ export function releasesWorkerGeneration(generation: WorkerGeneration): boolean 
     generation === "failed"
   );
 }
-
 const MANUAL_STOP_REASON = "manual-stop";
 
 function eventSeq(event: Record<string, unknown>): number {
@@ -463,15 +462,15 @@ function eventData(event: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * Classify ONE request generation from durable events (ruling #4). The latest
- * `client/turn/requested` opens it, a `manual-stop` belongs to the interval it
- * falls in, and acceptance joins that request by `requestId === clientRequestId`
- * — never by timing, and it stays decisive when sequenced after the stop.
- * `host-daemon-restarted` and `provider-turn-idle` are not user stops. A
- * negative "not accepted" claim is final only once the host status is no
- * longer starting/active/stopping: until then the stop is still settling.
- * Unreadable evidence or host status classifies as unavailable, which
- * quarantines.
+ * Classify ONE request generation from durable events: the latest
+ * `client/turn/requested` opens it, a `manual-stop` after that request — or in a
+ * window that shows no request at all, which is a first-request abort by
+ * construction — closes it, and acceptance joins the request by
+ * `requestId === clientRequestId`, never by timing. `host-daemon-restarted` and
+ * `provider-turn-idle` are not user stops. A negative "not accepted" claim is
+ * final only once the host status is no longer starting/active/stopping: until
+ * then the stop is still settling. Unreadable evidence or host status
+ * classifies as unavailable, which quarantines.
  */
 export function classifyWorkerGeneration(input: {
   status: string | null;
@@ -487,8 +486,11 @@ export function classifyWorkerGeneration(input: {
   if (status === "stopping") return "stop_pending";
   const latest = input.events.filter((event) => event.type === "client/turn/requested").at(-1);
   const requestId = latest ? eventData(latest).requestId : null;
+  // The window is the tail of the history, so a stop it contains happened after
+  // any request it no longer shows: with no request in view, every stop in view
+  // belongs to this generation.
   const after = (event: Record<string, unknown>): boolean =>
-    latest != null && eventSeq(event) > eventSeq(latest);
+    latest === undefined || eventSeq(event) > eventSeq(latest);
   const stopped = input.events.some(
     (event) =>
       event.type === "system/thread/interrupted" &&
@@ -501,18 +503,19 @@ export function classifyWorkerGeneration(input: {
       (event) =>
         event.type === "turn/input/accepted" && eventData(event).clientRequestId === requestId,
     );
-  if (input.failed === true) {
-    return stopped ? (accepted ? "stopped_after_acceptance" : "first_request_aborted") : "failed";
-  }
+  const stopGeneration: WorkerGeneration = accepted
+    ? "stopped_after_acceptance"
+    : "first_request_aborted";
+  if (input.failed === true) return stopped ? stopGeneration : "failed";
   if (status === null) return "evidence_unavailable";
   if (status === "active" || status === "starting" || status === "provisioning") {
     return stopped ? "stop_pending" : accepted ? "running_accepted" : "running_unconfirmed";
   }
-  if (stopped) return accepted ? "stopped_after_acceptance" : "first_request_aborted";
+  if (stopped) return stopGeneration;
   if (status === "error") return "failed";
   if (input.events.some((event) => event.type === "turn/completed" && after(event))) {
     return "ordinary_idle";
   }
-  if (latest == null) return "never_dispatched";
+  if (latest === undefined) return "never_dispatched";
   return accepted ? "running_accepted" : "running_unconfirmed";
 }

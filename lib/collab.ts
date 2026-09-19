@@ -6,7 +6,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { isPromptLikeTitle, shortSliceTitle } from "./titles.js";
 import { z } from "zod";
 import type { GoalAgent, GoalAgentRole, GoalAgentStatus } from "../contract.js";
-import { auditorNameFor, nextHumorousName, slugFromName, workRelatedName } from "./names.js";
+import { auditorNameFor, slugFromName, workRelatedName } from "./names.js";
 import { workerQualityBrief } from "./prompts.js";
 import { isReasoningLevel, type ReasoningLevel, type ServiceTier } from "./execution.js";
 import { createItemReservationStore } from "./item-reservations.js";
@@ -629,8 +629,21 @@ export function createCollabStore(
       const CLAIM_WINDOW_MS = 6 * 60 * 60_000;
       for (const agent of agents) {
         if (agent.role === "verifier" || agent.itemId) continue;
-        const recent =
-          Date.now() - (byId.get(agent.threadId)?.created_at ?? 0) < CLAIM_WINDOW_MS;
+        const row = byId.get(agent.threadId);
+        // The courier carries the owner's message verbatim, so its prompt is
+        // untrusted prose: a slice id quoted in it is not a claim.
+        if (
+          row &&
+          isIntakeCourier({
+            taskName: row.task_name,
+            displayName: row.display_name,
+            itemId: row.item_id,
+            role: row.role,
+          })
+        ) {
+          continue;
+        }
+        const recent = Date.now() - (row?.created_at ?? 0) < CLAIM_WINDOW_MS;
         // Live workers always claim; recent idle ones claim too so their done
         // reports can close the right slice (reconcile picks it up).
         if (agent.status !== "running" && agent.status !== "starting" && !recent) continue;
@@ -649,7 +662,6 @@ export function createCollabStore(
           source: "prompt",
         });
         if (!claimed) continue;
-        const row = byId.get(agent.threadId);
         if (row) row.item_id = claimed;
         agent.itemId = claimed;
         setMeta.run({
@@ -1534,6 +1546,7 @@ export function createCollabStore(
               } catch {
                 // Timed out or interrupted for this agent.
               }
+              return;
             }),
           );
           if (updated.length === 0) {

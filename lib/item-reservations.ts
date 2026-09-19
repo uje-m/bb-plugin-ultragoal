@@ -4,17 +4,10 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 
 /**
- * Reservations do not expire: a slot is released by `release`, consumed by
- * `commit`, or retired when an authoritative signal proves the launch dead —
- * never by a clock. `expires_at` survives only as a column the shared
- * migration's capacity triggers still count, written beyond any clock, so the
- * fence counts every reservation instead of reviving time as an authority.
- *
- * "Proves the launch dead" includes `reclaimUnheld`: a row with no live worker
- * and no spawn in flight in the reclaiming generation is treated as ownerless.
- * A spawn in another generation loses its reservation and fails closed in
- * `commit` — the fence the token exists for — rather than ever becoming a
- * second owner.
+ * Reservations never expire: a slot ends at `release`, `commit`, or an
+ * authoritative "launch is dead" signal, never on a clock. `expires_at` stays
+ * only because the shared capacity triggers count rows rather than expiry; it
+ * is written beyond any clock and read by nothing.
  */
 const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 
@@ -52,8 +45,7 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
 
   return {
     /** Consume one attempt, recorded BEFORE dispatch so a crash mid-launch burns
-     * an attempt instead of double-launching. False while the generation is not
-     * due and while it is durably blocked. `now` is the caller's clock. */
+     * an attempt instead of double-launching. False while not due, or blocked. */
     begin(rootThreadId: string, itemId: string, now: number): boolean {
       const txn = db.transaction((): boolean => {
         const row = read.get(rootThreadId, itemId) as
@@ -148,10 +140,8 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
  * pass a process-local availability check and spawn the same work item.
  */
 export function createItemReservationStore(db: PluginDatabase) {
-  /** Tokens this store instance acquired and has not yet committed or released:
-   * a spawn of its own may still land with them. Process-local, and deliberately
-   * never time-keyed — a token that is in flight is proof a spawn may still
-   * land, and the only truthful way to stop believing it is the spawn ending. */
+  /** Tokens this store acquired and has not yet committed or released: a spawn
+   * of its own may still land. Process-local and never time-keyed. */
   const inFlight = new Set<string>();
   const acquireStmt = db.prepare(`
     INSERT OR IGNORE INTO collab_item_reservations (
@@ -271,23 +261,12 @@ export function createItemReservationStore(db: PluginDatabase) {
     },
 
     /**
-     * Reclaim reservations no owner can reach: the item has no live worker row
-     * and no spawn of this store instance still holds the token.
-     *
-     * A process killed between `acquire` and the worker insert leaves exactly
-     * that row. It consumes a root slot forever — `occupancy` counts it and the
-     * capacity triggers do too — and `acquire` for the item can never succeed
-     * again, because `INSERT OR IGNORE` finds the row and changes nothing.
-     *
-     * Non-temporal by construction: a slot a worker holds, or a spawn that may
-     * still land, is never touched however much time passes; only a row with
-     * neither is dropped. A spawn in another generation that loses its
-     * reservation this way fails closed in `commit`, which is the fence the
-     * token exists for. A spawn whose promise never settles keeps its token
-     * reserved until the process restarts: fail-closed, never a double owner.
-     *
-     * Returns the item ids whose reservation was dropped, so the caller can
-     * return a slice the dead spawn had already claimed to the queue.
+     * Reclaim reservations no owner can reach: no live worker row for the item
+     * and no spawn of this store still holding the token. A process killed
+     * between `acquire` and the worker insert leaves exactly that row, and it
+     * consumes a root slot forever. Non-temporal: a slot a worker, or a spawn
+     * that may still land, holds is never touched. Returns the reclaimed item
+     * ids so the caller can requeue their slices.
      */
     reclaimUnheld(rootThreadId: string): string[] {
       const txn = db.transaction((): string[] => {
@@ -307,8 +286,7 @@ export function createItemReservationStore(db: PluginDatabase) {
       return txn.immediate();
     },
 
-    /** Drop every reservation for the item. Explicit owner release only: a
-     * reservation is otherwise held until its launch commits or is proven dead. */
+    /** Drop every reservation for the item: explicit owner release only. */
     releaseItem(rootThreadId: string, itemId: string): number {
       return releaseItemStmt.run(rootThreadId, itemId).changes;
     },

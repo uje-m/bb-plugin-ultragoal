@@ -329,25 +329,27 @@ export function createCollabStore(
    * reopened, but its dead row is still retired — otherwise a deleted or failed
    * worker keeps a root slot until the next stall sweep. An already-retired row
    * does nothing, so a duplicate stop/abort/failure event observes the released
-   * state. */
+   * state. `requeued` is true only for a slice actually handed back: a row that
+   * held no slice, or held a closed one, retires without one. */
   function releaseAssignment(
     rootThreadId: string,
     workerThreadId: string,
     reason: string,
-  ): { retired: boolean; released: boolean; itemId: string | null } {
+  ): { retired: boolean; requeued: boolean; itemId: string | null } {
     const txn = db.transaction(
-      (): { retired: boolean; released: boolean; itemId: string | null } => {
+      (): { retired: boolean; requeued: boolean; itemId: string | null } => {
         const row = byThread.get(workerThreadId) as CollabRow | undefined;
         if (!row || row.root_thread_id !== rootThreadId) {
-          return { retired: false, released: false, itemId: null };
+          return { retired: false, requeued: false, itemId: null };
         }
         const itemId = row.item_id ?? null;
         const closed =
           itemId !== null && hooks?.itemStatus?.(rootThreadId, itemId) === "completed";
         removeRow.run({ thread_id: workerThreadId, retired_at: Date.now() });
         if (itemId) reservations.releaseItem(rootThreadId, itemId);
-        if (itemId && !closed) hooks?.releaseItem?.(rootThreadId, itemId, reason);
-        return { retired: true, released: !closed, itemId };
+        const requeued = itemId !== null && !closed;
+        if (itemId !== null && requeued) hooks?.releaseItem?.(rootThreadId, itemId, reason);
+        return { retired: true, requeued, itemId };
       },
     );
     const outcome = txn.immediate();
@@ -361,17 +363,17 @@ export function createCollabStore(
   async function releaseSlice(
     workerThreadId: string,
     reason: string,
-  ): Promise<{ retired: boolean; released: boolean; itemId: string | null; error?: string }> {
+  ): Promise<{ retired: boolean; requeued: boolean; itemId: string | null; error?: string }> {
     const row = rowOf(workerThreadId);
     if (!row) {
-      return { retired: false, released: false, itemId: null, error: "no live worker row" };
+      return { retired: false, requeued: false, itemId: null, error: "no live worker row" };
     }
     try {
       await bb.sdk.threads.stop({ threadId: workerThreadId });
     } catch (error) {
       return {
         retired: false,
-        released: false,
+        requeued: false,
         itemId: row.item_id ?? null,
         error: `threads.stop failed: ${error instanceof Error ? error.message : String(error)}`,
       };
@@ -1678,14 +1680,19 @@ export function createCollabStore(
               isError: true,
             };
           }
+          let note: string | null = null;
+          if (!outcome.requeued) {
+            note =
+              outcome.itemId === null
+                ? "it held no slice; retired the worker row"
+                : "its slice was already closed; retired the worker row without reopening it";
+          }
           return {
             content: [{
               type: "text",
               text: JSON.stringify({
-                released_item: outcome.released ? outcome.itemId : null,
-                note: outcome.released
-                  ? null
-                  : "its slice was already closed; retired the worker row without reopening it",
+                released_item: outcome.requeued ? outcome.itemId : null,
+                note,
                 agent: agent.thread_id,
                 reason,
               }),

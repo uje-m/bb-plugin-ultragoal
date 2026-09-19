@@ -996,9 +996,9 @@ export default function plugin(bb: BbPluginApi) {
     "system/thread/interrupted", "system/thread-provisioning",
   ] as const;
 
-  /** Classify one worker's latest request generation. `failed` and `deleted`
-   * are authoritative host death signals, so unreadable evidence cannot veto
-   * them; every other unreadable classification quarantines. */
+  /** Classify one worker's latest request generation. `failed`/`deleted` are
+   * authoritative host death signals, so unreadable evidence cannot veto them;
+   * every other unreadable classification quarantines. */
   async function workerGeneration(
     workerThreadId: string,
     options: { failed?: boolean; deleted?: boolean } = {},
@@ -1027,19 +1027,27 @@ export default function plugin(bb: BbPluginApi) {
 
   /** Give exactly one releasing generation back to the queue. The atomic
    * transition lives in `collab.releaseAssignment`; publishing and scheduling
-   * happen only when it retired a row, through `onReleased`. */
+   * happen only when it retired a row, through `onReleased`. A transient DB
+   * failure is logged, never thrown out of a detached event listener. */
   function releaseWorkerSlice(
     rootThreadId: string,
     workerThreadId: string,
     reason: string,
   ): void {
-    const outcome = collab.releaseAssignment(rootThreadId, workerThreadId, reason);
-    if (!outcome.retired) return;
-    bb.log.info(
-      `Released slice ${outcome.itemId ?? "(none)"} held by ${workerThreadId} on ${rootThreadId}: ${reason}${
-        outcome.released ? "" : " (slice already closed; row retired without requeue)"
-      }`,
-    );
+    try {
+      const outcome = collab.releaseAssignment(rootThreadId, workerThreadId, reason);
+      if (!outcome.retired) return;
+      let detail = `; slice ${outcome.itemId} already closed`;
+      if (outcome.requeued) detail = `; requeued slice ${outcome.itemId}`;
+      else if (outcome.itemId === null) detail = "; it held no slice";
+      bb.log.info(`Retired ${workerThreadId} on ${rootThreadId}: ${reason}${detail}`);
+    } catch (error) {
+      bb.log.warn(
+        `Release of ${workerThreadId} on ${rootThreadId} failed; it keeps its slice: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** Hydration: a stop that landed while this plugin generation was not
@@ -1086,18 +1094,17 @@ export default function plugin(bb: BbPluginApi) {
     // The durable generation is only serviced at the end of a completed pass, so
     // a failed one stays owed and the next trigger (or reload) services it.
     try {
-      if (transferLocked(rootThreadId)) return;
       const goal = store.get(rootThreadId);
+      // Every trigger advances the durable generation before any early return: a
+      // trigger during a transfer lock or on a paused goal still owes a pass.
+      if (goal) scheduleGenerations.request(rootThreadId, Date.now());
+      if (transferLocked(rootThreadId)) return;
       if (
         !goal ||
         (goal.status !== "active" && goal.status !== "budget_limited" && goal.status !== "blocked")
       ) {
         return;
       }
-      // Record the trigger BEFORE the re-entrancy check: a trigger that arrives
-      // mid-pass must leave the row dirty. The in-memory set only marks the pass,
-      // it never drops work.
-      scheduleGenerations.request(rootThreadId, Date.now());
       if (scheduling.has(rootThreadId)) return;
       scheduling.add(rootThreadId);
       try {
@@ -1135,12 +1142,10 @@ export default function plugin(bb: BbPluginApi) {
       if (!(await hydrateSchedulerOwnership(rootThreadId))) return;
       if (maxWorkers <= 0) return;
       // A process killed between a reservation's `acquire` and its worker-row
-      // insert leaves a row with no owner: no durable worker, no spawn still in
-      // flight. It consumes a root slot for good and makes every later
-      // `acquire` for that slice refuse. Reclaim it here — pass entry — and hand
-      // a slice the dead spawn had already claimed back to ready, so this pass
-      // can staff it. Deliberately not time-keyed: a reservation a live worker
-      // or an in-flight spawn still holds is never touched.
+      // insert leaves a row with no owner and no spawn in flight: it consumes a
+      // root slot for good and blocks every later `acquire` for that slice.
+      // Reclaim it at pass entry and hand a slice the dead spawn claimed back
+      // to ready. Never time-keyed: a live worker or in-flight spawn is kept.
       for (const itemId of collab.reclaimItemReservations(rootThreadId)) {
         const claimed = items.list(rootThreadId).find((row) => row.id === itemId);
         if (claimed?.status === "in_progress") items.setStatus(rootThreadId, itemId, "pending");
@@ -4840,13 +4845,11 @@ export default function plugin(bb: BbPluginApi) {
     const failedChild = collab.rowOf(thread.id);
     if (failedChild && failedChild.root_thread_id !== thread.id) {
       // A failed child is dead, and its durable row is not. Leaving it live
-      // wedges a slot two ways: as a worker it keeps consuming root capacity,
-      // and as a verifier it keeps `verifiersFor` reporting a dependant, which
-      // blocks its SOURCE worker from ever being retired. The host signal is
-      // authoritative, so the projection only labels the release: a manual stop
-      // in the generation stays a stop, and an unreadable projection cannot veto
-      // a thread the host has already pronounced dead. A verifier holds someone
-      // else's slice, so its row is retired without requeueing it.
+      // wedges a slot two ways: as a worker it consumes root capacity, and as a
+      // verifier it blocks its SOURCE worker from ever being retired. The host
+      // signal is authoritative; the projection only labels which release it
+      // was. A verifier holds someone else's slice, so it is retired without a
+      // requeue.
       if (failedChild.role === "verifier") {
         collab.forget(thread.id);
       } else {
@@ -4874,11 +4877,9 @@ export default function plugin(bb: BbPluginApi) {
     if (transferLocked(thread.id)) return;
     running.delete(thread.id);
     forgetNativeScan(thread.id);
-    // A deleted child cannot come back, so its durable row is pure leak: it
-    // holds a root slot, and as a verifier row it blocks its source worker's
-    // retirement forever. Deletion is authoritative, so the worker's slice is
-    // requeued through the one release transition while a verifier's row is
-    // simply retired.
+    // A deleted child cannot come back, so its durable row is pure leak. The
+    // deletion is authoritative: a worker's slice is requeued through the one
+    // release transition, a verifier's row is retired without requeueing.
     const deletedChild = collab.rowOf(thread.id);
     if (deletedChild && deletedChild.root_thread_id !== thread.id) {
       if (deletedChild.role === "verifier") {
@@ -5139,10 +5140,8 @@ export default function plugin(bb: BbPluginApi) {
         }
         const plan = planWorkerRelease(targets, threadId);
         if (!plan.ok) return { exitCode: 1, stderr: `${plan.reason}.` };
-        // Stop every target BEFORE mutating any of them: a release whose stop
-        // call fails must refuse rather than requeue a slice whose worker may
-        // still be running, and a partial release is not an outcome the caller
-        // can reason about.
+        // Stop every target BEFORE mutating any of them: a failed stop must
+        // refuse rather than requeue a slice whose worker may still be running.
         for (const { threadId: workerId } of plan.release) {
           try {
             await bb.sdk.threads.stop({ threadId: workerId });
@@ -5166,13 +5165,18 @@ export default function plugin(bb: BbPluginApi) {
             continue;
           }
           await bb.sdk.threads.archive({ threadId: workerId }).catch(() => undefined);
-          if (!outcome.released) {
-            skipped.push(`${workerId} (its item is already closed)`);
+          const itemId = outcome.itemId;
+          if (!outcome.requeued || itemId === null) {
+            skipped.push(
+              `${workerId} (${
+                itemId === null ? "it held no slice" : "its item is already closed"
+              })`,
+            );
             continue;
           }
           // An explicit owner action also ends a launch-blocked generation.
-          if (outcome.itemId) launchAttempts.clear(threadId, outcome.itemId);
-          released.push(outcome.itemId ? `${workerId} -> ${outcome.itemId}` : workerId);
+          launchAttempts.clear(threadId, itemId);
+          released.push(`${workerId} -> ${itemId}`);
         }
         markGoalEvent(threadId);
         return {

@@ -1225,6 +1225,14 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
   it("requeues an explicit release, refuses a failed stop, and keeps the fence across a reload", async () => {
     const f = liveGoal("thr_s7", 1);
     const item = f.add("Slice: releasable", "pending", ["src/releasable.ts"]);
+    // A retired row that held no slice must not print "back to pending" for it.
+    f.own("thr_noslice", null);
+    const itemless = await f.host.harness.behavior.runCli([
+      "release", "thr_noslice", "--thread", "thr_s7",
+    ]);
+    assert.equal(itemless.exitCode, 0, itemless.stderr ?? "");
+    assert.match(itemless.stdout, /Released no slices back to pending/);
+    assert.match(itemless.stdout, /No slice was requeued for: thr_noslice \(it held no slice\)/);
     await f.pulse();
     const owner = f.owners()[0]!.thread_id;
     assert.equal(f.spawnsFor(item.id).length, 1);

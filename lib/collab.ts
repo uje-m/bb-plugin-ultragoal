@@ -354,18 +354,25 @@ export function createCollabStore(
 
   /**
    * The orchestrator's own release lever: stop the worker, then give the slice
-   * back through the same transaction the evidence-driven paths use.
+   * back through the same transaction the evidence-driven paths use. A stop that
+   * fails refuses the release instead of requeueing a slice whose worker may
+   * still be running: the assignment stays quarantined until an explicit retry
+   * or an authoritative death signal resolves it.
    */
   async function releaseSlice(
     workerThreadId: string,
     reason: string,
-  ): Promise<{ released: boolean; itemId: string | null }> {
+  ): Promise<{ released: boolean; itemId: string | null; error?: string }> {
     const row = rowOf(workerThreadId);
-    if (!row) return { released: false, itemId: null };
+    if (!row) return { released: false, itemId: null, error: "no live worker row" };
     try {
       await bb.sdk.threads.stop({ threadId: workerThreadId });
-    } catch {
-      // Best-effort: the durable release below is what matters.
+    } catch (error) {
+      return {
+        released: false,
+        itemId: row.item_id ?? null,
+        error: `threads.stop failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
     const outcome = releaseAssignment(row.root_thread_id, workerThreadId, reason);
     await bb.sdk.threads.archive({ threadId: workerThreadId }).catch(() => undefined);
@@ -1590,9 +1597,8 @@ export function createCollabStore(
             return { content: [{ type: "text", text: "No live agents." }] };
           }
           const deadline = Date.now() + timeout;
-          const updated: string[] = [];
-          await Promise.all(
-            rows.map(async (row): Promise<void> => {
+          const waited = await Promise.all(
+            rows.map(async (row): Promise<string | null> => {
               const remaining = Math.max(1, deadline - Date.now());
               try {
                 await bb.sdk.threads.wait({
@@ -1601,13 +1607,14 @@ export function createCollabStore(
                   timeoutMs: remaining,
                   signal,
                 });
-                updated.push(row.task_name);
+                return row.task_name;
               } catch {
                 // Timed out or interrupted for this agent.
+                return null;
               }
-              return;
             }),
           );
+          const updated = waited.filter((name): name is string => name !== null);
           if (updated.length === 0) {
             return {
               content: [{ type: "text", text: "Timed out before any mailbox update." }],
@@ -1661,7 +1668,9 @@ export function createCollabStore(
             return {
               content: [{
                 type: "text",
-                text: `${agent.thread_id} holds no releaseable slice (already retired, or its slice is closed).`,
+                text: outcome.error
+                  ? `Could not release ${agent.thread_id}: ${outcome.error}. Its slice stays quarantined until the stop succeeds.`
+                  : `${agent.thread_id} holds no releaseable slice (already retired, or its slice is closed).`,
               }],
               isError: true,
             };

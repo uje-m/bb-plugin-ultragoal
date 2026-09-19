@@ -769,11 +769,9 @@ describe("liveVerifierCount / threadAcceptsSteer / orphanInProgressIds", () => {
     );
   });
 });
-
 // ---------------------------------------------------------------------------
 // Real plugin lifecycle: convergence after a worker is stopped, aborted before
-// acceptance, or released. Every assertion reads durable rows or observed
-// spawns — never a rendered count.
+// acceptance, or released. Every assertion reads durable rows or spawns.
 // ---------------------------------------------------------------------------
 
 const hosts: FakePluginHost[] = [];
@@ -786,40 +784,59 @@ afterEach(async () => {
 
 type EventRow = { seq: number; type: string; data?: Record<string, unknown> };
 
+async function drain(
+  service: { controller: AbortController; done: Promise<unknown> },
+  settle: (rounds?: number) => Promise<void>,
+): Promise<void> {
+  await settle(10);
+  service.controller.abort();
+  await service.done;
+  await settle(80);
+}
+
+async function reloadHost(host: FakePluginHost): Promise<FakePluginHost> {
+  const next = await host.harness.lifecycle.reload(plugin);
+  hosts.push(next);
+  return next;
+}
+
 function liveGoal(rootId: string, maxWorkers: number) {
   const spawns: Array<{ threadId: string; itemId: string | null }> = [];
   const statuses = new Map<string, string>();
   const events = new Map<string, EventRow[]>();
+  const stopped: string[] = [];
   let spawnFailure: string | null = null;
   let stopFailure: string | null = null;
+  let eventReadFails = false;
+  let spawnCalls = 0;
   let gate: Promise<void> | null = null;
   let openGate: (() => void) | null = null;
-  let spawnCalls = 0;
+  const thread = (threadId: string, status: string) =>
+    makeThreadResponse({
+      id: threadId,
+      projectId: "proj",
+      providerId: "codex",
+      environmentId: null,
+      parentThreadId: threadId === rootId ? null : rootId,
+      status: status as never,
+    });
   const host = createFakePluginHost({
     pluginId: `ultragoal-scheduler-${hosts.length}`,
     sdk: {
       threads: {
-        get: async ({ threadId }: { threadId: string }) =>
-          makeThreadResponse({
-            id: threadId,
-            projectId: "proj",
-            providerId: "codex",
-            environmentId: null,
-            parentThreadId: threadId === rootId ? null : rootId,
-            status: (statuses.get(threadId) ?? (threadId === rootId ? "idle" : "idle")) as never,
-          }),
+        get: async ({ threadId }: { threadId: string }) => thread(threadId, statuses.get(threadId) ?? "idle"),
         list: () => [],
         timeline: () => ({ rows: [] as never[] }),
         output: () => ({ output: null }),
+        send: async () => ({ ok: true }),
+        archive: async () => ({}),
+        update: async ({ threadId }: { threadId: string }) => thread(threadId, "idle"),
+        interactions: { list: async () => [], resolve: async () => ({}) },
         stop: async ({ threadId }: { threadId: string }) => {
           stopped.push(threadId);
           if (stopFailure) throw new Error(stopFailure);
           return { ok: true };
         },
-        send: async () => ({ ok: true }),
-        archive: async () => ({}),
-        update: async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId }),
-        interactions: { list: async () => [], resolve: async () => ({}) },
         events: {
           list: async (args: {
             threadId: string;
@@ -830,9 +847,7 @@ function liveGoal(rootId: string, maxWorkers: number) {
           }) => {
             if (eventReadFails) throw new Error("event projection read failed");
             let rows = [...(events.get(args.threadId) ?? [])].sort((a, b) => a.seq - b.seq);
-            if (args.types && args.types.length > 0) {
-              rows = rows.filter((row) => args.types!.includes(row.type));
-            }
+            if (args.types?.length) rows = rows.filter((row) => args.types!.includes(row.type));
             if (args.afterSeq != null) rows = rows.filter((row) => row.seq > Number(args.afterSeq));
             if (args.order === "desc") rows.reverse();
             if (args.limit != null) rows = rows.slice(0, Number(args.limit));
@@ -844,79 +859,51 @@ function liveGoal(rootId: string, maxWorkers: number) {
           if (gate) await gate;
           if (spawnFailure) throw new Error(spawnFailure);
           const id = `thr_spawn_${spawnCalls}`;
-          const itemId = /item_id=(itm_[A-Za-z0-9_]+)/.exec(args.prompt ?? "")?.[1] ?? null;
-          spawns.push({ threadId: id, itemId });
-          statuses.set(id, "active");
-          return makeThreadResponse({
-            id,
-            projectId: "proj",
-            providerId: "codex",
-            environmentId: null,
-            parentThreadId: String(args.parentThreadId ?? rootId),
-            status: "active",
+          spawns.push({
+            threadId: id,
+            itemId: /item_id=(itm_[A-Za-z0-9_]+)/.exec(args.prompt ?? "")?.[1] ?? null,
           });
+          statuses.set(id, "active");
+          return thread(id, "active");
         },
       },
     } as never,
   });
   hosts.push(host);
-  const stopped: string[] = [];
-  let eventReadFails = false;
   const db = host.bb.storage.database();
-  // Sentinel row: keeps the store's one-time legacy import out of this
-  // machine's developer database, exactly as lib/server-tools.test.ts does.
-  db.exec(`
-    CREATE TABLE goals (
+  // Sentinel row: keeps the store's one-time legacy import out of this machine's
+  // developer database, exactly as lib/server-tools.test.ts does.
+  db.exec(`CREATE TABLE goals (
       thread_id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER NOT NULL,
       turn_count INTEGER NOT NULL, max_turns INTEGER NOT NULL, max_minutes INTEGER NOT NULL,
       last_continue_at INTEGER, last_assistant_hash TEXT
     );
-    INSERT INTO goals VALUES ('thr_sentinel', 'test', 'complete', NULL, 1, 1, 1, 0, 0, 0, NULL, NULL);
-  `);
+    INSERT INTO goals VALUES ('thr_sentinel', 'test', 'complete', NULL, 1, 1, 1, 0, 0, 0, NULL, NULL);`);
   plugin(host.bb);
   db.prepare(
     `UPDATE goals SET thread_id = ?, status = 'active', max_workers = ?, last_continue_at = ?,
        verify_enabled = 0, progress_update_minutes = 0 WHERE thread_id = 'thr_sentinel'`,
   ).run(rootId, maxWorkers, Date.now());
   const items = createItemStore(host.bb);
-
   const settle = async (rounds = 80): Promise<void> => {
-    for (let index = 0; index < rounds; index += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    for (let n = 0; n < rounds; n += 1) await new Promise<void>((r) => setImmediate(r));
   };
-  const pulse = async (): Promise<void> => {
-    const service = host.harness.behavior.runService("progress-pulse");
-    await settle(10);
-    service.controller.abort();
-    await service.done;
-    await settle(80);
-  };
-  const emitIdle = async (threadId: string, lastAssistantText = ""): Promise<void> => {
-    await host.harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({
-        id: threadId,
-        projectId: "proj",
-        providerId: "codex",
-        environmentId: null,
-        parentThreadId: threadId === rootId ? null : rootId,
-        status: "idle",
-      }),
-      lastAssistantText,
-    } as never);
-    await settle(80);
-  };
+  const one = <T,>(sql: string, ...params: unknown[]): T | undefined =>
+    db.prepare(sql).get(...params) as T | undefined;
   return {
-    host,
-    db,
-    rootId,
-    items,
-    settle,
-    pulse,
-    emitIdle,
+    host, db, rootId, items, settle, stopped, spawns,
     spawnCalls: () => spawnCalls,
     spawnsFor: (itemId: string) => spawns.filter((spawn) => spawn.itemId === itemId),
+    pulse: (from: FakePluginHost = host) =>
+      drain(from.harness.behavior.runService("progress-pulse"), settle),
+    emitIdle: async (threadId: string, text = "") => {
+      await host.harness.behavior.emitThreadEvent("thread.idle", {
+        thread: thread(threadId, "idle"),
+        lastAssistantText: text,
+      } as never);
+      await settle(80);
+    },
     add(step: string, status: "pending" | "in_progress", files: string[]) {
       const item = items.add(rootId, step, status, { files, deps: [], check: null });
       if (!item) throw new Error(`could not create ${step}`);
@@ -924,53 +911,51 @@ function liveGoal(rootId: string, maxWorkers: number) {
     },
     own(threadId: string, itemId: string | null, role = "worker") {
       db.prepare(
-        `INSERT INTO collab_agents (
-           thread_id, root_thread_id, parent_thread_id, task_name, created_at,
-           display_name, item_id, role
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO collab_agents (thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+           display_name, item_id, role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(threadId, rootId, rootId, `/root/${threadId}`, Date.now(), `Worker ${threadId}`, itemId, role);
     },
     status: (threadId: string, value: string) => statuses.set(threadId, value),
     event: (threadId: string, row: EventRow) =>
       events.set(threadId, [...(events.get(threadId) ?? []), row]),
     itemStatus: (itemId: string) =>
-      (db.prepare("SELECT status FROM goal_items WHERE id = ?").get(itemId) as { status: string } | undefined)?.status,
+      one<{ status: string }>("SELECT status FROM goal_items WHERE id = ?", itemId)?.status,
     owners: () =>
-      db
-        .prepare(
-          `SELECT thread_id, item_id FROM collab_agents
-           WHERE root_thread_id = ? AND retired_at IS NULL AND COALESCE(role, 'worker') != 'verifier'
-           ORDER BY thread_id`,
-        )
-        .all(rootId) as Array<{ thread_id: string; item_id: string | null }>,
+      db.prepare(
+        `SELECT thread_id, item_id FROM collab_agents WHERE root_thread_id = ? AND retired_at IS NULL
+           AND COALESCE(role, 'worker') != 'verifier' ORDER BY thread_id`,
+      ).all(rootId) as Array<{ thread_id: string; item_id: string | null }>,
     generation: () =>
-      db
-        .prepare("SELECT requested_seq, serviced_seq FROM collab_scheduler_generations WHERE root_thread_id = ?")
-        .get(rootId) as { requested_seq: number; serviced_seq: number } | undefined,
+      one<{ requested_seq: number; serviced_seq: number }>(
+        "SELECT requested_seq, serviced_seq FROM collab_scheduler_generations WHERE root_thread_id = ?",
+        rootId,
+      ),
     attempt: (itemId: string) =>
-      db
-        .prepare(
-          "SELECT attempt_count, next_due_at, last_attempt_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
-        )
-        .get(rootId, itemId) as
-        | { attempt_count: number; next_due_at: number | null; last_attempt_at: number; blocked_at: number | null }
-        | undefined,
-    failSpawn(message: string | null) {
+      one<{
+        attempt_count: number;
+        next_due_at: number | null;
+        last_attempt_at: number;
+        blocked_at: number | null;
+      }>(
+        "SELECT attempt_count, next_due_at, last_attempt_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
+        rootId,
+        itemId,
+      ),
+    failSpawn: (message: string | null) => {
       spawnFailure = message;
     },
-    failStop(message: string | null) {
+    failStop: (message: string | null) => {
       stopFailure = message;
     },
-    failEventRead() {
+    failEventRead: () => {
       eventReadFails = true;
     },
-    stopped,
-    holdSpawn() {
+    holdSpawn: () => {
       gate = new Promise<void>((resolve) => {
         openGate = resolve;
       });
     },
-    releaseSpawn() {
+    releaseSpawn: () => {
       openGate?.();
       gate = null;
       openGate = null;
@@ -985,38 +970,41 @@ function liveGoal(rootId: string, maxWorkers: number) {
 }
 
 describe("scheduler convergence (real plugin lifecycle)", () => {
-  it("staffs four ready slices once each and retains an ordinary idle", async () => {
+  it("staffs four eligible disjoint slices under free capacity exactly once each", async () => {
     const f = liveGoal("thr_s1", 6);
     const created = [0, 1, 2, 3].map((n) =>
       f.add(`Slice: independent repair ${n}`, "pending", [`src/independent-${n}.ts`]),
     );
     await f.pulse();
-
-    assert.equal(f.spawnCalls(), 4, "four disjoint slices under free capacity are each staffed once");
+    assert.equal(f.spawnCalls(), 4, "four disjoint slices under free capacity are staffed once each");
     for (const item of created) {
       assert.equal(f.spawnsFor(item.id).length, 1, `${item.id} may not be staffed twice`);
       assert.equal(f.itemStatus(item.id), "in_progress");
     }
     assert.equal(f.owners().length, 4, "one durable owner per slice");
+  });
 
-    // Ordinary idle with a completed turn is ownership, not a stall.
+  it("retains ownership and capacity on ordinary idle with no stop evidence", async () => {
+    const f = liveGoal("thr_s2", 3);
+    const item = f.add("Slice: ordinary idle", "pending", ["src/idle.ts"]);
+    await f.pulse();
     const worker = f.owners()[0]!.thread_id;
     f.status(worker, "idle");
     f.event(worker, { seq: 1, type: "client/turn/requested", data: { requestId: "req_idle" } });
     f.event(worker, { seq: 2, type: "turn/input/accepted", data: { clientRequestId: "req_idle" } });
     f.event(worker, { seq: 3, type: "turn/completed", data: { status: "completed" } });
     await f.emitIdle(worker, "Still working this slice.");
-
-    assert.equal(f.spawnCalls(), 4, "ordinary idle must not staff a replacement");
-    assert.equal(f.owners().some((owner) => owner.thread_id === worker), true);
+    assert.equal(f.spawnCalls(), 1, "ordinary idle must not staff a replacement");
+    assert.equal(f.spawnsFor(item.id).length, 1);
+    assert.deepEqual(f.owners().map((row) => row.thread_id), [worker]);
   });
 
-  it("releases a stop and an abort-before-acceptance exactly once, consuming duplicates", async () => {
-    const f = liveGoal("thr_s2", 2);
+  it("releases a reliable stop and an abort-before-acceptance exactly once each", async () => {
+    const f = liveGoal("thr_s3", 2);
     const aborted = f.add("Slice: aborted before acceptance", "in_progress", ["src/abort.ts"]);
-    const stopped = f.add("Slice: stopped after acceptance", "in_progress", ["src/stop.ts"]);
+    const held = f.add("Slice: stopped after acceptance", "in_progress", ["src/stop.ts"]);
     f.own("thr_abort", aborted.id);
-    f.own("thr_stop", stopped.id);
+    f.own("thr_stop", held.id);
     f.status("thr_abort", "idle");
     f.status("thr_stop", "idle");
     f.event("thr_abort", { seq: 1, type: "client/turn/requested", data: { requestId: "req_a" } });
@@ -1024,31 +1012,24 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     f.event("thr_stop", { seq: 1, type: "client/turn/requested", data: { requestId: "req_s" } });
     f.event("thr_stop", { seq: 2, type: "turn/input/accepted", data: { clientRequestId: "req_s" } });
     f.event("thr_stop", { seq: 3, type: "system/thread/interrupted", data: { reason: "manual-stop" } });
-
     await f.emitIdle("thr_abort", "Stopped before the provider accepted the turn.");
     await f.emitIdle("thr_stop", "Stopped after the provider accepted the turn.");
-
-    for (const item of [aborted, stopped]) {
+    for (const item of [aborted, held]) {
       assert.equal(f.spawnsFor(item.id).length, 1, `${item.id} is requeued and restaffed once`);
       assert.equal(f.itemStatus(item.id), "in_progress");
     }
     assert.equal(f.owners().length, 2, "exactly one live owner per released slice");
     for (const retired of ["thr_abort", "thr_stop"]) {
-      assert.equal(f.owners().some((owner) => owner.thread_id === retired), false);
-      assert.ok(
-        f.db.prepare("SELECT retired_at FROM collab_agents WHERE thread_id = ?").get(retired),
-        `${retired} must be retired, not left live`,
-      );
+      assert.equal(f.owners().some((row) => row.thread_id === retired), false);
+      assert.ok(f.db.prepare("SELECT retired_at FROM collab_agents WHERE thread_id = ?").get(retired));
     }
-
-    // The same durable stop evidence arriving again consumes nothing.
     await f.emitIdle("thr_abort", "Stopped before the provider accepted the turn.");
     assert.equal(f.spawnsFor(aborted.id).length, 1, "a duplicate stop releases once");
     assert.equal(f.owners().length, 2, "a duplicate stop leaves the owner count alone");
   });
 
-  it("quarantines stop-pending and unreadable-evidence workers instead of replacing them", async () => {
-    const f = liveGoal("thr_s3", 2);
+  it("quarantines stop-pending and unavailable-evidence workers", async () => {
+    const f = liveGoal("thr_s4", 2);
     const pending = f.add("Slice: stop still settling", "in_progress", ["src/pending.ts"]);
     const unreadable = f.add("Slice: unreadable evidence", "in_progress", ["src/unreadable.ts"]);
     f.own("thr_pending", pending.id);
@@ -1058,22 +1039,20 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     f.event("thr_pending", { seq: 1, type: "client/turn/requested", data: { requestId: "req_p" } });
     f.event("thr_pending", { seq: 2, type: "system/thread/interrupted", data: { reason: "manual-stop" } });
     f.failEventRead();
-
     await f.emitIdle("thr_pending", "Stopping.");
     await f.emitIdle("thr_unreadable", "Worker went quiet.");
-
-    assert.equal(f.spawnCalls(), 0, "neither a settling stop nor unreadable evidence may be replaced");
+    assert.equal(f.spawnCalls(), 0, "neither a settling stop nor unreadable evidence is replaced");
     assert.equal(f.itemStatus(pending.id), "in_progress");
     assert.equal(f.itemStatus(unreadable.id), "in_progress");
     assert.deepEqual(
-      f.owners().map((owner) => owner.thread_id),
+      f.owners().map((row) => row.thread_id),
       ["thr_pending", "thr_unreadable"],
       "both quarantined workers keep their slot",
     );
   });
 
-  it("walks a failed launch 15s/1m/5m into a durable blocked record that survives a reload", async () => {
-    const f = liveGoal("thr_s4", 1);
+  it("walks a failed launch 15s/1m/5m into a durable blocked record", async () => {
+    const f = liveGoal("thr_s5", 1);
     const item = f.add("Slice: transiently unlaunchable", "pending", ["src/flaky.ts"]);
     f.failSpawn("threads.spawn refused the launch");
     const t0 = 1_800_000_000_000;
@@ -1081,13 +1060,12 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
       Date.now = () => t0 + ms;
       await f.pulse();
     };
-
     await at(0);
     assert.equal(f.spawnCalls(), 1, "the initial attempt fires immediately");
     assert.equal(f.itemStatus(item.id), "pending", "a failed launch rolls the slice back");
     assert.deepEqual(f.owners(), [], "a confirmed failed attempt leaves no live row");
     assert.deepEqual(
-      f.db.prepare("SELECT item_id FROM collab_item_reservations WHERE root_thread_id = ?").all("thr_s4"),
+      f.db.prepare("SELECT item_id FROM collab_item_reservations WHERE root_thread_id = ?").all("thr_s5"),
       [],
       "a confirmed failed attempt releases its reservation",
     );
@@ -1096,7 +1074,6 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
       f.attempt(item.id)!.next_due_at! - f.attempt(item.id)!.last_attempt_at >= 15_000,
       "the 15 second retry is scheduled durably",
     );
-
     await at(8_000);
     assert.equal(f.spawnCalls(), 1, "no retry before the 15 second floor");
     await at(20_000);
@@ -1112,17 +1089,9 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     assert.equal(f.attempt(item.id)?.attempt_count, 4);
     assert.ok(f.attempt(item.id)?.blocked_at != null, "exhaustion produces a durable launch block");
     assert.equal(f.itemStatus(item.id), "pending");
-
-    // The block is durable state, not a process-local cooldown: drive the pulse
-    // through the RELOADED plugin and read the surviving rows from its handle.
-    const reloaded = await f.host.harness.lifecycle.reload(plugin);
-    hosts.push(reloaded);
+    const reloaded = await reloadHost(f.host);
     Date.now = () => t0 + 2_700_000;
-    const service = reloaded.harness.behavior.runService("progress-pulse");
-    await f.settle(10);
-    service.controller.abort();
-    await service.done;
-    await f.settle(80);
+    await f.pulse(reloaded);
     assert.equal(f.spawnCalls(), 4, "a reload may not reset an exhausted attempt generation");
     const liveDb = reloaded.bb.storage.database();
     assert.equal(
@@ -1133,13 +1102,13 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     assert.ok(
       liveDb
         .prepare("SELECT blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?")
-        .get("thr_s4", item.id),
+        .get("thr_s5", item.id),
       "the launch-blocked record survives the reload",
     );
   });
 
   it("records an overlapping trigger durably and services it with one follow-up pass", async () => {
-    const f = liveGoal("thr_s5", 3);
+    const f = liveGoal("thr_s6", 3);
     for (const n of [0, 1]) {
       const held = f.add(`Slice: held ${n}`, "in_progress", [`src/held-${n}.ts`]);
       f.own(`thr_held_${n}`, held.id);
@@ -1158,13 +1127,10 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     f.db
       .prepare(
         `UPDATE collab_agents SET retired_at = ?
-         WHERE root_thread_id = 'thr_s5' AND thread_id = 'thr_held_0'`,
+         WHERE root_thread_id = 'thr_s6' AND thread_id = 'thr_held_0'`,
       )
       .run(Date.now());
-    f.db
-      .prepare("UPDATE goal_items SET status = 'completed' WHERE step = 'Slice: held 0'")
-      .run();
-
+    f.db.prepare("UPDATE goal_items SET status = 'completed' WHERE step = 'Slice: held 0'").run();
     await f.trigger(ready[1]!);
     await f.settle(40);
     const dirty = f.generation();
@@ -1173,15 +1139,10 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
       dirty!.requested_seq > dirty!.serviced_seq,
       `a trigger during a pass owes a follow-up: ${JSON.stringify(dirty)}`,
     );
-
     f.releaseSpawn();
     await first;
     await f.settle(200);
-    assert.equal(
-      f.spawnCalls(),
-      2,
-      "capacity freed during the pass is serviced by the follow-up, not lost",
-    );
+    assert.equal(f.spawnCalls(), 2, "capacity freed during the pass is serviced by the follow-up");
     for (const item of ready) {
       assert.equal(f.spawnsFor(item.id).length, 1, `${item.id} is staffed exactly once`);
     }
@@ -1191,43 +1152,33 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
   });
 
   it("requeues an explicit release, refuses a failed stop, and keeps the fence across a reload", async () => {
-    const f = liveGoal("thr_s6", 1);
+    const f = liveGoal("thr_s7", 1);
     const item = f.add("Slice: releasable", "pending", ["src/releasable.ts"]);
     await f.pulse();
     const owner = f.owners()[0]!.thread_id;
     assert.equal(f.spawnsFor(item.id).length, 1);
     f.status(owner, "idle");
-
-    const released = await f.host.harness.behavior.runCli(["release", owner, "--thread", "thr_s6"]);
+    const released = await f.host.harness.behavior.runCli(["release", owner, "--thread", "thr_s7"]);
     await f.settle(120);
     assert.equal(released.exitCode, 0, released.stderr ?? "");
     assert.equal(f.spawnsFor(item.id).length, 2, "the released slice is requeued and restaffed once");
     assert.equal(f.itemStatus(item.id), "in_progress");
     const next = f.owners()[0]!.thread_id;
     assert.notEqual(next, owner);
-
     // A stop that fails must refuse: no retirement, no requeue, no replacement.
     f.status(next, "idle");
     f.failStop("threads.stop refused the stop");
-    const refused = await f.host.harness.behavior.runCli(["release", next, "--thread", "thr_s6"]);
+    const refused = await f.host.harness.behavior.runCli(["release", next, "--thread", "thr_s7"]);
     await f.settle(40);
     assert.notEqual(refused.exitCode, 0, "a failed stop may not report a successful release");
     assert.equal(f.stopped.includes(next), true, "the stop was attempted");
     assert.equal(f.itemStatus(item.id), "in_progress", "a failed stop quarantines the slice");
-    assert.deepEqual(
-      f.owners().map((row) => row.thread_id),
-      [next],
-      "a failed stop retains the durable owner row",
-    );
-
-    // The reservation fence is durable state: a new plugin generation resumes
-    // it instead of resetting it.
-    const reloaded = await f.host.harness.lifecycle.reload(plugin);
-    hosts.push(reloaded);
+    assert.deepEqual(f.owners().map((row) => row.thread_id), [next], "a failed stop retains the durable owner row");
+    const reloaded = await reloadHost(f.host);
     const fence = createItemReservationStore(reloaded.bb.storage.database());
-    assert.equal(fence.isHeld("thr_s6", item.id), true, "the live owner still holds its slice");
+    assert.equal(fence.isHeld("thr_s7", item.id), true, "the live owner still holds its slice");
     assert.equal(
-      fence.acquire("thr_s6", "itm_other", 1),
+      fence.acquire("thr_s7", "itm_other", 1),
       null,
       "a reloaded generation cannot reserve the slot its durable owner occupies",
     );

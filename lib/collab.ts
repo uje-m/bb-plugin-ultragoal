@@ -158,9 +158,8 @@ function mapThreadStatus(status: string | undefined, output?: string | null): {
 } {
   if (status === "active") return { status: "running", summary: null };
   if (status === "starting" || status === "provisioning") return { status: "starting", summary: null };
-  // A stop still settling keeps its runtime and its slice: `stopped` here
-  // demoted the item and freed the slot while the stop was in flight, so the
-  // scheduler could restaff work the old worker had not yet let go of.
+  // A stop still settling keeps its runtime and its slice, so the scheduler
+  // cannot restaff work the old worker has not yet let go of.
   if (status === "stopping") return { status: "running", summary: null };
   if (status === "error") return { status: "error", summary: "Turn error" };
   if (status === "idle") {
@@ -189,12 +188,9 @@ export function createCollabStore(
     ) => string | null;
     /** Status of a plan item, so retired workers can refuse new slices. */
     itemStatus?: (rootThreadId: string, itemId: string) => string | null;
-    /**
-     * Give a work item back to the ready queue. MUST stay synchronous and
-     * side-effect-free outside SQLite: the atomic release runs it inside its
-     * own IMMEDIATE transaction, and publishing/scheduling happen afterwards
-     * through `onReleased`.
-     */
+    /** Give a work item back to the ready queue. MUST stay synchronous and free
+     * of side effects outside SQLite: the atomic release calls it inside its own
+     * IMMEDIATE transaction. */
     releaseItem?: (rootThreadId: string, itemId: string, reason: string) => void;
     /** A release transaction committed; the caller publishes and schedules. */
     onReleased?: (rootThreadId: string, itemId: string | null) => void;
@@ -320,14 +316,11 @@ export function createCollabStore(
     return reservations.isHeld(rootThreadId, itemId, exceptReservation);
   }
 
-  /**
-   * The one atomic release-and-requeue. In a single IMMEDIATE transaction:
-   * retire the worker row (tombstone its item, set `retired_at`), delete its
-   * reservation, and hand the slice back to the queue. A slice that is already
-   * completed is never reopened, and a row that is already retired releases
-   * nothing: a duplicate stop/abort/failure event observes the released state
-   * and does nothing.
-   */
+  /** The one atomic release-and-requeue: in a single IMMEDIATE transaction it
+   * retires the worker row (tombstone its item, set `retired_at`), deletes its
+   * reservation and hands the slice back. A completed slice is never reopened
+   * and an already-retired row releases nothing, so a duplicate stop/abort/
+   * failure event observes the released state and does nothing. */
   function releaseAssignment(
     rootThreadId: string,
     workerThreadId: string,
@@ -352,13 +345,9 @@ export function createCollabStore(
     return outcome;
   }
 
-  /**
-   * The orchestrator's own release lever: stop the worker, then give the slice
-   * back through the same transaction the evidence-driven paths use. A stop that
-   * fails refuses the release instead of requeueing a slice whose worker may
-   * still be running: the assignment stays quarantined until an explicit retry
-   * or an authoritative death signal resolves it.
-   */
+  /** Stop the worker, then requeue its slice through the one release
+   * transaction. A failed stop refuses the release instead of requeueing a slice
+   * whose worker may still be running. */
   async function releaseSlice(
     workerThreadId: string,
     reason: string,

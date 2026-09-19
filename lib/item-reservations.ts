@@ -4,23 +4,20 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 
 /**
- * Reservations do not expire. A slot is released by `release`, consumed by
- * `commit`, or retired when a host signal proves the launch dead — never by a
- * clock. `expires_at` survives only because the shared migration's capacity
- * triggers read it, and it is written with a value no clock can pass so that
- * fence counts every reservation instead of resurrecting elapsed time as an
- * authority. A reservation whose launch may have dispatched is a quarantined
- * attempt: it keeps its slot until reconciliation proves a safe outcome.
+ * Reservations do not expire: a slot is released by `release`, consumed by
+ * `commit`, or retired when an authoritative host signal proves the launch dead
+ * — never by a clock. `expires_at` survives only as a column the shared
+ * migration's capacity triggers still count, written beyond any clock, so the
+ * fence counts every reservation instead of reviving time as an authority.
  */
 const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 
 /**
- * Retry ladder after a transient launch failure: the initial attempt plus
- * retries at 15 seconds, 1 minute and 5 minutes, then a durable blocked record.
- * Exhaustion is a state, not a loop.
+ * Launch-retry ladder: the initial attempt plus retries at 15s, 1m and 5m, then
+ * a durable blocked record. Exhaustion is a state, not a loop.
  */
 export const LAUNCH_RETRY_DELAYS_MS: readonly number[] = [15_000, 60_000, 300_000];
-export const MAX_LAUNCH_ATTEMPTS = LAUNCH_RETRY_DELAYS_MS.length + 1;
+const MAX_LAUNCH_ATTEMPTS = LAUNCH_RETRY_DELAYS_MS.length + 1;
 
 export interface LaunchAttemptRecord {
   attemptCount: number;
@@ -34,11 +31,8 @@ interface AttemptRow {
   blocked_at: number | null;
 }
 
-/**
- * Durable launch-attempt generation per (root, item), owned here rather than in
- * the shared migration list — which records progress by array index and has
- * silently skipped an appended statement before.
- */
+/** Durable launch-attempt generation per (root, item), owned here rather than in
+ * the shared migration list, which records progress by array index. */
 export function createLaunchAttemptStore(db: PluginDatabase) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS collab_launch_attempts (
@@ -55,32 +49,27 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
   const read = db.prepare(
     "SELECT attempt_count, next_due_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
   );
-  const insert = db.prepare(`
-    INSERT INTO collab_launch_attempts (
-      root_thread_id, item_id, attempt_count, first_attempt_at, last_attempt_at, next_due_at, blocked_at
-    ) VALUES (?, ?, 1, ?, ?, ?, NULL)
-  `);
-  const advance = db.prepare(`
-    UPDATE collab_launch_attempts
-    SET attempt_count = ?, last_attempt_at = ?, next_due_at = ?, blocked_at = ?
-    WHERE root_thread_id = ? AND item_id = ?
-  `);
+  const insert = db.prepare(
+    "INSERT INTO collab_launch_attempts (root_thread_id, item_id, attempt_count, first_attempt_at, last_attempt_at, next_due_at, blocked_at) VALUES (?, ?, 1, ?, ?, ?, NULL)",
+  );
+  const advance = db.prepare(
+    "UPDATE collab_launch_attempts SET attempt_count = ?, last_attempt_at = ?, next_due_at = ?, blocked_at = ? WHERE root_thread_id = ? AND item_id = ?",
+  );
   const clear = db.prepare(
     "DELETE FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
   );
 
   return {
     /**
-     * Consume one launch attempt for the item, recorded BEFORE dispatch so a
-     * crash mid-launch burns the attempt instead of double-launching. Returns
-     * null while the generation is not due and while it is durably blocked.
-     * `now` is the caller's clock; this store never reads one.
+     * Consume one attempt, recorded BEFORE dispatch so a crash mid-launch burns
+     * an attempt instead of double-launching. Null while the generation is not
+     * due and while it is durably blocked. `now` is the caller's clock.
      */
     begin(rootThreadId: string, itemId: string, now: number): LaunchAttemptRecord | null {
       const txn = db.transaction((): LaunchAttemptRecord | null => {
         const row = read.get(rootThreadId, itemId) as AttemptRow | undefined;
         if (!row) {
-          const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[0];
+          const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[0]!;
           insert.run(rootThreadId, itemId, now, now, nextDueAt);
           return { attemptCount: 1, nextDueAt, blockedAt: null };
         }
@@ -91,47 +80,23 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
           advance.run(MAX_LAUNCH_ATTEMPTS, now, null, now, rootThreadId, itemId);
           return { attemptCount: MAX_LAUNCH_ATTEMPTS, nextDueAt: null, blockedAt: now };
         }
-        const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[attemptCount - 1];
+        const nextDueAt = now + LAUNCH_RETRY_DELAYS_MS[attemptCount - 1]!;
         advance.run(attemptCount, now, nextDueAt, null, rootThreadId, itemId);
         return { attemptCount, nextDueAt, blockedAt: null };
       });
       return txn.immediate();
     },
 
-    /** The launch landed, or an owner explicitly requeued the slice: either way
-     * the generation is over and the next launch starts a fresh one. */
+    /** The launch landed, or an owner explicitly requeued the slice. */
     clear(rootThreadId: string, itemId: string): void {
       clear.run(rootThreadId, itemId);
-    },
-
-    get(rootThreadId: string, itemId: string): LaunchAttemptRecord | null {
-      const row = read.get(rootThreadId, itemId) as AttemptRow | undefined;
-      return row
-        ? { attemptCount: row.attempt_count, nextDueAt: row.next_due_at, blockedAt: row.blocked_at }
-        : null;
-    },
-
-    /** Items whose generation ended in a durable blocked record. */
-    blocked(rootThreadId: string): string[] {
-      return (
-        db
-          .prepare(
-            "SELECT item_id FROM collab_launch_attempts WHERE root_thread_id = ? AND blocked_at IS NOT NULL",
-          )
-          .all(rootThreadId) as Array<{ item_id: string }>
-      ).map((row) => row.item_id);
     },
   };
 }
 
-export type LaunchAttemptStore = ReturnType<typeof createLaunchAttemptStore>;
-
-/**
- * Durable scheduling generation per root: every trigger advances `requested_seq`
- * and every pass records the generation it serviced. A trigger that lands while
- * a pass is in flight leaves the row dirty instead of being dropped by a
- * process-local flag, so a follow-up pass is owed and survives a reload.
- */
+/** Durable scheduling generation per root: every trigger advances
+ * `requested_seq`, and a trigger that lands while a pass is in flight leaves the
+ * row dirty instead of being dropped by a process-local flag. */
 export function createSchedulerGenerationStore(db: PluginDatabase) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS collab_scheduler_generations (
@@ -148,13 +113,12 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
       requested_seq = requested_seq + 1,
       updated_at = excluded.updated_at
   `);
+  const service = db.prepare(
+    "UPDATE collab_scheduler_generations SET serviced_seq = ?, updated_at = ? WHERE root_thread_id = ? AND serviced_seq < ?",
+  );
   const read = db.prepare(
     "SELECT requested_seq, serviced_seq FROM collab_scheduler_generations WHERE root_thread_id = ?",
   );
-  const service = db.prepare(`
-    UPDATE collab_scheduler_generations SET serviced_seq = ?, updated_at = ?
-    WHERE root_thread_id = ? AND serviced_seq < ?
-  `);
   const sequence = (rootThreadId: string): { requested: number; serviced: number } => {
     const row = read.get(rootThreadId) as
       | { requested_seq: number; serviced_seq: number }
@@ -176,14 +140,8 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
       return sequence(rootThreadId).requested;
     },
 
-    serviced(rootThreadId: string): number {
-      return sequence(rootThreadId).serviced;
-    },
-
-    /**
-     * Record the generation a pass serviced. Returns true while a newer
-     * generation is still outstanding, which owes exactly one follow-up pass.
-     */
+    /** Record the generation a pass serviced; true while a newer generation is
+     * still outstanding, which owes exactly one follow-up pass. */
     service(rootThreadId: string, servicedSeq: number, now: number): boolean {
       const txn = db.transaction((): boolean => {
         service.run(servicedSeq, now, rootThreadId, servicedSeq);
@@ -194,8 +152,6 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
     },
   };
 }
-
-export type SchedulerGenerationStore = ReturnType<typeof createSchedulerGenerationStore>;
 
 /**
  * Cross-generation scheduler lock. The row is acquired before BB is asked to

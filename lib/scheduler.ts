@@ -463,14 +463,13 @@ function eventData(event: Record<string, unknown>): Record<string, unknown> {
 
 /**
  * Classify ONE request generation from durable events: the latest
- * `client/turn/requested` opens it, a `manual-stop` after that request — or in a
- * window that shows no request at all, which is a first-request abort by
- * construction — closes it, and acceptance joins the request by
- * `requestId === clientRequestId`, never by timing. `host-daemon-restarted` and
- * `provider-turn-idle` are not user stops. A negative "not accepted" claim is
- * final only once the host status is no longer starting/active/stopping: until
- * then the stop is still settling. Unreadable evidence or host status
- * classifies as unavailable, which quarantines.
+ * `client/turn/requested` opens it, a `manual-stop` after that request closes
+ * it, and acceptance joins the request by `requestId === clientRequestId`,
+ * never by timing. `host-daemon-restarted` and `provider-turn-idle` are not
+ * user stops. A negative "not accepted" claim is final only once the host
+ * status is no longer starting/active/stopping: until then the stop is still
+ * settling. Unreadable evidence or host status classifies as unavailable,
+ * which quarantines.
  */
 export function classifyWorkerGeneration(input: {
   status: string | null;
@@ -486,11 +485,8 @@ export function classifyWorkerGeneration(input: {
   if (status === "stopping") return "stop_pending";
   const latest = input.events.filter((event) => event.type === "client/turn/requested").at(-1);
   const requestId = latest ? eventData(latest).requestId : null;
-  // The window is the tail of the history, so a stop it contains happened after
-  // any request it no longer shows: with no request in view, every stop in view
-  // belongs to this generation.
   const after = (event: Record<string, unknown>): boolean =>
-    latest === undefined || eventSeq(event) > eventSeq(latest);
+    latest != null && eventSeq(event) > eventSeq(latest);
   const stopped = input.events.some(
     (event) =>
       event.type === "system/thread/interrupted" &&
@@ -516,6 +512,6 @@ export function classifyWorkerGeneration(input: {
   if (input.events.some((event) => event.type === "turn/completed" && after(event))) {
     return "ordinary_idle";
   }
-  if (latest === undefined) return "never_dispatched";
+  if (latest == null) return "never_dispatched";
   return accepted ? "running_accepted" : "running_unconfirmed";
 }

@@ -999,6 +999,36 @@ describe("scheduler convergence (real plugin lifecycle)", () => {
     assert.deepEqual(f.owners().map((row) => row.thread_id), [worker]);
   });
 
+  it("keeps an aged reservation's slot, item lock, and commit path", async () => {
+    const f = liveGoal("thr_s8", 1);
+    const t0 = Date.now();
+    const store = createItemReservationStore(f.db);
+    const token = store.acquire("thr_s8", "itm_aged", 1);
+    assert.ok(token, "the reservation is admitted under free capacity");
+
+    // Eleven minutes is the exact TTL the contract forbids from freeing a slot.
+    Date.now = () => t0 + 11 * 60_000;
+    const aged = createItemReservationStore(f.db);
+    assert.equal(aged.isHeld("thr_s8", "itm_aged"), true, "an aged reservation still holds its item");
+    assert.deepEqual(
+      aged.claimants("thr_s8", "itm_aged"),
+      [token],
+      "the claim token survives elapsed time",
+    );
+    assert.equal(aged.acquire("thr_s8", "itm_aged", 1), null, "the aged row still exists");
+    assert.equal(
+      aged.acquire("thr_s8", "itm_other", 1),
+      null,
+      "the aged reservation still occupies its slot",
+    );
+    assert.equal(
+      aged.commit("thr_s8", "itm_aged", token!, () => {}),
+      true,
+      "the aged holder can still commit its own reservation",
+    );
+    assert.equal(store.release("thr_s8", "itm_aged", token!), false, "commit consumed the claim");
+  });
+
   it("releases a reliable stop and an abort-before-acceptance exactly once each", async () => {
     const f = liveGoal("thr_s3", 2);
     const aborted = f.add("Slice: aborted before acceptance", "in_progress", ["src/abort.ts"]);

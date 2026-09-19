@@ -996,12 +996,7 @@ export default function plugin(bb: BbPluginApi) {
     "system/thread/interrupted", "system/thread-provisioning",
   ] as const;
 
-  /** The tail of a worker's event history is the window a request generation
-   * lives in: an event outside it is older than the request it would contradict,
-   * so dropping the oldest end can only retain ownership, never release it. */
-  const WORKER_GENERATION_WINDOW = 200;
-
-  /** Classify one worker's current request generation. `failed` and `deleted`
+  /** Classify one worker's latest request generation. `failed` and `deleted`
    * are authoritative host death signals, so unreadable evidence cannot veto
    * them; every other unreadable classification quarantines. */
   async function workerGeneration(
@@ -1018,7 +1013,8 @@ export default function plugin(bb: BbPluginApi) {
     const read = await readThreadEvents(bb, {
       threadId: workerThreadId,
       types: WORKER_GENERATION_EVENTS,
-      newest: WORKER_GENERATION_WINDOW,
+      order: "asc",
+      throughHighWater: true,
     });
     if (!read.ok) return authoritative ? "failed" : "evidence_unavailable";
     return classifyWorkerGeneration({
@@ -4880,7 +4876,7 @@ export default function plugin(bb: BbPluginApi) {
         releaseWorkerSlice(
           deletedChild.root_thread_id,
           thread.id,
-          `deleted (${await workerGeneration(thread.id, { failed: true })})`,
+          `deleted (${await workerGeneration(thread.id, { deleted: true })})`,
         );
       }
       markGoalEvent(deletedChild.root_thread_id);

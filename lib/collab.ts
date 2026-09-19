@@ -20,6 +20,48 @@ const MAX_WAIT_TIMEOUT_MS = 600_000;
  * SQLite ABORT rather than a query result. A count taken before the insert
  * cannot fence a concurrent legacy generation — catching the ABORT is the only
  * race-free way to learn the durable write was rejected. */
+/**
+ * The exact display name the plugin's own intake spawn passes, and the only row
+ * that carries it. The slug is derived from the name rather than written out, so
+ * the identity the idle path matches can never drift from the spawn site.
+ */
+export const INTAKE_COURIER_DISPLAY_NAME = "Intake Courier";
+export const INTAKE_COURIER_SLUG = slugFromName(INTAKE_COURIER_DISPLAY_NAME);
+
+/**
+ * Whether a durable task name carries the shape `spawnWorker` emits for the
+ * courier: `<parent path>/<slug>_<Date.now().toString(36)>`.
+ *
+ * A bare `intake_` prefix is deliberately not enough. An orchestrator can name a
+ * real slice `/root/intake_<something>`, and matching that would hand the
+ * courier's lifecycle to an unrelated worker.
+ */
+export function isIntakeCourierTaskName(taskName: string): boolean {
+  const last = taskName.split("/").pop() ?? "";
+  return last.startsWith(`${INTAKE_COURIER_SLUG}_`);
+}
+
+/**
+ * THE courier predicate. The `thread.idle` branch and the durable retirement
+ * sweep both call it, so the two can never disagree about which itemless child
+ * is the plugin's own intake courier. `itemId === null` is not an identity:
+ * discovered and natively spawned children are itemless too, and bulk-retiring
+ * them would kill live work.
+ */
+export function isIntakeCourier(row: {
+  taskName: string;
+  displayName: string | null;
+  itemId: string | null;
+  role: string | null;
+}): boolean {
+  return (
+    row.role !== "verifier" &&
+    row.itemId === null &&
+    row.displayName === INTAKE_COURIER_DISPLAY_NAME &&
+    isIntakeCourierTaskName(row.taskName)
+  );
+}
+
 function isRootCapacityFull(error: unknown): boolean {
   return error instanceof Error && /root worker capacity is full/.test(error.message);
 }
@@ -1028,6 +1070,8 @@ export function createCollabStore(
       itemId: string | null;
       role: string | null;
       taskName: string;
+      displayName: string | null;
+      createdAt: number;
       reportStatus: string | null;
     }> {
       return (byRoot.all(rootId(rootThreadId)) as CollabRow[]).map((row) => ({
@@ -1035,6 +1079,8 @@ export function createCollabStore(
         itemId: row.item_id ?? null,
         role: row.role ?? null,
         taskName: row.task_name,
+        displayName: row.display_name ?? null,
+        createdAt: row.created_at,
         reportStatus: row.report_status ?? null,
       }));
     },
@@ -1475,7 +1521,7 @@ export function createCollabStore(
           const deadline = Date.now() + timeout;
           const updated: string[] = [];
           await Promise.all(
-            rows.map(async (row) => {
+            rows.map(async (row): Promise<void> => {
               const remaining = Math.max(1, deadline - Date.now());
               try {
                 await bb.sdk.threads.wait({

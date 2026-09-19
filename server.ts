@@ -41,11 +41,16 @@ import {
 } from "./lib/finding-brief.js";
 import { workRelatedName } from "./lib/names.js";
 import { createItemStore, type ItemStore } from "./lib/items.js";
-import { createItemReservationStore } from "./lib/item-reservations.js";
+import {
+  createItemReservationStore,
+  createLaunchAttemptStore,
+  createSchedulerGenerationStore,
+} from "./lib/item-reservations.js";
 import {
   forgetNativeScan,
   hasPendingNativeTasks,
   listLiveNativeTasks,
+  readThreadEvents,
   type LiveNativeTask,
 } from "./lib/native-sync.js";
 import { currentSliceTitle, shortSliceTitle } from "./lib/titles.js";
@@ -62,10 +67,12 @@ import { createIntegrationRecordStore } from "./lib/integration-record.js";
 import { hostContract } from "./host-contract.js";
 import { projectPane } from "./lib/projection.js";
 import {
+  classifyWorkerGeneration,
   filesOverlap,
   finishedWorkerRetirementCandidates,
   freeSlots,
   ownSliceScope,
+  releasesWorkerGeneration,
   retirementPermittedByHost,
   liveVerifierCount,
   orphanInProgressIds,
@@ -75,6 +82,7 @@ import {
   planWorkerRelease,
   setSharedInfrastructureFiles,
   type ReleaseTarget,
+  type WorkerGeneration,
   threadAcceptsStart,
   threadAcceptsSteer,
   immediateSendMode,

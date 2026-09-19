@@ -423,3 +423,104 @@ export function orphanInProgressIds(
     .filter((item) => item.status === "in_progress" && !heldItemIds.has(item.id))
     .map((item) => item.id);
 }
+
+/**
+ * What the durable event projection says about one worker's latest request
+ * generation. Only three of these permit releasing the slice; the rest retain
+ * or quarantine it, and elapsed time never changes that.
+ */
+export type WorkerGeneration =
+  | "never_dispatched"
+  | "running_unconfirmed"
+  | "running_accepted"
+  | "stop_pending"
+  | "ordinary_idle"
+  | "first_request_aborted"
+  | "stopped_after_acceptance"
+  | "failed"
+  | "evidence_unavailable";
+
+const RELEASING_WORKER_GENERATIONS: ReadonlySet<WorkerGeneration> = new Set([
+  "first_request_aborted",
+  "stopped_after_acceptance",
+  "failed",
+]);
+
+/** Whether this generation relinquishes assignment and capacity. */
+export function releasesWorkerGeneration(generation: WorkerGeneration): boolean {
+  return RELEASING_WORKER_GENERATIONS.has(generation);
+}
+
+const MANUAL_STOP_REASON = "manual-stop";
+
+function eventSeq(event: Record<string, unknown>): number {
+  const seq = event.seq;
+  return typeof seq === "number" && Number.isFinite(seq) ? seq : 0;
+}
+
+function eventData(event: Record<string, unknown>): Record<string, unknown> {
+  const data = event.data;
+  return data !== null && typeof data === "object" ? (data as Record<string, unknown>) : {};
+}
+
+/**
+ * Classify ONE request generation from durable events (ruling #4). The latest
+ * `client/turn/requested` opens the generation; a `manual-stop` belongs to the
+ * interval it falls in; acceptance is joined to that request by
+ * `requestId === clientRequestId`, never by timing, and stays decisive even
+ * when it is sequenced after the stop. `host-daemon-restarted` and
+ * `provider-turn-idle` are not user stops.
+ *
+ * A negative "not accepted" claim is finalized only once the host status is no
+ * longer starting/active/stopping: while it is, the answer is that the stop is
+ * still settling. Unreadable evidence (`events === null`) and an unreadable
+ * host status classify as unavailable, which quarantines.
+ */
+export function classifyWorkerGeneration(input: {
+  status: string | null;
+  events: readonly Record<string, unknown>[] | null;
+  /** This wake-up is a terminal failure reported by the host. */
+  failed?: boolean;
+  /** This wake-up is a deletion (or the host reports the thread gone). */
+  deleted?: boolean;
+}): WorkerGeneration {
+  if (input.events === null) return "evidence_unavailable";
+  if (input.deleted === true) return "failed";
+  const status = input.status;
+  if (status === "stopping") return "stop_pending";
+
+  const requests = input.events.filter((event) => event.type === "client/turn/requested");
+  const latest = requests.at(-1);
+  const requestId = latest ? eventData(latest).requestId : null;
+  const inGeneration = (event: Record<string, unknown>): boolean =>
+    latest !== undefined && latest !== null && eventSeq(event) > eventSeq(latest);
+  const stopped = input.events.some(
+    (event) =>
+      event.type === "system/thread/interrupted" &&
+      eventData(event).reason === MANUAL_STOP_REASON &&
+      inGeneration(event),
+  );
+  const accepted =
+    typeof requestId === "string" &&
+    input.events.some(
+      (event) =>
+        event.type === "turn/input/accepted" &&
+        eventData(event).clientRequestId === requestId,
+    );
+  if (input.failed === true) {
+    return stopped ? (accepted ? "stopped_after_acceptance" : "first_request_aborted") : "failed";
+  }
+  if (status === null) return "evidence_unavailable";
+  if (status === "active" || status === "starting" || status === "provisioning") {
+    if (stopped) return "stop_pending";
+    return accepted ? "running_accepted" : "running_unconfirmed";
+  }
+  if (stopped) return accepted ? "stopped_after_acceptance" : "first_request_aborted";
+  if (status === "error") return "failed";
+  const completed = input.events.some(
+    (event) => event.type === "turn/completed" && inGeneration(event),
+  );
+  if (completed) return "ordinary_idle";
+  if (latest === undefined || latest === null) return "never_dispatched";
+  return accepted ? "running_accepted" : "running_unconfirmed";
+}

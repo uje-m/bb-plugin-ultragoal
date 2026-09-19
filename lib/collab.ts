@@ -158,7 +158,10 @@ function mapThreadStatus(status: string | undefined, output?: string | null): {
 } {
   if (status === "active") return { status: "running", summary: null };
   if (status === "starting" || status === "provisioning") return { status: "starting", summary: null };
-  if (status === "stopping") return { status: "stopped", summary: null };
+  // A stop still settling keeps its runtime and its slice: `stopped` here
+  // demoted the item and freed the slot while the stop was in flight, so the
+  // scheduler could restaff work the old worker had not yet let go of.
+  if (status === "stopping") return { status: "running", summary: null };
   if (status === "error") return { status: "error", summary: "Turn error" };
   if (status === "idle") {
     const summary = output?.trim() ? output.trim().slice(0, 160) : null;
@@ -187,12 +190,14 @@ export function createCollabStore(
     /** Status of a plan item, so retired workers can refuse new slices. */
     itemStatus?: (rootThreadId: string, itemId: string) => string | null;
     /**
-     * Give a work item back to the ready queue. The orchestrator could see a
-     * redundant or stale-based worker and had no lever to stop it: interrupting
-     * ends a turn but keeps the slot and the assignment, so the slice stayed
-     * in_progress and the queue stayed blocked.
+     * Give a work item back to the ready queue. MUST stay synchronous and
+     * side-effect-free outside SQLite: the atomic release runs it inside its
+     * own IMMEDIATE transaction, and publishing/scheduling happen afterwards
+     * through `onReleased`.
      */
     releaseItem?: (rootThreadId: string, itemId: string, reason: string) => void;
+    /** A release transaction committed; the caller publishes and schedules. */
+    onReleased?: (rootThreadId: string, itemId: string | null) => void;
     /** Goal-level worker execution pin; null fields inherit the root thread. */
     workerExecution?: (rootThreadId: string) => {
       providerId: string | null;
@@ -313,6 +318,58 @@ export function createCollabStore(
   ): boolean {
     if (!itemId) return false;
     return reservations.isHeld(rootThreadId, itemId, exceptReservation);
+  }
+
+  /**
+   * The one atomic release-and-requeue. In a single IMMEDIATE transaction:
+   * retire the worker row (tombstone its item, set `retired_at`), delete its
+   * reservation, and hand the slice back to the queue. A slice that is already
+   * completed is never reopened, and a row that is already retired releases
+   * nothing: a duplicate stop/abort/failure event observes the released state
+   * and does nothing.
+   */
+  function releaseAssignment(
+    rootThreadId: string,
+    workerThreadId: string,
+    reason: string,
+  ): { released: boolean; itemId: string | null } {
+    const txn = db.transaction((): { released: boolean; itemId: string | null } => {
+      const row = byThread.get(workerThreadId) as CollabRow | undefined;
+      if (!row || row.root_thread_id !== rootThreadId) return { released: false, itemId: null };
+      const itemId = row.item_id ?? null;
+      if (itemId && hooks?.itemStatus?.(rootThreadId, itemId) === "completed") {
+        return { released: false, itemId };
+      }
+      removeRow.run({ thread_id: workerThreadId, retired_at: Date.now() });
+      if (itemId) {
+        reservations.releaseItem(rootThreadId, itemId);
+        hooks?.releaseItem?.(rootThreadId, itemId, reason);
+      }
+      return { released: true, itemId };
+    });
+    const outcome = txn.immediate();
+    if (outcome.released) hooks?.onReleased?.(rootThreadId, outcome.itemId);
+    return outcome;
+  }
+
+  /**
+   * The orchestrator's own release lever: stop the worker, then give the slice
+   * back through the same transaction the evidence-driven paths use.
+   */
+  async function releaseSlice(
+    workerThreadId: string,
+    reason: string,
+  ): Promise<{ released: boolean; itemId: string | null }> {
+    const row = rowOf(workerThreadId);
+    if (!row) return { released: false, itemId: null };
+    try {
+      await bb.sdk.threads.stop({ threadId: workerThreadId });
+    } catch {
+      // Best-effort: the durable release below is what matters.
+    }
+    const outcome = releaseAssignment(row.root_thread_id, workerThreadId, reason);
+    await bb.sdk.threads.archive({ threadId: workerThreadId }).catch(() => undefined);
+    return outcome;
   }
 
   function rowOf(threadId: string): CollabRow | null {
@@ -1055,6 +1112,8 @@ export function createCollabStore(
   }
 
   return {
+    releaseAssignment,
+    releaseSlice,
     rootId,
     rowOf,
     itemHasWorker,
@@ -1597,18 +1656,20 @@ export function createCollabStore(
           if (!agent) {
             return { content: [{ type: "text", text: `Agent not found: ${target}` }], isError: true };
           }
-          // Stop first: releasing a slice under a running turn lets the worker
-          // keep writing to a directory nobody is watching any more.
-          await bb.sdk.threads.stop({ threadId: agent.thread_id }).catch(() => undefined);
-          const itemId = agent.item_id ?? null;
-          removeRow.run({ thread_id: agent.thread_id, retired_at: Date.now() });
-          await bb.sdk.threads.archive({ threadId: agent.thread_id }).catch(() => undefined);
-          if (itemId) hooks?.releaseItem?.(rootId(threadId), itemId, reason);
-          hooks?.onChange?.(rootId(threadId));
+          const outcome = await releaseSlice(agent.thread_id, reason);
+          if (!outcome.released) {
+            return {
+              content: [{
+                type: "text",
+                text: `${agent.thread_id} holds no releaseable slice (already retired, or its slice is closed).`,
+              }],
+              isError: true,
+            };
+          }
           return {
             content: [{
               type: "text",
-              text: JSON.stringify({ released_item: itemId, agent: agent.thread_id, reason }),
+              text: JSON.stringify({ released_item: outcome.itemId, agent: agent.thread_id, reason }),
             }],
           };
         },

@@ -26,7 +26,8 @@ Skill impact: none — <why this change touches no behavior those surfaces depen
 
 Format rules, all enforced by the check:
 
-- an optional list marker, then the exact keyword `Skill impact:`, then
+- an optional list marker — blockquote, heading and emphasis decoration around
+  the keyword is tolerated — then the exact keyword `Skill impact:`, then
   `updated` or `none`, then a separator (`—`, `–` or `-`), then a rationale;
 - the rationale must be real prose: not empty, no `<placeholder>` text, and not
   a bare `todo`, `tbd`, `n/a`, `na`, `none`, `no impact`, `not applicable` or
@@ -56,7 +57,7 @@ the unedited template deliberately fails the check.
 ## Run it locally
 
 ```sh
-node scripts/check-skill-impact.mjs                          # this checkout, no PR metadata
+node scripts/check-skill-impact.mjs --no-diff                # this checkout, diff rules see an empty diff
 node scripts/check-skill-impact.mjs --changed server.ts,skills/ultragoal/SKILL.md
 node scripts/check-skill-impact.mjs --body-file pr-body.md --changed server.ts
 node scripts/check-skill-impact.mjs --base origin/main --head HEAD
@@ -67,9 +68,14 @@ node --test scripts/check-skill-impact.test.mjs              # checker's own tes
 Exit codes: `0` pass, `1` violations (one `skill-impact:` line per violation),
 `2` usage or setup error. The checker is dependency-free, never writes files and
 never uses the network. Flags are `--root`, `--body-file`, `--changed`, `--base`,
-`--head` and `--json`; anything not passed explicitly falls back to the
-`pull_request` payload at `GITHUB_EVENT_PATH` (body, `base.sha`, `head.sha`),
-and changed paths fall back to a local `git diff --name-only <base>...<head>`.
+`--head`, `--no-diff` and `--json`; anything not passed explicitly falls back to
+the `pull_request` payload at `GITHUB_EVENT_PATH` (body, `base.sha`,
+`head.sha`), and changed paths fall back to a local
+`git diff --name-only --no-renames -z <base>...<head>` (renames and deletions
+are visible as changes to their old path, and non-ASCII paths are not quoted).
+With no changed-path source at all — no `--changed`, no `--base` with `--head`,
+no payload carrying both shas, no `--no-diff` — the check exits `2` instead of
+silently evaluating an empty diff and reporting success.
 
 ## CI and the required check
 

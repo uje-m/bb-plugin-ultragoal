@@ -3,7 +3,7 @@
 // Run: node --test scripts/check-skill-impact.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -79,6 +79,20 @@ function bodyArgs(root, body) {
   const path = join(root, "pr-body.md");
   writeFileSync(path, body);
   return ["--body-file", path];
+}
+
+// Local git with a hermetic config, so a fixture repository can drive the
+// checker's `git diff` path without touching the host's git config.
+function gitIn(root) {
+  return (...args) => {
+    const proc = spawnSync(
+      "git",
+      ["-C", root, "-c", "user.name=gate", "-c", "user.email=gate@example.invalid", "-c", "commit.gpgsign=false", ...args],
+      { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } },
+    );
+    assert.equal(proc.status, 0, `git ${args.join(" ")}: ${proc.stderr}`);
+    return proc.stdout.trim();
+  };
 }
 
 function withRepo(overrides, fn) {
@@ -269,6 +283,14 @@ test("role-aware allowance: a worker-only registered tool is accepted, prose par
         "Workers close the slice with `slice_done`. Also `plan_status`, `token_budget` and `remove_item_ids` " +
         "are parameters, not tools.\n",
       "templates/goals/continuation.md": "Close with `slice_done`.\n",
+      // Registrations that exist only to exercise tests or repository scripts
+      // are not shipped behavior and must not widen the canonical registry: this
+      // checker's own test file registers `ultragoal_*`/`slice_*` literals the
+      // same way, and without the exclusion these `plan_*`/`token_*` literals
+      // would turn the documented `plan_status`/`token_budget` parameters into
+      // unknown-tool violations.
+      "lib/probe.test.ts": 'bb.agents.registerTool({ name: "plan_start" });\n',
+      "scripts/probe-fixture.mjs": 'bb.agents.registerTool({ name: "token_probe" });\n',
     },
     (root) => {
       const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
@@ -300,15 +322,7 @@ test("the payload supplies the body and changed paths for a fork PR with no toke
 
 test("base/head from the payload resolve the diff with local git, never the API", () => {
   withRepo({}, (root) => {
-    const git = (...args) => {
-      const proc = spawnSync(
-        "git",
-        ["-C", root, "-c", "user.name=gate", "-c", "user.email=gate@example.invalid", "-c", "commit.gpgsign=false", ...args],
-        { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } },
-      );
-      assert.equal(proc.status, 0, `git ${args.join(" ")}: ${proc.stderr}`);
-      return proc.stdout.trim();
-    };
+    const git = gitIn(root);
     git("init", "-q");
     git("add", "-A");
     git("commit", "-q", "-m", "baseline");
@@ -344,6 +358,152 @@ test("usage and setup errors exit 2", () => {
     assert.equal(missingRoot.status, 2, missingRoot.stderr);
   });
 });
+
+// Without a changed-path source the gate must refuse to answer rather than
+// report success for an unknown diff; --no-diff is the explicit opt-out.
+test("no changed-path source is a setup error unless --no-diff is explicit", () => {
+  withRepo({}, (root) => {
+    const bare = runChecker(root, [...bodyArgs(root, GOOD_NONE)]);
+    assert.equal(bare.status, 2, bare.out);
+    assert.match(bare.out, /skill-impact: usage: no changed-path source/);
+
+    const optedOut = runChecker(root, [...bodyArgs(root, GOOD_NONE), "--no-diff"]);
+    assert.equal(optedOut.status, 0, optedOut.out);
+
+    const eventPath = join(root, "event.json");
+    writeFileSync(eventPath, JSON.stringify({ pull_request: { body: GOOD_NONE } }));
+    const malformedPayload = runChecker(root, [], { GITHUB_EVENT_PATH: eventPath });
+    assert.equal(malformedPayload.status, 2, malformedPayload.out);
+  });
+});
+
+// Test-only and script-only registrations are exercised in the role-aware test
+// above; this one proves the registry still accepts a `name` literal that sits
+// past a long description, which a fixed-width slice would drop.
+test("a registerTool name literal is found wherever it sits in the registration object", () => {
+  withRepo(
+    {
+      "server.ts":
+        'bb.agents.registerTool({\n' +
+        `  description: "${"x".repeat(450)}",\n` +
+        '  name: "mytool_foo",\n' +
+        '});\n' +
+        'bb.agents.configure(() => ({ tools: ["mytool_foo"] }));\n',
+      "skills/demo/SKILL.md": `---\nname: demo\ndescription: Demo.\n---\n\nCall \`mytool_bar\` now.\n`,
+    },
+    (root) => {
+      const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+      assert.equal(status, 1, out);
+      assert.match(out, /mytool_bar/);
+    },
+  );
+});
+
+// A rename out of skills/ or templates/ must not hide the deletion: the gate
+// has to see the old path, not only the rename destination.
+test("a skill or template moved away still requires a declaration", () => {
+  withRepo(
+    {
+      "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: Alpha skill.\n---\n\nBody.\n",
+      "templates/goals/continuation.md": "Continue.\n",
+    },
+    (root) => {
+      const git = gitIn(root);
+      git("init", "-q");
+      git("add", "-A");
+      git("commit", "-q", "-m", "baseline");
+      const base = git("rev-parse", "HEAD");
+
+      mkdirSync(join(root, "docs"), { recursive: true });
+      git("mv", "skills/alpha/SKILL.md", "docs/alpha.md");
+      git("mv", "templates/goals/continuation.md", "docs/continuation.md");
+      git("commit", "-q", "-m", "move content out of the bundled roots");
+      const head = git("rev-parse", "HEAD");
+
+      const eventPath = join(root, "event.json");
+      writeFileSync(
+        eventPath,
+        JSON.stringify({ pull_request: { body: GOOD_NONE, base: { sha: base }, head: { sha: head } } }),
+      );
+      const { status, out } = runChecker(root, [], { GITHUB_EVENT_PATH: eventPath });
+      assert.equal(status, 1, out);
+      assert.match(out, /skills\/alpha\/SKILL\.md/);
+      assert.match(out, /templates\/goals\/continuation\.md/);
+    },
+  );
+});
+
+// C-quoted diff output made `skills/café/SKILL.md` look like a path that starts
+// outside every behavior-affecting prefix, so an undeclared skills change passed.
+test("a non-ASCII path is still behavior-affecting", () => {
+  withRepo({}, (root) => {
+    const git = gitIn(root);
+    git("init", "-q");
+    git("add", "-A");
+    git("commit", "-q", "-m", "baseline");
+    const base = git("rev-parse", "HEAD");
+
+    mkdirSync(join(root, "skills", "café"), { recursive: true });
+    writeFileSync(
+      join(root, "skills", "café", "SKILL.md"),
+      "---\nname: café\ndescription: Accented skill.\n---\n\nBody.\n",
+    );
+    git("add", "-A");
+    git("commit", "-q", "-m", "accented skill");
+    const head = git("rev-parse", "HEAD");
+
+    const eventPath = join(root, "event.json");
+    writeFileSync(eventPath, JSON.stringify({ pull_request: { body: "", base: { sha: base }, head: { sha: head } } }));
+    const { status, out } = runChecker(root, [], { GITHUB_EVENT_PATH: eventPath });
+    assert.equal(status, 1, out);
+    assert.match(out, /skills\/café\/SKILL\.md/);
+  });
+});
+
+// A declaration wrapped in Markdown decoration is still an attempt, so the
+// format, contradiction and duplicate rules apply to it.
+test("a decorated declaration is validated instead of being ignored", () => {
+  withRepo({}, (root) => {
+    const blockquoted = runChecker(root, [
+      ...bodyArgs(root, "> Skill impact: none — a real rationale for the change."),
+      "--changed",
+      "skills/demo/SKILL.md",
+    ]);
+    assert.equal(blockquoted.status, 1, blockquoted.out);
+    assert.match(blockquoted.out, /declaration-contradiction/);
+    assert.match(blockquoted.out, /line 1/);
+
+    const duplicate = runChecker(root, [
+      ...bodyArgs(root, "**Skill impact: none** — a real rationale.\n\n> **Skill impact: none** — another real rationale."),
+      "--changed",
+      "docs/notes.md",
+    ]);
+    assert.equal(duplicate.status, 1, duplicate.out);
+    assert.match(duplicate.out, /duplicate-declaration/);
+    assert.match(duplicate.out, /lines 1, 3/);
+
+    const malformed = runChecker(root, [...bodyArgs(root, "**Skill impact:** none"), "--changed", "docs/notes.md"]);
+    assert.equal(malformed.status, 1, malformed.out);
+    assert.match(malformed.out, /malformed-declaration/);
+  });
+});
+
+// Reading a file the gate needs can fail for reasons the repository cannot
+// influence (permissions, a broken mount); that is a setup error, not a pass
+// and not a violation.
+test(
+  "an unreadable skill document is a setup error",
+  { skip: typeof process.getuid === "function" && process.getuid() === 0 },
+  () => {
+    withRepo({}, (root) => {
+      chmodSync(join(root, "skills", "demo", "SKILL.md"), 0o000);
+      const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+      assert.equal(status, 2, out);
+      assert.match(out, /skill-impact: usage: cannot read/);
+      assert.match(out, /SKILL\.md/);
+    });
+  },
+);
 
 test("the evaluation entry point is exported and --json reports the same result", () => {
   withRepo({}, (root) => {

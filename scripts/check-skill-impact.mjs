@@ -11,11 +11,13 @@
 //
 // Inputs come from explicit flags, otherwise from the GitHub `pull_request`
 // event payload at GITHUB_EVENT_PATH. Changed paths come from --changed or from
-// a local `git diff --name-only <base>...<head>`; the GitHub API is never
-// called, so fork PRs need no token or secret.
+// a local `git diff --name-only --no-renames -z <base>...<head>`; the GitHub API
+// is never called, so fork PRs need no token or secret. Without a changed-path
+// source the check is a setup error instead of silently evaluating an empty
+// diff, unless --no-diff is passed explicitly.
 //
 //   node scripts/check-skill-impact.mjs [--root DIR] [--body-file FILE]
-//     [--changed path,path] [--base SHA] [--head SHA] [--json]
+//     [--changed path,path] [--base SHA] [--head SHA] [--no-diff] [--json]
 //
 // Exit 0 pass | 1 violations (one stdout line per violation) | 2 usage/setup.
 import { execFileSync } from "node:child_process";
@@ -35,8 +37,12 @@ const PLACEHOLDER_RATIONALES = new Set([
   "no change",
 ]);
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "coverage"]);
-const DECLARATION_LINE = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?Skill impact:\s*(.*)$/i;
-const DECLARATION_BODY = /^(updated|none)\s*(—|–|-)\s*([\s\S]*)$/i;
+// Markdown decoration (blockquote, heading, emphasis) must not hide a
+// declaration: a decorated "Skill impact:" line is still an attempt, so the
+// format and contradiction rules apply to it either way.
+const DECLARATION_LINE =
+  /^\s*(?:>\s*)*(?:#{1,6}\s*)?(?:[-*+]\s+|\d+[.)]\s+)?(?:\*\*|__|\*|_)?\s*Skill impact:\s*(.*)$/i;
+const DECLARATION_BODY = /^\s*(?:\*\*|__|\*|_)?\s*(updated|none)\s*(?:\*\*|__|\*|_)?\s*(—|–|-)\s*([\s\S]*)$/i;
 
 /** A path whose change can alter tool, command, orchestration, permission or instruction behavior. */
 export function isBehaviorAffectingPath(path) {
@@ -58,7 +64,7 @@ export function parseDeclarationLine(line) {
     return { problem: `malformed "Skill impact:" line — expected "Skill impact: updated|none <separator> rationale"` };
   }
   const kind = declaration[1].toLowerCase();
-  const rationale = declaration[3].trim();
+  const rationale = declaration[3].replace(/(?:\*\*|__)\s*$/, "").trim();
   if (!rationale) return { problem: `"Skill impact: ${kind}" has an empty rationale` };
   if (/<[^>]*>/.test(rationale)) return { problem: `"Skill impact: ${kind}" rationale still contains a template placeholder` };
   const bare = rationale.replace(/\.+$/, "").trim().toLowerCase();
@@ -159,6 +165,15 @@ const isDirectory = (path) => {
   }
 };
 
+/** Read a file the gate needs; an unreadable file is a setup error, not a violation. */
+function readText(path) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    throw new UsageError(`cannot read ${path}: ${error.message}`);
+  }
+}
+
 function parseFrontmatter(text) {
   if (!text.startsWith("---")) return null;
   const end = text.indexOf("\n---", 3);
@@ -216,7 +231,7 @@ function packagingViolations(root) {
         violations.push({ rule: "packaging", message: `${label} is missing (every directory under ${skillRoot}/ must ship a SKILL.md)` });
         continue;
       }
-      const fields = parseFrontmatter(readFileSync(docPath, "utf8"));
+      const fields = parseFrontmatter(readText(docPath));
       if (!fields) {
         violations.push({ rule: "packaging", message: `${label} has no YAML frontmatter` });
         continue;
@@ -234,16 +249,48 @@ function packagingViolations(root) {
   return violations;
 }
 
-function readBracketBody(text, openIndex) {
+// Index of the closing quote of the string literal that starts at `start`.
+function endOfString(text, start) {
+  const quote = text[start];
+  for (let index = start + 1; index < text.length; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (text[index] === quote) return index;
+  }
+  return text.length - 1;
+}
+
+// Body of the literal opened at `openIndex`, found by matching `open`/`close`
+// with depth counting that ignores string contents — so a brace or bracket
+// inside a description or a nested schema never truncates the body.
+function readBalancedBody(text, openIndex, open, close) {
   let depth = 0;
   for (let index = openIndex; index < text.length; index += 1) {
-    if (text[index] === "[") depth += 1;
-    else if (text[index] === "]") {
+    const char = text[index];
+    if (char === '"' || char === "'" || char === "`") {
+      index = endOfString(text, index);
+      continue;
+    }
+    if (char === open) depth += 1;
+    else if (char === close) {
       depth -= 1;
       if (depth === 0) return text.slice(openIndex + 1, index);
     }
   }
   return text.slice(openIndex + 1);
+}
+
+// The canonical registry describes shipped behavior, so registrations that only
+// exist to exercise tests or repository scripts must not widen a family: a
+// fixture `plan_*` tool would otherwise turn documented `plan_status` parameters
+// into unknown-tool violations.
+function isTestOrToolingSource(path) {
+  return (
+    /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) ||
+    /(^|\/)(test|tests|__tests__|__mocks__|fixtures|scripts)\//.test(path)
+  );
 }
 
 // Canonical registry: every registerTool name literal plus the COLLAB_TOOL_NAMES
@@ -252,11 +299,15 @@ function readBracketBody(text, openIndex) {
 function collectRegistry(root) {
   const registered = new Set();
   const collab = new Set();
-  const sources = listFiles(root, (path) => /\.(ts|tsx|mts|cts|mjs|cjs|js)$/.test(path));
+  const sources = listFiles(root, (path) => {
+    if (!/\.(ts|tsx|mts|cts|mjs|cjs|js)$/.test(path)) return false;
+    return !isTestOrToolingSource(relative(root, path).split(sep).join("/"));
+  });
   for (const source of sources) {
-    const text = readFileSync(source, "utf8");
+    const text = readText(source);
     for (const match of text.matchAll(/registerTool\s*\(\s*\{/g)) {
-      const name = text.slice(match.index, match.index + 400).match(/\bname\s*:\s*"([^"]+)"/);
+      const body = readBalancedBody(text, match.index + match[0].length - 1, "{", "}");
+      const name = body.match(/\bname\s*:\s*"([^"]+)"/);
       if (name) registered.add(name[1]);
     }
     for (const match of text.matchAll(/COLLAB_TOOL_NAMES\s*=\s*\[([\s\S]*?)\]/g)) {
@@ -266,9 +317,9 @@ function collectRegistry(root) {
   const surfaces = new Set();
   const serverPath = join(root, "server.ts");
   if (isFile(serverPath)) {
-    const text = readFileSync(serverPath, "utf8");
+    const text = readText(serverPath);
     for (const match of text.matchAll(/tools\s*:\s*\[/g)) {
-      const body = readBracketBody(text, match.index + match[0].length - 1);
+      const body = readBalancedBody(text, match.index + match[0].length - 1, "[", "]");
       for (const name of body.matchAll(/"([^"]+)"/g)) surfaces.add(name[1]);
       if (/\.\.\.\s*COLLAB_TOOL_NAMES\b/.test(body)) for (const name of collab) surfaces.add(name);
     }
@@ -284,7 +335,7 @@ function documentedTools(root) {
   const documented = [];
   for (const doc of docs) {
     const path = relative(root, doc).split(sep).join("/");
-    for (const match of readFileSync(doc, "utf8").matchAll(/`([^`\n]+)`/g)) {
+    for (const match of readText(doc).matchAll(/`([^`\n]+)`/g)) {
       const name = match[1].trim();
       if (!/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(name)) continue;
       documented.push({ name, path });
@@ -324,7 +375,7 @@ export function evaluateSkillImpact({ root = process.cwd(), body = "", changedPa
 class UsageError extends Error {}
 
 function parseArgs(argv) {
-  const flags = { root: null, bodyFile: null, changed: null, base: null, head: null, json: false };
+  const flags = { root: null, bodyFile: null, changed: null, base: null, head: null, noDiff: false, json: false };
   const takeValue = (arg, index) => {
     if (index >= argv.length) throw new UsageError(`${arg} requires a value`);
     return argv[index];
@@ -348,6 +399,9 @@ function parseArgs(argv) {
         break;
       case "--head":
         flags.head = inline ?? takeValue(arg, ++index);
+        break;
+      case "--no-diff":
+        flags.noDiff = true;
         break;
       case "--json":
         flags.json = true;
@@ -382,10 +436,17 @@ function resolveInputs(flags) {
   let changedPaths;
   if (flags.changed !== null) {
     changedPaths = flags.changed.split(",");
+  } else if (flags.noDiff) {
+    changedPaths = [];
   } else {
     const base = flags.base || payload.base;
     const head = flags.head || payload.head;
-    changedPaths = base && head ? gitChangedPaths(root, base, head) : [];
+    if (!base || !head) {
+      throw new UsageError(
+        "no changed-path source: pass --changed, --base/--head or --no-diff; GITHUB_EVENT_PATH must carry pull_request.base.sha and pull_request.head.sha",
+      );
+    }
+    changedPaths = gitChangedPaths(root, base, head);
   }
   return { root, body, changedPaths };
 }
@@ -398,12 +459,18 @@ function readFile(path) {
   }
 }
 
+// `-z` plus `core.quotepath=off` keeps non-ASCII paths unquoted, and
+// `--no-renames` reports both sides of a rename so a skill or template moved
+// away is still visible as a change to its old path.
 function gitChangedPaths(root, base, head) {
   try {
-    return execFileSync("git", ["-C", root, "diff", "--name-only", `${base}...${head}`], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-    }).split("\n");
+    return execFileSync(
+      "git",
+      ["-C", root, "-c", "core.quotepath=off", "diff", "--name-only", "--no-renames", "-z", `${base}...${head}`],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    )
+      .split("\0")
+      .filter(Boolean);
   } catch (error) {
     const detail = String(error.stderr ?? error.message).trim();
     throw new UsageError(`git diff --name-only ${base}...${head} failed: ${detail}`);

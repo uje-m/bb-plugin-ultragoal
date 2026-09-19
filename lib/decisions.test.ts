@@ -607,3 +607,105 @@ describe("owner decision delivery", () => {
     assert.deepEqual(settledBoard.goal.pendingDeliveryDecisions, []);
   });
 });
+
+describe("owner decision resolution", () => {
+  // The store only persists a decision under an owner key that names a goal
+  // row, so each fixture renames the sentinel goal to its own owner thread and
+  // drives the resolution seam directly: no server tool, no CLI.
+  function storeOnOwner() {
+    const host = registeredHost();
+    const owner = `thr_resolution_${hosts.length}`;
+    host.bb.storage
+      .database()
+      .prepare("UPDATE goals SET thread_id = ? WHERE thread_id = 'thr_sentinel'")
+      .run(owner);
+    return { host, owner, decisions: createDecisionStore(host.bb) };
+  }
+
+  it("keeps the first answer when a conflicting answer arrives", () => {
+    const { owner, decisions } = storeOnOwner();
+    const requested = decisions.request(owner, {
+      question: "Which answer wins?",
+      options: ["first", "second"],
+    });
+    const first = decisions.resolve(owner, requested.id, "answered", "first");
+    assert.equal(first?.status, "answered");
+    assert.equal(first?.answer, "first");
+
+    const conflicting = decisions.resolve(owner, requested.id, "answered", "second");
+    assert.equal(conflicting?.status, "answered", "the committed status is unchanged");
+    assert.equal(conflicting?.answer, "first", "the first answer wins, not the conflicting one");
+    assert.equal(decisions.get(owner, requested.id)?.answer, "first");
+  });
+
+  it("leaves a committed answer intact when a withdrawal arrives later", () => {
+    const { owner, decisions } = storeOnOwner();
+    const requested = decisions.request(owner, { question: "Answer before it is withdrawn?" });
+    decisions.resolve(owner, requested.id, "answered", "keep this answer");
+
+    const withdrawn = decisions.resolve(owner, requested.id, "withdrawn", "moot now");
+    assert.equal(withdrawn?.status, "answered");
+    assert.equal(withdrawn?.answer, "keep this answer");
+    assert.deepEqual(
+      decisions.list(owner).map((decision) => [decision.status, decision.answer]),
+      [["answered", "keep this answer"]],
+    );
+  });
+
+  it("keeps a committed withdrawal when an answer arrives later", () => {
+    const { owner, decisions } = storeOnOwner();
+    const requested = decisions.request(owner, { question: "Withdrawn before it is answered?" });
+    const withdrawn = decisions.resolve(owner, requested.id, "withdrawn", "no longer needed");
+    assert.equal(withdrawn?.status, "withdrawn");
+
+    const later = decisions.resolve(owner, requested.id, "answered", "answer after the withdrawal");
+    assert.equal(later?.status, "withdrawn");
+    assert.equal(later?.answer, "no longer needed");
+    assert.deepEqual(
+      decisions.listUndelivered(owner),
+      [],
+      "a withdrawal is never an owner answer awaiting delivery",
+    );
+  });
+
+  it("returns the committed decision without rewriting the row on a retry or a conflict", () => {
+    const { host, owner, decisions } = storeOnOwner();
+    const db = host.bb.storage.database();
+    const requested = decisions.request(owner, { question: "Retry the same answer?" });
+    const committed = decisions.resolve(owner, requested.id, "answered", "the answer");
+
+    // Physical writes only: a guarded UPDATE that matches no row fires this
+    // trigger zero times, so it proves the resolved row was not rewritten.
+    db.exec(`
+      CREATE TABLE decision_writes (n INTEGER NOT NULL);
+      INSERT INTO decision_writes VALUES (0);
+      CREATE TRIGGER count_decision_writes AFTER UPDATE ON goal_decisions
+      BEGIN
+        UPDATE decision_writes SET n = n + 1;
+      END;
+    `);
+
+    assert.deepEqual(
+      decisions.resolve(owner, requested.id, "answered", "the answer"),
+      committed,
+      "an identical retry returns the committed decision",
+    );
+    assert.deepEqual(
+      decisions.resolve(owner, requested.id, "answered", "a different answer"),
+      committed,
+    );
+    assert.deepEqual(decisions.resolve(owner, requested.id, "withdrawn", "moot"), committed);
+    assert.equal(
+      (db.prepare("SELECT n FROM decision_writes").get() as { n: number }).n,
+      0,
+      "a retry or a conflict must not write the resolved row again",
+    );
+  });
+
+  it("resolves an unknown decision id to null", () => {
+    const { owner, decisions } = storeOnOwner();
+    assert.equal(decisions.resolve(owner, "dec_missing", "answered", "no such decision"), null);
+    assert.equal(decisions.resolve(owner, "dec_missing", "withdrawn", "no such decision"), null);
+    assert.deepEqual(decisions.list(owner), [], "a null resolution persists no row");
+  });
+});

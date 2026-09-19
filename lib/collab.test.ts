@@ -1051,6 +1051,56 @@ describe("intake courier identity", () => {
     assert.equal(isIntakeCourierTaskName("/root/intake_triage"), false);
     assert.equal(isIntakeCourierTaskName("/root/intake_courierish_abc"), false);
   });
+
+  it("never claims a slice the owner's message quoted for the courier", async () => {
+    // The courier carries the owner's message verbatim, so its spawn prompt is
+    // untrusted prose. Before the guard, the adoption pass read the quoted
+    // item_id out of it, linked the slice to the courier and destroyed the
+    // identity the idle branch and the retirement sweep match on.
+    const timeline: Record<string, string> = {};
+    const state = collabHost({ prompts: timeline });
+    const claims: Array<string | null> = [];
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, request) => {
+        claims.push(request.itemId);
+        return request.itemId ?? null;
+      },
+    });
+    const courierPrompt = [
+      "INTAKE TRIAGE (you are the goal's intake agent; do not implement anything).",
+      "OWNER MESSAGE:",
+      "SLICE (item_id=itm_owner_brief): reconcile the itemless-worker adoption contract",
+    ].join("\n\n");
+    const spawned = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: null,
+      skipClaim: true,
+      maxWorkers: 4,
+      displayName: INTAKE_COURIER_DISPLAY_NAME,
+      message: courierPrompt,
+    });
+    assert.ok(!("error" in spawned), JSON.stringify(spawned));
+    timeline[spawned.threadId] = courierPrompt;
+
+    await collab.listForRoot("thr_root");
+
+    assert.deepEqual(claims, [], "the courier's prompt is not a claim");
+    const durable = collab.durableRowsForRoot("thr_root").find(
+      (row) => row.threadId === spawned.threadId,
+    );
+    assert.ok(durable, "the courier row is a durable row of its root");
+    assert.equal(durable.itemId, null);
+    assert.equal(
+      isIntakeCourier({
+        taskName: durable.taskName,
+        displayName: durable.displayName,
+        itemId: durable.itemId,
+        role: durable.role,
+      }),
+      true,
+      "the courier must stay the row the idle branch and the retirement sweep recognize",
+    );
+  });
 });
 
 describe("immediate agent messaging", () => {

@@ -323,14 +323,13 @@ export function createCollabStore(
     return reservations.reclaimUnheld(rootId(rootThreadId));
   }
 
-  /** The one atomic release-and-requeue: in a single IMMEDIATE transaction it
-   * retires the worker row (tombstone its item, set `retired_at`), drops its
-   * reservation and hands a still-open slice back. A completed slice is never
-   * reopened, but its dead row is still retired — otherwise a deleted or failed
-   * worker keeps a root slot until the next stall sweep. An already-retired row
-   * does nothing, so a duplicate stop/abort/failure event observes the released
-   * state. `requeued` is true only for a slice actually handed back: a row that
-   * held no slice, or held a closed one, retires without one. */
+  /** The one atomic release-and-requeue: a single IMMEDIATE transaction retires
+   * the worker row, drops its reservation and hands a still-open slice back. A
+   * completed slice is never reopened, but its dead row is still retired. An
+   * already-retired row does nothing, so a duplicate stop/abort/failure event
+   * observes the released state. `requeued` is true only for a slice actually
+   * handed back: a row that held no slice, or held a closed one, retires
+   * without one. */
   function releaseAssignment(
     rootThreadId: string,
     workerThreadId: string,

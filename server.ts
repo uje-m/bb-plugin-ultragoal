@@ -508,8 +508,8 @@ export default function plugin(bb: BbPluginApi) {
   // the store object — and it lets scheduleReady read the fence directly
   // instead of projecting the crew.
   const reservations = createItemReservationStore(bb.storage.database());
-  // Durable launch-attempt and scheduling generations. Both live in SQLite so a
-  // plugin reload resumes the ladder and the owed pass instead of resetting eit
+  // Durable launch-attempt and scheduling generations: SQLite, so a reload
+  // resumes the ladder and the owed pass instead of resetting either.
   const launchAttempts = createLaunchAttemptStore(bb.storage.database());
   const scheduleGenerations = createSchedulerGenerationStore(bb.storage.database());
 
@@ -1025,10 +1025,9 @@ export default function plugin(bb: BbPluginApi) {
     });
   }
 
-  /** Give exactly one releasing generation back to the queue. The atomic
-   * transition lives in `collab.releaseAssignment`; publishing and scheduling
-   * happen only when it retired a row, through `onReleased`. A transient DB
-   * failure is logged, never thrown out of a detached event listener. */
+  /** Release one worker's slice through the atomic transition in
+   * `collab.releaseAssignment`. A transient DB failure is logged, never thrown
+   * out of a detached event listener. */
   function releaseWorkerSlice(
     rootThreadId: string,
     workerThreadId: string,
@@ -1089,10 +1088,9 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function scheduleReady(rootThreadId: string): Promise<void> {
-    // Best-effort pass: callers invoke this detached, so a host or SDK failure
-    // that lands after they returned must not surface as an unhandled rejection.
-    // The durable generation is only serviced at the end of a completed pass, so
-    // a failed one stays owed and the next trigger (or reload) services it.
+    // Callers invoke this detached, so a host or SDK failure after they returned
+    // must not surface as an unhandled rejection. A failed pass leaves its
+    // generation owed, so the next trigger (or reload) services it.
     try {
       const goal = store.get(rootThreadId);
       // Every trigger advances the durable generation before any early return: a
@@ -1141,11 +1139,9 @@ export default function plugin(bb: BbPluginApi) {
       if (!collab.setWorkerCap(rootThreadId, maxWorkers)) return;
       if (!(await hydrateSchedulerOwnership(rootThreadId))) return;
       if (maxWorkers <= 0) return;
-      // A process killed between a reservation's `acquire` and its worker-row
-      // insert leaves a row with no owner and no spawn in flight: it consumes a
-      // root slot for good and blocks every later `acquire` for that slice.
-      // Reclaim it at pass entry and hand a slice the dead spawn claimed back
-      // to ready. Never time-keyed: a live worker or in-flight spawn is kept.
+      // A process killed between `acquire` and its worker-row insert leaves a
+      // row with no owner and no spawn in flight, consuming a root slot for
+      // good. Reclaim it at pass entry; a live worker or in-flight spawn is kept.
       for (const itemId of collab.reclaimItemReservations(rootThreadId)) {
         const claimed = items.list(rootThreadId).find((row) => row.id === itemId);
         if (claimed?.status === "in_progress") items.setStatus(rootThreadId, itemId, "pending");
@@ -1241,11 +1237,10 @@ export default function plugin(bb: BbPluginApi) {
           return;
         }
         let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
-        // Consume one durable launch attempt BEFORE dispatch: a crash between
-        // this record and the spawn burns the attempt instead of double-
-        // launching, and the 15s/1m/5m ladder is the only pacing. A generation
-        // that ended in a durable block returns null, so no pass — pulse
-        // included — can restart an exhausted slice.
+        // Consume one durable attempt BEFORE dispatch: a crash between this
+        // record and the spawn burns the attempt instead of double-launching,
+        // and the 15s/1m/5m ladder is the only pacing. A generation that ended
+        // in a durable block returns false, so no pass can restart it.
         if (!launchAttempts.begin(rootThreadId, item.id, now)) continue;
         try {
           result = await collab.spawnWorker({

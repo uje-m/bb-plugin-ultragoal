@@ -3,12 +3,9 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 
-/**
- * Reservations never expire: a slot ends at `release`, `commit`, or an
- * authoritative "launch is dead" signal, never on a clock. `expires_at` stays
- * only because the shared capacity triggers count rows rather than expiry; it
- * is written beyond any clock and read by nothing.
- */
+/** Reservations never expire: a slot ends at `release`, `commit`, or an
+ * authoritative "launch is dead" signal, never on a clock. `expires_at` is
+ * written beyond any clock and read by nothing. */
 const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 
 /** Initial attempt plus retries at 15s, 1m and 5m, then a durable block — which
@@ -262,11 +259,9 @@ export function createItemReservationStore(db: PluginDatabase) {
 
     /**
      * Reclaim reservations no owner can reach: no live worker row for the item
-     * and no spawn of this store still holding the token. A process killed
-     * between `acquire` and the worker insert leaves exactly that row, and it
-     * consumes a root slot forever. Non-temporal: a slot a worker, or a spawn
-     * that may still land, holds is never touched. Returns the reclaimed item
-     * ids so the caller can requeue their slices.
+     * and no spawn of this store still holding the token. Non-temporal: a slot a
+     * live worker, or a spawn that may still land, holds is never touched.
+     * Returns the reclaimed item ids so the caller can requeue their slices.
      */
     reclaimUnheld(rootThreadId: string): string[] {
       const txn = db.transaction((): string[] => {

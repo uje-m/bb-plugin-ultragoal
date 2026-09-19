@@ -813,12 +813,8 @@ function liveGoal(rootId: string, maxWorkers: number) {
   let openGate: (() => void) | null = null;
   const thread = (threadId: string, status: string) =>
     makeThreadResponse({
-      id: threadId,
-      projectId: "proj",
-      providerId: "codex",
-      environmentId: null,
-      parentThreadId: threadId === rootId ? null : rootId,
-      status: status as never,
+      id: threadId, projectId: "proj", providerId: "codex", environmentId: null,
+      parentThreadId: threadId === rootId ? null : rootId, status: status as never,
     });
   const host = createFakePluginHost({
     pluginId: `ultragoal-scheduler-${hosts.length}`,
@@ -839,11 +835,8 @@ function liveGoal(rootId: string, maxWorkers: number) {
         },
         events: {
           list: async (args: {
-            threadId: string;
-            types?: readonly string[];
-            order?: string;
-            limit?: string;
-            afterSeq?: string;
+            threadId: string; types?: readonly string[]; order?: string;
+            limit?: string; afterSeq?: string;
           }) => {
             if (eventReadFails) throw new Error("event projection read failed");
             let rows = [...(events.get(args.threadId) ?? [])].sort((a, b) => a.seq - b.seq);
@@ -859,10 +852,8 @@ function liveGoal(rootId: string, maxWorkers: number) {
           if (gate) await gate;
           if (spawnFailure) throw new Error(spawnFailure);
           const id = `thr_spawn_${spawnCalls}`;
-          spawns.push({
-            threadId: id,
-            itemId: /item_id=(itm_[A-Za-z0-9_]+)/.exec(args.prompt ?? "")?.[1] ?? null,
-          });
+          const itemId = /item_id=(itm_[A-Za-z0-9_]+)/.exec(args.prompt ?? "")?.[1] ?? null;
+          spawns.push({ threadId: id, itemId });
           statuses.set(id, "active");
           return thread(id, "active");
         },
@@ -892,15 +883,14 @@ function liveGoal(rootId: string, maxWorkers: number) {
   const one = <T,>(sql: string, ...params: unknown[]): T | undefined =>
     db.prepare(sql).get(...params) as T | undefined;
   return {
-    host, db, rootId, items, settle, stopped, spawns,
+    host, db, settle, stopped,
     spawnCalls: () => spawnCalls,
     spawnsFor: (itemId: string) => spawns.filter((spawn) => spawn.itemId === itemId),
     pulse: (from: FakePluginHost = host) =>
       drain(from.harness.behavior.runService("progress-pulse"), settle),
     emitIdle: async (threadId: string, text = "") => {
       await host.harness.behavior.emitThreadEvent("thread.idle", {
-        thread: thread(threadId, "idle"),
-        lastAssistantText: text,
+        thread: thread(threadId, "idle"), lastAssistantText: text,
       } as never);
       await settle(80);
     },
@@ -931,30 +921,15 @@ function liveGoal(rootId: string, maxWorkers: number) {
         rootId,
       ),
     attempt: (itemId: string) =>
-      one<{
-        attempt_count: number;
-        next_due_at: number | null;
-        last_attempt_at: number;
-        blocked_at: number | null;
-      }>(
+      one<{ attempt_count: number; next_due_at: number | null; last_attempt_at: number; blocked_at: number | null }>(
         "SELECT attempt_count, next_due_at, last_attempt_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
         rootId,
         itemId,
       ),
-    failSpawn: (message: string | null) => {
-      spawnFailure = message;
-    },
-    failStop: (message: string | null) => {
-      stopFailure = message;
-    },
-    failEventRead: () => {
-      eventReadFails = true;
-    },
-    holdSpawn: () => {
-      gate = new Promise<void>((resolve) => {
-        openGate = resolve;
-      });
-    },
+    failSpawn: (message: string | null) => { spawnFailure = message; },
+    failStop: (message: string | null) => { stopFailure = message; },
+    failEventRead: () => { eventReadFails = true; },
+    holdSpawn: () => { gate = new Promise<void>((resolve) => { openGate = resolve; }); },
     releaseSpawn: () => {
       openGate?.();
       gate = null;

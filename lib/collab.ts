@@ -6,7 +6,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { isPromptLikeTitle, shortSliceTitle } from "./titles.js";
 import { z } from "zod";
 import type { GoalAgent, GoalAgentRole, GoalAgentStatus } from "../contract.js";
-import { auditorNameFor, nextHumorousName, slugFromName, workRelatedName } from "./names.js";
+import { auditorNameFor, slugFromName, workRelatedName } from "./names.js";
 import { workerQualityBrief } from "./prompts.js";
 import { isReasoningLevel, type ReasoningLevel, type ServiceTier } from "./execution.js";
 import { createItemReservationStore } from "./item-reservations.js";
@@ -1546,6 +1546,7 @@ export function createCollabStore(
               } catch {
                 // Timed out or interrupted for this agent.
               }
+              return;
             }),
           );
           if (updated.length === 0) {

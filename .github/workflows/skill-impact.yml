@@ -1,0 +1,24 @@
+name: Skill impact
+
+# Always report: no path filter, so the check can be a required status even for
+# documentation-only and workflow-only changes. PR metadata stays in the event
+# payload file (GITHUB_EVENT_PATH); nothing untrusted is interpolated into shell
+# text, and PR code never runs with a write token or any secret.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  skill-impact:
+    name: skill-impact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check skill impact
+        run: node scripts/check-skill-impact.mjs

@@ -12,9 +12,11 @@ const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
  * is a state, not a loop. */
 export const LAUNCH_RETRY_DELAYS_MS: readonly number[] = [15_000, 60_000, 300_000];
 
-/** Durable launch-attempt generation per (root, item), owned here rather than in
- * the shared migration list, which records progress by array index. */
-export function createLaunchAttemptStore(db: PluginDatabase) {
+/** The attempt table is owned here, but both callers build the reservation
+ * store first (`server.ts` before its attempt store, `lib/collab.ts` without
+ * one), so the reservation store ensures the table itself instead of assuming
+ * a sibling store ran first. */
+function ensureLaunchAttemptTable(db: PluginDatabase): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS collab_launch_attempts (
       root_thread_id TEXT NOT NULL,
@@ -27,6 +29,12 @@ export function createLaunchAttemptStore(db: PluginDatabase) {
       PRIMARY KEY (root_thread_id, item_id)
     )
   `);
+}
+
+/** Durable launch-attempt generation per (root, item), owned here rather than in
+ * the shared migration list, which records progress by array index. */
+export function createLaunchAttemptStore(db: PluginDatabase) {
+  ensureLaunchAttemptTable(db);
   const read = db.prepare(
     "SELECT attempt_count, next_due_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?",
   );
@@ -137,6 +145,7 @@ export function createSchedulerGenerationStore(db: PluginDatabase) {
  * pass a process-local availability check and spawn the same work item.
  */
 export function createItemReservationStore(db: PluginDatabase) {
+  ensureLaunchAttemptTable(db);
   /** Tokens this store acquired and has not yet committed or released: a spawn
    * of its own may still land. Process-local and never time-keyed. */
   const inFlight = new Set<string>();
@@ -181,6 +190,9 @@ export function createItemReservationStore(db: PluginDatabase) {
       AND COALESCE(role, 'worker') != 'verifier'
     LIMIT 1
   `);
+  const launchAttempt = db.prepare(
+    "SELECT 1 FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ? LIMIT 1",
+  );
   const writeRootCap = db.prepare(`
     INSERT INTO collab_root_worker_caps (root_thread_id, max_workers, updated_at)
     VALUES (@root_thread_id, @max_workers, @updated_at)
@@ -272,6 +284,11 @@ export function createItemReservationStore(db: PluginDatabase) {
         }>) {
           if (inFlight.has(row.claim_token)) continue;
           if (liveWorker.get(rootThreadId, row.item_id)) continue;
+          // Any attempt row means this launch may already have been dispatched:
+          // an in-process failure releases the reservation, and a landed launch
+          // clears the attempt first, so reservation + open attempt is an
+          // unresolved possibly-live child. Quarantine it, blocked or not.
+          if (launchAttempt.get(rootThreadId, row.item_id)) continue;
           if (releaseStmt.run(rootThreadId, row.item_id, row.claim_token).changes === 1) {
             reclaimed.push(row.item_id);
           }

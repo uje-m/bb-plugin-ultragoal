@@ -154,6 +154,7 @@ import {
 } from "./lib/goal-settings.js";
 import {
   BRAND_PREFIX,
+  REASONING_LEVELS,
   catalogModelsFromOptions,
   type CatalogModel,
   type CatalogProvider,
@@ -244,12 +245,18 @@ let snapshotDefaults: GoalSettingDefaults = {
   verifyByDefault: true,
   verifyProvider: DEFAULT_VERIFY_PROVIDER,
   verifyModel: DEFAULT_VERIFY_MODEL,
+  verifyReasoning: "",
+  verifyServiceTier: "",
   autoContinue: true,
   progressUpdateMinutes: DEFAULT_PROGRESS_UPDATE_MINUTES,
   maxWorkers: DEFAULT_MAX_WORKERS,
   maxOpenFindings: DEFAULT_MAX_OPEN_FINDINGS,
   autoApproveAgentRequests: false,
   workerPermissionMode: "auto",
+  workerProvider: "",
+  workerModel: "",
+  workerReasoning: "",
+  workerServiceTier: "",
   autoIntegrateCompletedSlices: false,
   reclaimMergedWorktrees: false,
   readLocalProviderData: false,
@@ -381,6 +388,22 @@ export default function plugin(bb: BbPluginApi) {
       description: "Codex GPT-5.6-Sol unless an UltraGoal overrides it in the right-pane Settings.",
       default: DEFAULT_VERIFY_MODEL,
     },
+    verifyReasoning: {
+      type: "string",
+      label: "Default verifier reasoning level (empty = medium)",
+      description:
+        "Reasoning level for verifier launches whose goal pins none: " +
+        REASONING_LEVELS.join(", ") +
+        ". Empty keeps the built-in medium default.",
+      default: "",
+    },
+    verifyServiceTier: {
+      type: "string",
+      label: "Default verifier service tier (empty = provider default)",
+      description:
+        'Service tier ("default" or "fast") for verifier launches whose goal pins none. Empty leaves the provider default in place.',
+      default: "",
+    },
     progressUpdateMinutes: {
       type: "string",
       label: "Progress update interval (minutes, 0 = off)",
@@ -441,6 +464,36 @@ export default function plugin(bb: BbPluginApi) {
         "Defaults to auto, so a worker's risky actions still reach the normal approval gate. Set to full only for a deliberately unattended run.",
       default: "auto",
     },
+    workerProvider: {
+      type: "string",
+      label: "Default worker provider (empty = inherit)",
+      description:
+        "Provider for worker launches whose goal pins no provider. Empty inherits the goal thread's provider.",
+      default: "",
+    },
+    workerModel: {
+      type: "string",
+      label: "Default worker model (empty = inherit)",
+      description:
+        "Model for worker launches whose goal pins no model. Empty inherits the goal thread's model.",
+      default: "",
+    },
+    workerReasoning: {
+      type: "string",
+      label: "Default worker reasoning level (empty = inherit)",
+      description:
+        "Reasoning level for worker launches whose goal pins none: " +
+        REASONING_LEVELS.join(", ") +
+        ". Empty inherits the goal thread's level.",
+      default: "",
+    },
+    workerServiceTier: {
+      type: "string",
+      label: "Default worker service tier (empty = inherit)",
+      description:
+        'Service tier ("default" or "fast") for worker launches whose goal pins none. Empty inherits the goal thread\'s tier.',
+      default: "",
+    },
     maxOpenFindings: {
       type: "string",
       label: "Remediation work capacity per goal",
@@ -455,6 +508,10 @@ export default function plugin(bb: BbPluginApi) {
       verifyByDefault: value.verifyByDefault,
       verifyProvider: value.verifyProvider.trim() || DEFAULT_VERIFY_PROVIDER,
       verifyModel: value.verifyModel.trim() || DEFAULT_VERIFY_MODEL,
+      // Read trimmed and verbatim: an unrecognised value is left for
+      // resolveGoalSettings to refuse by name, never rewritten to a sentinel.
+      verifyReasoning: value.verifyReasoning.trim(),
+      verifyServiceTier: value.verifyServiceTier.trim(),
       autoContinue: value.autoContinue,
       progressUpdateMinutes:
         parseNonNegativeInt(value.progressUpdateMinutes) ?? DEFAULT_PROGRESS_UPDATE_MINUTES,
@@ -466,6 +523,10 @@ export default function plugin(bb: BbPluginApi) {
       readLocalProviderData: value.readLocalProviderData === true,
       shareWorktreeNodeModules: value.shareWorktreeNodeModules !== false,
       workerPermissionMode: normalizePermissionMode(value.workerPermissionMode),
+      workerProvider: value.workerProvider.trim(),
+      workerModel: value.workerModel.trim(),
+      workerReasoning: value.workerReasoning.trim(),
+      workerServiceTier: value.workerServiceTier.trim(),
     };
     // Which files count as shared infrastructure is a property of the
     // repository being worked on, not of this plugin, so it arrives as

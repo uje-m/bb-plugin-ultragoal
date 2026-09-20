@@ -1,7 +1,9 @@
 import {
   DEFAULT_REASONING_LEVEL,
-  parseReasoningLevel,
-  parseServiceTier,
+  REASONING_LEVELS,
+  isReasoningLevel,
+  isServiceTier,
+  type EffectiveExecutionSelection,
   type ReasoningLevel,
   type ServiceTier,
 } from "./execution.js";
@@ -72,6 +74,10 @@ export interface GoalSettingDefaults {
   verifyByDefault: boolean;
   verifyProvider: string;
   verifyModel: string;
+  /** Current global verifier reasoning default; `""` is unpinned. */
+  verifyReasoning: string;
+  /** Current global verifier service tier; `""` is unpinned. */
+  verifyServiceTier: string;
   autoContinue: boolean;
   progressUpdateMinutes: number;
   maxWorkers: number;
@@ -79,6 +85,18 @@ export interface GoalSettingDefaults {
   /** Off unless an operator deliberately opts in; see the setting's description. */
   autoApproveAgentRequests: boolean;
   workerPermissionMode: AgentPermissionMode;
+  // Installation-level execution defaults are kept exactly as configured —
+  // trimmed, never coerced — because an unrecognised value must reach
+  // resolution, which refuses it by name instead of launching a selection
+  // nobody chose. `""` is the unpinned sentinel for all six.
+  /** Global worker provider default; `""` is unpinned (workers inherit the goal thread). */
+  workerProvider: string;
+  /** Global worker model default; `""` is unpinned. */
+  workerModel: string;
+  /** Global worker reasoning default; `""` is unpinned. */
+  workerReasoning: string;
+  /** Global worker service tier; `""` is unpinned. */
+  workerServiceTier: string;
   /** Repository mutation is opt-in and resolved per goal. */
   autoIntegrateCompletedSlices: boolean;
   /** Remove a slice's worktree once its commits are on the base branch. */
@@ -88,33 +106,114 @@ export interface GoalSettingDefaults {
   shareWorktreeNodeModules: boolean;
 }
 
+/** `null` and a whitespace-only string both mean unpinned. */
+function trimToNull(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/**
+ * The complete role selections a future launch would use: every explicit pin,
+ * every unpinned field already replaced by its current global default.
+ */
+export interface EffectiveGoalExecutionSelections {
+  worker: EffectiveExecutionSelection;
+  verify: EffectiveExecutionSelection;
+}
+
+/**
+ * The ONE place an unpinned execution field inherits its current global
+ * default, for both roles. Resolution is a read: nothing is written back to a
+ * goal row, so changing a global default moves every unpinned future launch and
+ * no stored override.
+ *
+ * Values stay raw on the way out. An unrecognised value must reach
+ * {@link resolveGoalSettings}, which refuses it by name; coercing it here would
+ * launch a selection nobody chose.
+ */
+export function effectiveGoalExecutionSelections(
+  overrides: GoalSettingOverrides,
+  defaults: GoalSettingDefaults,
+): EffectiveGoalExecutionSelections {
+  const inherited = (
+    pin: string | null | undefined,
+    globalDefault: string | null | undefined,
+  ): string | null => trimToNull(pin) ?? trimToNull(globalDefault);
+  return {
+    worker: {
+      providerId: inherited(overrides.workerProvider, defaults.workerProvider),
+      model: inherited(overrides.workerModel, defaults.workerModel),
+      reasoningLevel: inherited(overrides.workerReasoning, defaults.workerReasoning),
+      serviceTier: inherited(overrides.workerServiceTier, defaults.workerServiceTier),
+    },
+    verify: {
+      providerId: inherited(overrides.verifyProvider, defaults.verifyProvider),
+      model: inherited(overrides.verifyModel, defaults.verifyModel),
+      reasoningLevel: inherited(overrides.verifyReasoning, defaults.verifyReasoning),
+      serviceTier: inherited(overrides.verifyServiceTier, defaults.verifyServiceTier),
+    },
+  };
+}
+
+/**
+ * A recognised reasoning level, or `null` when the field is unpinned. A
+ * non-empty unrecognised value throws, naming the field and the value: it is
+ * never coerced to a default or a neighbour.
+ */
+export function requireReasoningLevel(
+  field: string,
+  value: string | null | undefined,
+): ReasoningLevel | null {
+  const candidate = trimToNull(value);
+  if (candidate === null) return null;
+  if (isReasoningLevel(candidate)) return candidate;
+  throw new Error(
+    `Invalid ${field} "${candidate}": expected one of ${REASONING_LEVELS.join(", ")}. ` +
+      `Set a recognised global default, pin a recognised ${field}, or clear the ${field} pin.`,
+  );
+}
+
+/**
+ * A recognised service tier, or `null` when the field is unpinned. A non-empty
+ * unrecognised value throws, naming the field and the value: it is never
+ * coerced to a default or a neighbour.
+ */
+export function requireServiceTier(
+  field: string,
+  value: string | null | undefined,
+): ServiceTier | null {
+  const candidate = trimToNull(value);
+  if (candidate === null) return null;
+  if (isServiceTier(candidate)) return candidate;
+  throw new Error(
+    `Invalid ${field} "${candidate}": expected "default" or "fast". ` +
+      `Set a recognised global default, pin a recognised ${field}, or clear the ${field} pin.`,
+  );
+}
+
 export function resolveGoalSettings(
   overrides: GoalSettingOverrides,
   defaults: GoalSettingDefaults,
 ): ResolvedGoalSettings {
-  const workerProvider = overrides.workerProvider?.trim() ?? "";
+  const execution = effectiveGoalExecutionSelections(overrides, defaults);
   return {
     verifyEnabled: overrides.verifyEnabled ?? defaults.verifyByDefault,
-    verifyProvider: overrides.verifyProvider?.trim() || defaults.verifyProvider,
-    verifyModel: overrides.verifyModel?.trim() || defaults.verifyModel,
-    verifyReasoning: parseReasoningLevel(
-      overrides.verifyReasoning,
+    verifyProvider: execution.verify.providerId ?? "",
+    verifyModel: execution.verify.model ?? "",
+    verifyReasoning:
+      requireReasoningLevel("verifyReasoning", execution.verify.reasoningLevel) ??
       DEFAULT_REASONING_LEVEL,
-    ),
-    verifyServiceTier: parseServiceTier(overrides.verifyServiceTier),
+    verifyServiceTier: requireServiceTier("verifyServiceTier", execution.verify.serviceTier),
     autoContinue: overrides.autoContinue ?? defaults.autoContinue,
     progressUpdateMinutes:
       overrides.progressUpdateMinutes ?? defaults.progressUpdateMinutes,
     maxWorkers: overrides.maxWorkers ?? defaults.maxWorkers,
     maxOpenFindings: overrides.maxOpenFindings ?? defaults.maxOpenFindings,
-    workerProvider,
-    workerModel: overrides.workerModel?.trim() ?? "",
-    workerReasoning: workerProvider
-      ? parseReasoningLevel(overrides.workerReasoning)
-      : "",
-    workerServiceTier: workerProvider
-      ? parseServiceTier(overrides.workerServiceTier)
-      : null,
+    workerProvider: execution.worker.providerId ?? "",
+    workerModel: execution.worker.model ?? "",
+    workerReasoning:
+      requireReasoningLevel("workerReasoning", execution.worker.reasoningLevel) ?? "",
+    workerServiceTier: requireServiceTier("workerServiceTier", execution.worker.serviceTier),
     autoIntegrateCompletedSlices:
       overrides.autoIntegrateCompletedSlices ?? defaults.autoIntegrateCompletedSlices,
     reclaimMergedWorktrees:

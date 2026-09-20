@@ -16,6 +16,13 @@ const MIN_WAIT_TIMEOUT_MS = 1_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
 
+export interface ValidatedWorkerBase {
+  hostId: string;
+  repository: string;
+  requestedRef: string;
+  commit: string;
+}
+
 /** The capacity fence is a BEFORE INSERT trigger, so it reports a refusal as a
  * SQLite ABORT rather than a query result. A count taken before the insert
  * cannot fence a concurrent legacy generation — catching the ABORT is the only
@@ -822,6 +829,8 @@ export function createCollabStore(
     strictItemClaim?: boolean;
     /** Root-wide durable worker cap for scheduler-only strict spawns. */
     schedulerMaxWorkers?: number;
+    /** Host-validated scheduler source. Its peeled commit closes the ref race. */
+    validatedBase?: ValidatedWorkerBase;
   }): Promise<
     | { threadId: string; taskName: string; nickname: string; itemId: string | null }
     | { error: string }
@@ -838,6 +847,7 @@ export function createCollabStore(
       skipClaim,
       strictItemClaim,
       schedulerMaxWorkers,
+      validatedBase,
     } = args;
     const trimmed = args.message.trim();
     if (!trimmed) return { error: "Empty message can't be sent to an agent" };
@@ -953,7 +963,10 @@ export function createCollabStore(
     // default carries merge_base_branch=NULL, so integrateWorker falls through
     // to default_branch and squash-merges the slice into the upstream tracker.
     // Refusing costs one staffing attempt; guessing costs a silent bad merge.
-    if (parent.environmentId && !integrationBranch) {
+    // A validated base is the exception: the scheduler already asked the host to
+    // peel this root's ref to an exact commit, so the worker is cut from that
+    // commit rather than from an unnameable branch.
+    if (parent.environmentId && !integrationBranch && !validatedBase) {
       return {
         error: `Refusing to spawn: root environment ${parent.environmentId} names no integration branch, and a worker cut from the project default would aim its slice at the default branch rather than the goal's base. Set the root thread's branch, then staff again.`,
       };
@@ -1033,7 +1046,7 @@ export function createCollabStore(
       // environment would put concurrent writers in one directory.
       environment: {
         type: "host" as const,
-        hostId: parentHostId,
+        hostId: validatedBase?.hostId ?? parentHostId,
         workspace: {
           type: "managed-worktree" as const,
           // Branch from where integration LANDS, not from the repository
@@ -1045,7 +1058,13 @@ export function createCollabStore(
           // integration point is wasted before it reads a line. `default` is
           // reached only by a goal whose root has no environment at all; a root
           // that has one and cannot name its branch was refused above.
-          baseBranch: integrationBranch
+          //
+          // A validated base pins the exact commit the host resolved instead of
+          // the named ref, so a ref that moves between validation and
+          // allocation cannot change what the worker is cut from.
+          baseBranch: validatedBase
+            ? { kind: "named" as const, name: validatedBase.commit }
+            : integrationBranch
             ? { kind: "named" as const, name: integrationBranch }
             : { kind: "default" as const },
         },
@@ -1407,6 +1426,7 @@ export function createCollabStore(
       message: string;
       skipClaim?: boolean;
       maxWorkers: number;
+      validatedBase?: ValidatedWorkerBase;
     }): Promise<
       | { threadId: string; taskName: string; nickname: string; itemId: string | null }
       | { error: string }
@@ -1423,6 +1443,7 @@ export function createCollabStore(
         skipClaim: args.skipClaim,
         strictItemClaim: Boolean(args.itemId) && !args.skipClaim,
         schedulerMaxWorkers: args.maxWorkers,
+        validatedBase: args.validatedBase,
       });
       return result;
     },

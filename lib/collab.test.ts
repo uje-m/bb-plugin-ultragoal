@@ -176,6 +176,43 @@ function collabHost(options?: {
 }
 
 describe("scheduler-strict collaboration spawns", () => {
+  it("binds scheduler allocation to the validated host and peeled commit", async () => {
+    // The root names an integration branch of its own: the validated commit must
+    // still win, or a ref that moved between validation and allocation would
+    // silently decide what the worker is cut from.
+    const state = collabHost({ rootBranch: "integration" });
+    const collab = createCollabStore(state.host.bb, {
+      claimItem: (_root, args) => args.itemId ?? null,
+    });
+    const commit = "a".repeat(40);
+
+    const result = await collab.spawnWorker({
+      parentThreadId: "thr_root",
+      itemId: "itm_validated",
+      maxWorkers: 1,
+      displayName: "Commit Binder",
+      message: "SLICE (item_id=itm_validated): use the validated source",
+      validatedBase: {
+        hostId: "host_source",
+        repository: "/srv/project",
+        requestedRef: "release",
+        commit,
+      },
+    });
+
+    assert.ok(!("error" in result));
+    const args = state.spawnArgs()[0] as {
+      environment?: {
+        hostId?: string;
+        workspace?: { baseBranch?: { kind?: string; name?: string } };
+      };
+    };
+    assert.equal(args.environment?.hostId, "host_source");
+    assert.equal(args.environment?.workspace?.baseBranch?.kind, "named");
+    assert.equal(args.environment?.workspace?.baseBranch?.name, commit);
+    assert.notEqual(args.environment?.workspace?.baseBranch?.name, "integration");
+  });
+
   it("fails closed before claim fallback when the requested item already has a worker", async () => {
     const state = collabHost();
     state.host.bb.storage.database().prepare(`

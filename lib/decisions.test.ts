@@ -496,6 +496,12 @@ describe("owner decision delivery", () => {
         .get(id) as { delivered_at: number | null } | undefined
     )?.delivered_at ?? null;
 
+  const drain = async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+
   it("marks the root's own resolution delivered and delivers a worker's relay only once the root is steered", async () => {
     const root = "thr_delivery_root";
     const worker = "thr_delivery_relay";
@@ -514,11 +520,6 @@ describe("owner decision delivery", () => {
         },
       },
     });
-    const drain = async () => {
-      for (let index = 0; index < 5; index += 1) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
-    };
     await startGoal(host, root, "Prove delivery is recorded only after the root is steered");
 
     // The root answered a ruling it asked itself: it already holds the answer
@@ -605,6 +606,86 @@ describe("owner decision delivery", () => {
       (await callTool(host, "ultragoal_state", {}, root)).text,
     ) as { goal: { pendingDeliveryDecisions: unknown[] } };
     assert.deepEqual(settledBoard.goal.pendingDeliveryDecisions, []);
+  });
+
+  it("cannot strand the committed answer when the root resolves the same decision differently", async () => {
+    const root = "thr_conflict_root";
+    const worker = "thr_conflict_worker";
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            status: "active",
+            parentThreadId: threadId === worker ? root : null,
+          }),
+        send: async () => ({ ok: true }),
+      },
+    });
+    await startGoal(host, root, "Prove a conflicting root-side resolve never strands an answer");
+
+    const relayed = await requestDecision(host, worker, "Which answer does the root receive?");
+    // A second card keeps the board busy, so the worker's relay cannot be
+    // steered yet and stays durably undelivered.
+    const openCard = await requestDecision(host, root, "Is a second card still open?");
+    const relay = await callTool(
+      host,
+      "resolve_decision",
+      { decision: relayed, resolution: "answered", answer: "The first answer" },
+      worker,
+    );
+    assert.equal(relay.isError, false, relay.text);
+    await drain();
+    assert.equal(deliveredAtOf(host, relayed), null, "the relay is undelivered while a card is open");
+
+    // The root now resolves the same decision with a different answer. The
+    // guarded store keeps the first one and writes nothing, so the root
+    // supplying an answer the row does not hold proves nothing was delivered:
+    // marking the row delivered here would drop the answer the root never got.
+    const conflict = await callTool(
+      host,
+      "resolve_decision",
+      { decision: relayed, resolution: "answered", answer: "A conflicting answer" },
+      root,
+    );
+    assert.equal(conflict.isError, false, conflict.text);
+    await drain();
+    assert.equal(
+      deliveredAtOf(host, relayed),
+      null,
+      "the root was never steered the committed answer",
+    );
+    assert.deepEqual(
+      JSON.parse(conflict.text),
+      { decision_id: relayed, status: "answered", answer: "The first answer" },
+      "the tool result names the committed answer, not the conflicting one",
+    );
+
+    const stalled = JSON.parse((await callTool(host, "ultragoal_state", {}, root)).text) as {
+      goal: { pendingDeliveryDecisions: Array<{ decision_id: string; answer: string | null }> };
+    };
+    assert.deepEqual(
+      stalled.goal.pendingDeliveryDecisions.map((decision) => [decision.decision_id, decision.answer]),
+      [[relayed, "The first answer"]],
+      "the committed answer must stay deliverable",
+    );
+    assert.equal(deliveredAtOf(host, openCard), null, "the open card is still unanswered");
+
+    // The board clears and the sweep delivers the answer the root never
+    // supplied instead of leaving only the one it made up.
+    const cli = await host.harness.behavior.runCli([
+      "decide",
+      openCard,
+      "The board is clear now",
+      "--thread",
+      root,
+    ]);
+    assert.equal(cli.exitCode, 0, cli.stderr ?? "");
+    assert.notEqual(
+      deliveredAtOf(host, relayed),
+      null,
+      "the committed answer reaches the root once the steer is possible",
+    );
   });
 
 });

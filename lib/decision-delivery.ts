@@ -292,3 +292,49 @@ export async function deliverAnsweredDecisions(input: {
   }
   return result;
 }
+
+/** Stable marker text a wakeup message carries so a timeline scan can prove it landed. */
+export function wakeupMarker(threadId: string): string {
+  return `ULTRAWAKE (${threadId})`;
+}
+
+/** Includes `dispatched`: history carrying the marker is a distinct action from holding. */
+export type WakeupAction = "settled" | "queued" | "dispatched" | "send" | "hold";
+
+/**
+ * Decide what a caller holding an outstanding wakeup may do, using only the
+ * evidence it was given. Pure: it reads the durable row and the supplied queue
+ * and history snapshots, never mutates anything, and never performs a send.
+ *
+ * Authority order is deliberate. Unreadable history or an unreadable queue is
+ * `hold`: missing evidence can neither claim delivery nor authorize a blind
+ * resend. The marker in authoritative history proves the wakeup landed. A
+ * queue row still holding `queueMessageId` — or carrying the marker — means the
+ * caller updates that queued message in place; the row's identity, not its
+ * `state` label, is what the queue is matched against, so an unknown outcome
+ * that kept a queued identity is still never re-created. Both readings showing
+ * nothing is the reconciled resend path: queue absence is not delivery proof.
+ * Anything unreadable or unrecognized holds.
+ */
+export function reconcileWakeup(input: {
+  row: RootWakeup | null;
+  queue: { ok: boolean; rows: readonly { id: string; content?: string }[] };
+  timeline: { ok: boolean; rows: readonly unknown[] };
+}): WakeupAction {
+  const { row } = input;
+  if (row === null || row.revision <= row.settledRevision) return "settled";
+  const marker = wakeupMarker(row.threadId);
+  if (!input.timeline.ok) return "hold";
+  // Same scan as decisionIdsInTimeline: raw strings and nested JSON rows.
+  const history = input.timeline.rows
+    .map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry)))
+    .join("\n");
+  if (history.includes(marker)) return "dispatched";
+  if (!input.queue.ok) return "hold";
+  const held = input.queue.rows.some(
+    (queued) =>
+      (row.queueMessageId !== null && queued.id === row.queueMessageId) ||
+      (queued.content ?? "").includes(marker),
+  );
+  return held ? "queued" : "send";
+}

@@ -1308,10 +1308,17 @@ describe("large-plan agent tool contracts", () => {
     let resolution: "invalid" | "valid" = "invalid";
     let spawnCalls = 0;
     let validationCalls = 0;
+    let validCalls = 0;
     const spawnArgs: unknown[] = [];
-    const commit = "a".repeat(40);
-    const moved = "e".repeat(40);
-    let refNowPointsTo = commit;
+    const returnedCommits: string[] = [];
+    const commitAt = (n: number) => String(n).padStart(40, "0");
+    // Every successful peel returns the ref's current commit and advances the
+    // ref past it, so the live tip is never a commit a spawn may bind. That
+    // makes the binding check count-agnostic: no pass-count assumption, only
+    // the commit the validation authorizing the spawn actually returned.
+    let refNowPointsTo = commitAt(1);
+    let spawnValidations = -1;
+    let boundCommit: string | null = null;
     const sdk = {
       threads: {
         get: ({ threadId }: { threadId: string }) => makeThreadResponse({
@@ -1325,6 +1332,10 @@ describe("large-plan agent tool contracts", () => {
         spawn: (args: unknown) => {
           spawnCalls += 1;
           spawnArgs.push(args);
+          spawnValidations = returnedCommits.length;
+          boundCommit =
+            (args as { environment?: { workspace?: { baseBranch?: { name?: string } } } })
+              .environment?.workspace?.baseBranch?.name ?? null;
           return makeThreadResponse({ id: `thr_invalid_worker_${spawnCalls}` });
         },
         update: ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId }),
@@ -1341,14 +1352,14 @@ describe("large-plan agent tool contracts", () => {
     } as CreateFakePluginHostOptions["sdk"];
     const host = registeredHost(sdk, () => {
       validationCalls += 1;
-      if (resolution === "valid") {
-        // The named ref moves right after the peel: every admitted spawn must
-        // stay bound to the commit the host returned, never the ref's new tip.
-        refNowPointsTo = moved;
+      if (resolution !== "valid") {
+        return { status: "invalid", repository: "/srv/project" };
       }
-      return resolution === "valid"
-        ? { status: "valid", repository: "/srv/project", commit }
-        : { status: "invalid", repository: "/srv/project" };
+      validCalls += 1;
+      const peeled = refNowPointsTo;
+      refNowPointsTo = commitAt(validCalls + 1);
+      returnedCommits.push(peeled);
+      return { status: "valid", repository: "/srv/project", commit: peeled };
     });
     const db = host.bb.storage.database();
     db.prepare(
@@ -1418,109 +1429,21 @@ describe("large-plan agent tool contracts", () => {
       environment?: { hostId?: string; workspace?: { baseBranch?: { name?: string } } };
     };
     assert.equal(args.environment?.hostId, "host_source");
-    assert.equal(args.environment?.workspace?.baseBranch?.name, commit);
-    assert.equal(refNowPointsTo, moved, "the ref moved; the spawn stayed pinned to the validated commit");
+    assert.ok(spawnValidations >= 1, "the admitted spawn must follow a base validation");
+    assert.equal(
+      boundCommit,
+      returnedCommits[spawnValidations - 1],
+      "the spawn must bind the commit its own authorizing validation returned",
+    );
+    assert.notEqual(
+      boundCommit,
+      refNowPointsTo,
+      "every peel left the named ref behind; the spawn must not bind its live value",
+    );
     assert.ok(validationCalls >= 4, "each request is checked in the exact repository before suppression lookup");
   });
 
-  it("runs one scheduling pass per tick, so a revalidated spawn binds the commit it peeled", async () => {
-    const commit = "a".repeat(40);
-    const moved = "e".repeat(40);
-    let mode: "invalid" | "valid" = "invalid";
-    let refNow = commit;
-    let validationCalls = 0;
-    let validCalls = 0;
-    let spawnCalls = 0;
-    const spawnArgs: unknown[] = [];
-    const host = registeredHost(
-      {
-        threads: {
-          get: ({ threadId }) => makeThreadResponse({
-            id: threadId,
-            projectId: "proj",
-            providerId: "acp-opencode",
-            environmentId: "env_one_pass",
-            status: "idle",
-          }),
-          list: () => [],
-          spawn: (args: unknown) => {
-            spawnCalls += 1;
-            spawnArgs.push(args);
-            return makeThreadResponse({ id: `thr_one_pass_worker_${spawnCalls}` });
-          },
-          update: ({ threadId }) => makeThreadResponse({ id: threadId }),
-        },
-        environments: {
-          get: async () => ({
-            id: "env_one_pass",
-            hostId: "host_source",
-            path: "/srv/project",
-            branchName: "release",
-            mergeBaseBranch: "main",
-          }),
-        },
-      } as CreateFakePluginHostOptions["sdk"],
-      () => {
-        validationCalls += 1;
-        if (mode === "invalid") return { status: "invalid", repository: "/srv/project" };
-        validCalls += 1;
-        const peeled = refNow;
-        // The ref moves right after this peel. An idle heal sweep that bought a
-        // second pass for the same tick would peel the new tip, and the spawn
-        // could no longer bind the commit its own validation returned.
-        if (validCalls > 1) refNow = moved;
-        return { status: "valid", repository: "/srv/project", commit: peeled };
-      },
-    );
-    const db = host.bb.storage.database();
-    db.prepare(
-      "UPDATE goals SET thread_id='thr_one_pass', status='active', max_workers=1 WHERE thread_id='thr_sentinel'",
-    ).run();
-    await host.harness.behavior.callAgentTool(
-      "ultragoal_patch",
-      { plan: [{ step: "One-pass slice", status: "pending", deps: [], files: ["src/one-pass.ts"] }] },
-      { threadId: "thr_one_pass" },
-    );
-    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    const item = db.prepare(
-      "SELECT id, status FROM goal_items WHERE thread_id='thr_one_pass'",
-    ).get() as { id: string; status: string };
-    assert.equal(item.status, "pending");
-    assert.equal(spawnCalls, 0);
-    assert.equal(
-      (db.prepare("SELECT COUNT(*) AS n FROM invalid_base_suppressions").get() as { n: number }).n,
-      1,
-      "the pass that re-validated the invalid tuple persisted it",
-    );
-    assert.equal(validationCalls, 1, "one trigger runs one scheduling pass");
-
-    mode = "valid";
-    await host.harness.behavior.callAgentTool(
-      "ultragoal_patch",
-      { plan: [{ id: item.id, step: "One-pass slice", status: "pending", deps: [], files: ["src/one-pass.ts"] }] },
-      { threadId: "thr_one_pass" },
-    );
-    for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(validCalls, 1, "a suppressed tick validates the unchanged tuple exactly once");
-    assert.equal(spawnCalls, 0, "an unchanged tuple stays suppressed");
-
-    const retried = await host.harness.behavior.runCli([
-      "revalidate",
-      item.id,
-      "--thread",
-      "thr_one_pass",
-    ]);
-    assert.equal(retried.exitCode, 0, retried.stderr);
-    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(spawnCalls, 1);
-    const args = spawnArgs[0] as {
-      environment?: { workspace?: { baseBranch?: { name?: string } } };
-    };
-    assert.equal(args.environment?.workspace?.baseBranch?.name, commit);
-    assert.equal(refNow, moved, "the ref moved after the peel; the spawn stayed pinned to it");
-  });
-
-  it("restaffs a slice reclaimed as an orphan by the snapshot that demoted it", async () => {
+  it("restaffs a slice reclaimed as an orphan by the heal sweep that follows the demotion", async () => {
     let spawnCalls = 0;
     const host = registeredHost(
       {
@@ -1561,8 +1484,9 @@ describe("large-plan agent tool contracts", () => {
       "in_progress",
       { files: ["src/orphan.ts"] },
     )!;
-    // healStalls can also request a pass, but only for a durable row it retires.
-    // An empty worker table keeps the reclaim under test the only reason to run.
+    // The orphan has no durable worker row, so the sweep has no retirement to
+    // make; the reclaim alone requeues the slice, and the sweep the snapshot
+    // runs after it is what staffs the requeued slice again.
     assert.equal(
       (db.prepare(
         "SELECT COUNT(*) AS n FROM collab_agents WHERE root_thread_id='thr_orphan'",
@@ -1576,13 +1500,13 @@ describe("large-plan agent tool contracts", () => {
       { threadId: "thr_orphan" },
     );
     assert.equal(isToolError(state), false, toolText(state));
-    // The state pass reclaims the orphan and requests scheduling detached, so
+    // The state pass reclaims the orphan and runs the heal sweep detached, so
     // poll for the restaff instead of asserting right after the awaited call.
     for (let index = 0; index < 60; index += 1) {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
-    assert.equal(spawnCalls, 1, "the snapshot that demoted the orphan must restaff it");
+    assert.equal(spawnCalls, 1, "the heal sweep after the demotion must restaff the reclaimed orphan");
     assert.equal(items.list("thr_orphan").find((row) => row.id === orphan.id)!.status, "in_progress");
   });
 

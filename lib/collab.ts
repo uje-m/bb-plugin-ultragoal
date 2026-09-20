@@ -340,6 +340,52 @@ export function createCollabStore(
     return match ?? null;
   }
 
+  /**
+   * An owning root owns no collab row of its own. This is an addressable
+   * stand-in, persisted nowhere: it exists only long enough to hand
+   * `deliverImmediately` a thread id.
+   */
+  function syntheticOwningRootRow(rootThreadId: string): CollabRow {
+    return {
+      thread_id: rootThreadId,
+      root_thread_id: rootThreadId,
+      parent_thread_id: null,
+      task_name: "/root",
+      created_at: 0,
+      display_name: null,
+      item_id: null,
+      role: null,
+      source_thread_id: null,
+      last_verify_hash: null,
+    };
+  }
+
+  /**
+   * Delivery-scoped resolution for `ultragoal_send_message`: the addresses
+   * `resolve` knows, plus the owning-root aliases "/root", "root" and the
+   * owning root's thread id. The aliases are reserved, so a child whose
+   * task_name merely ENDS in "/root" cannot capture them; the exact task-name
+   * and owning-root-scoped thread-id lookups still outrank them — deliberately,
+   * a discovered child may literally be titled "root" and that is a child
+   * address, not the alias — so every child keeps the addressing it has today. A caller that IS its current root
+   * (the root thread, or a thread with no durable row) has no owning root to
+   * address and fails closed — falling through to `resolve` there would let a
+   * child named `/root/root` answer, and resolving to the caller would
+   * re-enter its own live turn. The control tools keep calling `resolve`
+   * directly, so the root is never an interrupt/release/retire target.
+   */
+  function resolveForDelivery(fromThreadId: string, target: string): CollabRow | null {
+    const root = rootId(fromThreadId);
+    if (target === "/root" || target === "root" || target === root) {
+      const exact = byName.get(root, target) as CollabRow | undefined;
+      if (exact) return exact;
+      const byId = byThread.get(target) as CollabRow | undefined;
+      if (byId && byId.root_thread_id === root) return byId;
+      return root === fromThreadId ? null : syntheticOwningRootRow(root);
+    }
+    return resolve(fromThreadId, target);
+  }
+
   async function statusOf(threadId: string): Promise<AgentStatus> {
     try {
       const thread = await bb.sdk.threads.get({ threadId });
@@ -1402,7 +1448,7 @@ export function createCollabStore(
           if (!trimmed) {
             return { content: [{ type: "text", text: "Empty message can't be sent to an agent" }], isError: true };
           }
-          const agent = resolve(threadId, target);
+          const agent = resolveForDelivery(threadId, target);
           if (!agent) {
             return { content: [{ type: "text", text: `Agent not found: ${target}` }], isError: true };
           }
@@ -1546,7 +1592,7 @@ export function createCollabStore(
               } catch {
                 // Timed out or interrupted for this agent.
               }
-              return;
+              return undefined;
             }),
           );
           if (updated.length === 0) {

@@ -4,7 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { createItemReservationStore } from "./item-reservations.ts";
+import {
+  createFakePluginHost,
+  makeThreadResponse,
+  type FakePluginHost,
+} from "@get-bb/plugin-sdk/testing";
+import plugin from "../server.ts";
+import { createItemStore } from "./items.ts";
+import { createItemReservationStore, createLaunchAttemptStore } from "./item-reservations.ts";
 
 const dirs: string[] = [];
 
@@ -106,6 +113,31 @@ function connections() {
   second.pragma("journal_mode = WAL");
   second.pragma("busy_timeout = 5000");
   return { first, second };
+}
+
+const hosts: FakePluginHost[] = [];
+const REAL_NOW = Date.now;
+const T0 = 1_800_000_000_000;
+
+const settle = async (rounds: number): Promise<void> => {
+  for (let n = 0; n < rounds; n += 1) await new Promise<void>((r) => setImmediate(r));
+};
+
+afterEach(async () => {
+  Date.now = REAL_NOW;
+  while (hosts.length > 0) await hosts.pop()!.harness.lifecycle.dispose();
+});
+
+/** A reservation held by a dead generation plus the store a fresh generation
+ * builds for the same database (empty process-local in-flight set). */
+function held(rootThreadId: string, itemId: string) {
+  const { first, second } = connections();
+  const dead = createItemReservationStore(first);
+  const attempts = createLaunchAttemptStore(first);
+  const reservations = createItemReservationStore(second);
+  const token = dead.acquire(rootThreadId, itemId, 2);
+  assert.ok(token);
+  return { first, second, reservations, attempts, token: token! };
 }
 
 describe("durable scheduler item reservations", () => {
@@ -309,5 +341,169 @@ describe("durable scheduler item reservations", () => {
       first.close();
       second.close();
     }
+  });
+
+  it("quarantines a held reservation while its launch attempt is unresolved", () => {
+    const f = held("thr_root", "itm_maybe");
+    try {
+      assert.equal(f.attempts.begin("thr_root", "itm_maybe", 1_000), true);
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+      assert.deepEqual(f.reservations.claimants("thr_root", "itm_maybe"), [f.token]);
+    } finally {
+      f.first.close();
+      f.second.close();
+    }
+  });
+
+  it("quarantines an exhausted (blocked) attempt instead of reclaiming it", () => {
+    const f = held("thr_root", "itm_blocked");
+    try {
+      for (const now of [1_000, 16_000, 76_000, 376_000]) {
+        assert.equal(f.attempts.begin("thr_root", "itm_blocked", now), true);
+      }
+      const row = f.first.prepare(
+        "SELECT blocked_at FROM collab_launch_attempts WHERE root_thread_id = 'thr_root' AND item_id = 'itm_blocked'",
+      ).get() as { blocked_at: number | null };
+      assert.notEqual(row.blocked_at, null);
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+      assert.deepEqual(f.reservations.claimants("thr_root", "itm_blocked"), [f.token]);
+    } finally {
+      f.first.close();
+      f.second.close();
+    }
+  });
+
+  it("reclaims an attempt-free dead generation exactly once", () => {
+    const f = held("thr_root", "itm_dead");
+    try {
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), ["itm_dead"]);
+      assert.deepEqual(f.reservations.claimants("thr_root", "itm_dead"), []);
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+    } finally {
+      f.first.close();
+      f.second.close();
+    }
+  });
+
+  it("retains a reservation whose item has a live non-verifier worker", () => {
+    const f = held("thr_root", "itm_live");
+    try {
+      f.first.prepare(
+        "INSERT INTO collab_agents (thread_id, root_thread_id, item_id, role) VALUES ('thr_live', 'thr_root', 'itm_live', 'worker')",
+      ).run();
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+      assert.deepEqual(f.reservations.claimants("thr_root", "itm_live"), [f.token]);
+    } finally {
+      f.first.close();
+      f.second.close();
+    }
+  });
+
+  it("reclaims once the owner clears the quarantined attempt", () => {
+    const f = held("thr_root", "itm_cleared");
+    try {
+      assert.equal(f.attempts.begin("thr_root", "itm_cleared", 1_000), true);
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+      f.attempts.clear("thr_root", "itm_cleared");
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), ["itm_cleared"]);
+      assert.deepEqual(f.reservations.reclaimUnheld("thr_root"), []);
+    } finally {
+      f.first.close();
+      f.second.close();
+    }
+  });
+
+  it("ensures the attempt table when the reservation store is built first", () => {
+    const { first, second } = connections();
+    try {
+      // lib/collab.ts:234 builds this store without ever building the attempt store.
+      const reservations = createItemReservationStore(second);
+      const dead = createItemReservationStore(first);
+      const token = dead.acquire("thr_root", "itm_first", 2);
+      const control = dead.acquire("thr_root", "itm_control", 2);
+      assert.ok(token);
+      assert.ok(control);
+      assert.equal(createLaunchAttemptStore(first).begin("thr_root", "itm_first", 1_000), true);
+      assert.deepEqual(reservations.reclaimUnheld("thr_root"), ["itm_control"]);
+      assert.deepEqual(reservations.claimants("thr_root", "itm_first"), [token]);
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
+  it("keeps a possibly-dispatched launch quarantined across a reload and a pulse", async () => {
+    const spawns: string[] = [];
+    const rootId = "thr_quarantine";
+    const thread = (threadId: string) =>
+      makeThreadResponse({
+        id: threadId, projectId: "proj", providerId: "codex", environmentId: null,
+        parentThreadId: threadId === rootId ? null : rootId, status: "active" as never,
+      });
+    const host = createFakePluginHost({
+      pluginId: `ultragoal-quarantine-${hosts.length}`,
+      sdk: {
+        threads: {
+          get: async ({ threadId }: { threadId: string }) => thread(threadId),
+          list: () => [],
+          timeline: () => ({ rows: [] as never[] }),
+          output: () => ({ output: null }),
+          send: async () => ({ ok: true }),
+          archive: async () => ({}),
+          update: async ({ threadId }: { threadId: string }) => thread(threadId),
+          interactions: { list: async () => [], resolve: async () => ({}) },
+          stop: async () => ({ ok: true }),
+          events: { list: async () => [] as never[] },
+          spawn: async ({ prompt }: { prompt?: string }) => {
+            spawns.push(prompt ?? "");
+            return thread(`thr_spawn_${spawns.length}`);
+          },
+        },
+      } as never,
+    });
+    hosts.push(host);
+    let db = host.bb.storage.database();
+    db.exec(`CREATE TABLE goals (
+        thread_id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER NOT NULL,
+        turn_count INTEGER NOT NULL, max_turns INTEGER NOT NULL, max_minutes INTEGER NOT NULL,
+        last_continue_at INTEGER, last_assistant_hash TEXT
+      );
+      INSERT INTO goals VALUES ('thr_sentinel', 'test', 'complete', NULL, 1, 1, 1, 0, 0, 0, NULL, NULL);`);
+    plugin(host.bb);
+    db.prepare(
+      `UPDATE goals SET thread_id = ?, status = 'active', max_workers = 1, last_continue_at = ?,
+         verify_enabled = 0, progress_update_minutes = 0 WHERE thread_id = 'thr_sentinel'`,
+    ).run(rootId, Date.now());
+    const item = createItemStore(host.bb).add(rootId, "Slice: possibly dispatched", "in_progress", {
+      files: ["src/a.ts"], deps: [], check: null,
+    });
+    assert.ok(item);
+    const token = createItemReservationStore(db).acquire(rootId, item.id, 1);
+    assert.ok(token);
+    assert.equal(createLaunchAttemptStore(db).begin(rootId, item.id, T0), true);
+    const attemptSql =
+      "SELECT attempt_count, first_attempt_at, last_attempt_at, next_due_at, blocked_at FROM collab_launch_attempts WHERE root_thread_id = ? AND item_id = ?";
+    const attemptBefore = db.prepare(attemptSql).get(rootId, item.id);
+
+    const reloaded = await host.harness.lifecycle.reload(plugin);
+    hosts.push(reloaded);
+    db = reloaded.bb.storage.database();
+    Date.now = () => T0 + 20_000;
+    const service = reloaded.harness.behavior.runService("progress-pulse");
+    await settle(10);
+    service.controller.abort();
+    await service.done;
+    await settle(80);
+    Date.now = REAL_NOW;
+
+    assert.deepEqual(spawns, [], "no second worker for a possibly-dispatched launch");
+    assert.deepEqual(
+      db.prepare(
+        "SELECT item_id, claim_token FROM collab_item_reservations WHERE root_thread_id = ?",
+      ).all(rootId),
+      [{ item_id: item.id, claim_token: token }],
+    );
+    assert.deepEqual(db.prepare(attemptSql).get(rootId, item.id), attemptBefore);
   });
 });

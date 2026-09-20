@@ -158,7 +158,9 @@ function mapThreadStatus(status: string | undefined, output?: string | null): {
 } {
   if (status === "active") return { status: "running", summary: null };
   if (status === "starting" || status === "provisioning") return { status: "starting", summary: null };
-  if (status === "stopping") return { status: "stopped", summary: null };
+  // A stop still settling keeps its runtime and its slice, so the scheduler
+  // cannot restaff work the old worker has not yet let go of.
+  if (status === "stopping") return { status: "running", summary: null };
   if (status === "error") return { status: "error", summary: "Turn error" };
   if (status === "idle") {
     const summary = output?.trim() ? output.trim().slice(0, 160) : null;
@@ -186,13 +188,12 @@ export function createCollabStore(
     ) => string | null;
     /** Status of a plan item, so retired workers can refuse new slices. */
     itemStatus?: (rootThreadId: string, itemId: string) => string | null;
-    /**
-     * Give a work item back to the ready queue. The orchestrator could see a
-     * redundant or stale-based worker and had no lever to stop it: interrupting
-     * ends a turn but keeps the slot and the assignment, so the slice stayed
-     * in_progress and the queue stayed blocked.
-     */
+    /** Give a work item back to the ready queue. MUST stay synchronous and free
+     * of side effects outside SQLite: the atomic release calls it inside its own
+     * IMMEDIATE transaction. */
     releaseItem?: (rootThreadId: string, itemId: string, reason: string) => void;
+    /** A release transaction committed; the caller publishes and schedules. */
+    onReleased?: (rootThreadId: string, itemId: string | null) => void;
     /** Goal-level worker execution pin; null fields inherit the root thread. */
     workerExecution?: (rootThreadId: string) => {
       providerId: string | null;
@@ -313,6 +314,72 @@ export function createCollabStore(
   ): boolean {
     if (!itemId) return false;
     return reservations.isHeld(rootThreadId, itemId, exceptReservation);
+  }
+
+  /** Drop reservations no owner can reach — see
+   * `createItemReservationStore.reclaimUnheld`. Goes through this store's own
+   * handle, so a spawn this process still has in flight is never reclaimed. */
+  function reclaimItemReservations(rootThreadId: string): string[] {
+    return reservations.reclaimUnheld(rootId(rootThreadId));
+  }
+
+  /** The one atomic release-and-requeue: a single IMMEDIATE transaction retires
+   * the worker row, drops its reservation and hands a still-open slice back. A
+   * completed slice is never reopened, but its dead row is still retired. An
+   * already-retired row does nothing, so a duplicate stop/abort/failure event
+   * observes the released state. `requeued` is true only for a slice actually
+   * handed back: a row that held no slice, or held a closed one, retires
+   * without one. */
+  function releaseAssignment(
+    rootThreadId: string,
+    workerThreadId: string,
+    reason: string,
+  ): { retired: boolean; requeued: boolean; itemId: string | null } {
+    const txn = db.transaction(
+      (): { retired: boolean; requeued: boolean; itemId: string | null } => {
+        const row = byThread.get(workerThreadId) as CollabRow | undefined;
+        if (!row || row.root_thread_id !== rootThreadId) {
+          return { retired: false, requeued: false, itemId: null };
+        }
+        const itemId = row.item_id ?? null;
+        const closed =
+          itemId !== null && hooks?.itemStatus?.(rootThreadId, itemId) === "completed";
+        removeRow.run({ thread_id: workerThreadId, retired_at: Date.now() });
+        if (itemId) reservations.releaseItem(rootThreadId, itemId);
+        const requeued = itemId !== null && !closed;
+        if (itemId !== null && requeued) hooks?.releaseItem?.(rootThreadId, itemId, reason);
+        return { retired: true, requeued, itemId };
+      },
+    );
+    const outcome = txn.immediate();
+    if (outcome.retired) hooks?.onReleased?.(rootThreadId, outcome.itemId);
+    return outcome;
+  }
+
+  /** Stop the worker, then requeue its slice through the one release
+   * transaction. A failed stop refuses the release instead of requeueing a slice
+   * whose worker may still be running. */
+  async function releaseSlice(
+    workerThreadId: string,
+    reason: string,
+  ): Promise<{ retired: boolean; requeued: boolean; itemId: string | null; error?: string }> {
+    const row = rowOf(workerThreadId);
+    if (!row) {
+      return { retired: false, requeued: false, itemId: null, error: "no live worker row" };
+    }
+    try {
+      await bb.sdk.threads.stop({ threadId: workerThreadId });
+    } catch (error) {
+      return {
+        retired: false,
+        requeued: false,
+        itemId: row.item_id ?? null,
+        error: `threads.stop failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const outcome = releaseAssignment(row.root_thread_id, workerThreadId, reason);
+    await bb.sdk.threads.archive({ threadId: workerThreadId }).catch(() => undefined);
+    return outcome;
   }
 
   function rowOf(threadId: string): CollabRow | null {
@@ -1101,9 +1168,12 @@ export function createCollabStore(
   }
 
   return {
+    releaseAssignment,
+    releaseSlice,
     rootId,
     rowOf,
     itemHasWorker,
+    reclaimItemReservations,
     setWorkerCap(rootThreadId: string, maxWorkers: number): boolean {
       return reservations.setCap(rootId(rootThreadId), maxWorkers);
     },
@@ -1577,9 +1647,8 @@ export function createCollabStore(
             return { content: [{ type: "text", text: "No live agents." }] };
           }
           const deadline = Date.now() + timeout;
-          const updated: string[] = [];
-          await Promise.all(
-            rows.map(async (row): Promise<void> => {
+          const waited = await Promise.all(
+            rows.map(async (row): Promise<string | null> => {
               const remaining = Math.max(1, deadline - Date.now());
               try {
                 await bb.sdk.threads.wait({
@@ -1588,13 +1657,14 @@ export function createCollabStore(
                   timeoutMs: remaining,
                   signal,
                 });
-                updated.push(row.task_name);
+                return row.task_name;
               } catch {
                 // Timed out or interrupted for this agent.
+                return null;
               }
-              return undefined;
             }),
           );
+          const updated = waited.filter((name): name is string => name !== null);
           if (updated.length === 0) {
             return {
               content: [{ type: "text", text: "Timed out before any mailbox update." }],
@@ -1643,18 +1713,34 @@ export function createCollabStore(
           if (!agent) {
             return { content: [{ type: "text", text: `Agent not found: ${target}` }], isError: true };
           }
-          // Stop first: releasing a slice under a running turn lets the worker
-          // keep writing to a directory nobody is watching any more.
-          await bb.sdk.threads.stop({ threadId: agent.thread_id }).catch(() => undefined);
-          const itemId = agent.item_id ?? null;
-          removeRow.run({ thread_id: agent.thread_id, retired_at: Date.now() });
-          await bb.sdk.threads.archive({ threadId: agent.thread_id }).catch(() => undefined);
-          if (itemId) hooks?.releaseItem?.(rootId(threadId), itemId, reason);
-          hooks?.onChange?.(rootId(threadId));
+          const outcome = await releaseSlice(agent.thread_id, reason);
+          if (!outcome.retired) {
+            return {
+              content: [{
+                type: "text",
+                text: `Could not release ${agent.thread_id}: ${
+                  outcome.error ?? "it holds no live assignment"
+                }. Its slice stays quarantined until the stop succeeds.`,
+              }],
+              isError: true,
+            };
+          }
+          let note: string | null = null;
+          if (!outcome.requeued) {
+            note =
+              outcome.itemId === null
+                ? "it held no slice; retired the worker row"
+                : "its slice was already closed; retired the worker row without reopening it";
+          }
           return {
             content: [{
               type: "text",
-              text: JSON.stringify({ released_item: itemId, agent: agent.thread_id, reason }),
+              text: JSON.stringify({
+                released_item: outcome.requeued ? outcome.itemId : null,
+                note,
+                agent: agent.thread_id,
+                reason,
+              }),
             }],
           };
         },

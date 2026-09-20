@@ -144,6 +144,230 @@ export function defaultModelOf(provider: CatalogProvider | undefined): CatalogMo
     provider.models[0];
 }
 
+/**
+ * One role's complete effective selection: the values a launch actually uses
+ * after explicit pins were folded over the current global defaults. `null` (or
+ * a blank string) is the unpinned sentinel — for `providerId` it means the role
+ * inherits the goal thread's provider, which only the launch path can resolve.
+ */
+export interface EffectiveExecutionSelection {
+  providerId: string | null;
+  model: string | null;
+  reasoningLevel: string | null;
+  serviceTier: string | null;
+}
+
+/**
+ * The availability catalog a selection is judged against, plus whether the host
+ * answered at all. An empty or failed load is `available: false`: that catalog
+ * can describe a selection but can never validate one.
+ */
+export interface ExecutionCatalog {
+  providers: readonly CatalogProvider[];
+  available: boolean;
+}
+
+export type ExecutionSelectionField = keyof EffectiveExecutionSelection;
+
+export interface ExecutionSelectionIssue {
+  field: ExecutionSelectionField;
+  /** The offending value, verbatim: never rewritten to a neighbour. */
+  value: string;
+  message: string;
+}
+
+export type ExecutionSelectionValidation =
+  | { ok: true; selection: EffectiveExecutionSelection }
+  | { ok: false; issues: readonly ExecutionSelectionIssue[] };
+
+/**
+ * Whole-selection availability check for one role. Pure: it reads the catalog
+ * it is handed and edits nothing. It refuses instead of reconciling, so an
+ * unsupported reasoning level never climbs to a neighbour, an unrecognised
+ * value is refused by name, and any concrete pin fails closed when the catalog
+ * could not be loaded. A model/reasoning/tier pin whose provider is still
+ * inherited cannot be judged here; it is preserved, never cleared.
+ */
+export function validateExecutionSelection(
+  pin: Partial<EffectiveExecutionSelection>,
+  catalog: ExecutionCatalog,
+): ExecutionSelectionValidation {
+  const providerId = pin.providerId?.trim() || null;
+  const model = pin.model?.trim() || null;
+  const rawReasoning = pin.reasoningLevel?.trim() ?? "";
+  const rawTier = pin.serviceTier?.trim() ?? "";
+  const issues: ExecutionSelectionIssue[] = [];
+
+  let reasoningLevel: ReasoningLevel | null = null;
+  if (rawReasoning) {
+    if (isReasoningLevel(rawReasoning)) {
+      reasoningLevel = rawReasoning;
+    } else {
+      issues.push({
+        field: "reasoningLevel",
+        value: rawReasoning,
+        message:
+          `reasoningLevel "${rawReasoning}" is not a recognised level ` +
+          `(use one of ${REASONING_LEVELS.join(", ")}); ` +
+          "pin a recognised level or clear the reasoning-level pin.",
+      });
+    }
+  }
+
+  let serviceTier: ServiceTier | null = null;
+  if (rawTier) {
+    if (isServiceTier(rawTier)) {
+      serviceTier = rawTier;
+    } else {
+      issues.push({
+        field: "serviceTier",
+        value: rawTier,
+        message:
+          `serviceTier "${rawTier}" is not a recognised tier ` +
+          '(use "default" or "fast"); ' +
+          "pin a recognised tier or clear the service-tier pin.",
+      });
+    }
+  }
+
+  // Nothing concrete: every field inherits at launch, so this catalog cannot
+  // contradict the selection and an unavailable catalog is not a refusal.
+  if (!providerId && !model && !rawReasoning && !rawTier) {
+    return issues.length > 0
+      ? { ok: false, issues }
+      : {
+          ok: true,
+          selection: {
+            providerId: null,
+            model: null,
+            reasoningLevel: null,
+            serviceTier: null,
+          },
+        };
+  }
+
+  if (!catalog.available) {
+    const field: ExecutionSelectionField = providerId
+      ? "providerId"
+      : model
+        ? "model"
+        : rawReasoning
+          ? "reasoningLevel"
+          : "serviceTier";
+    const value = providerId ?? model ?? rawReasoning ?? rawTier;
+    issues.push({
+      field,
+      value,
+      message:
+        `the provider catalog is unavailable, so ${field} "${value}" cannot be ` +
+        "validated against it; restore provider discovery, or clear the pinned " +
+        "execution values.",
+    });
+    return { ok: false, issues };
+  }
+
+  // The provider is inherited from the goal thread and resolves only at launch,
+  // so the pins below cannot be judged here. Refusing would force an operator
+  // to invent a provider pin just to name a model; clearing them would discard
+  // an explicit pin. Preserve them untouched.
+  if (!providerId) {
+    return issues.length > 0
+      ? { ok: false, issues }
+      : { ok: true, selection: { providerId: null, model, reasoningLevel, serviceTier } };
+  }
+
+  const provider = catalog.providers.find((entry) => entry.id === providerId);
+  if (!provider) {
+    const known = catalog.providers.map((entry) => entry.id).join(", ") || "none";
+    issues.push({
+      field: "providerId",
+      value: providerId,
+      message:
+        `providerId "${providerId}" is not in this environment's provider catalog ` +
+        `(available: ${known}); ` +
+        "pin an existing provider, set a valid global default, or clear the provider pin.",
+    });
+    return { ok: false, issues };
+  }
+  if (!provider.available) {
+    issues.push({
+      field: "providerId",
+      value: providerId,
+      message:
+        `providerId "${providerId}" is not available in this environment; ` +
+        "pin an available provider, set a valid global default, or clear the provider pin.",
+    });
+    return { ok: false, issues };
+  }
+
+  let selected: CatalogModel | undefined;
+  if (model) {
+    selected = provider.models.find((entry) => entry.id === model);
+    if (!selected) {
+      const offered = provider.models.map((entry) => entry.id).join(", ") || "none";
+      issues.push({
+        field: "model",
+        value: model,
+        message:
+          `model "${model}" is not offered by provider "${providerId}" ` +
+          `(offered: ${offered}); ` +
+          "pin a model of that provider or clear the model pin.",
+      });
+    }
+  } else {
+    selected = defaultModelOf(provider);
+  }
+
+  if (reasoningLevel) {
+    if (selected) {
+      if (!selected.reasoning.includes(reasoningLevel)) {
+        const supported = selected.reasoning.join(", ") || "none declared";
+        issues.push({
+          field: "reasoningLevel",
+          value: reasoningLevel,
+          message:
+            `reasoningLevel "${reasoningLevel}" is not supported by ` +
+            `${providerId}/${selected.id} (supported: ${supported}); ` +
+            "pin a supported level, set a compatible global default, or clear the reasoning pin.",
+        });
+      }
+    } else if (!model) {
+      issues.push({
+        field: "reasoningLevel",
+        value: reasoningLevel,
+        message:
+          `reasoningLevel "${reasoningLevel}" cannot be validated: provider ` +
+          `"${providerId}" declares no model list; ` +
+          "pin a model with a known reasoning list or clear the reasoning pin.",
+      });
+    }
+  }
+
+  // "default" is the provider's own mode, so only a tier above it needs the
+  // provider's service-tier capability.
+  if (serviceTier && serviceTier !== "default" && !provider.supportsServiceTier) {
+    issues.push({
+      field: "serviceTier",
+      value: serviceTier,
+      message:
+        `serviceTier "${serviceTier}" is not supported by provider "${providerId}"; ` +
+        "pin a provider that supports service tiers, set a compatible global " +
+        "default, or clear the service-tier pin.",
+    });
+  }
+
+  return issues.length > 0
+    ? { ok: false, issues }
+    : { ok: true, selection: { providerId, model, reasoningLevel, serviceTier } };
+}
+
+/** One refusal sentence per issue, each naming the field, the value and the remedy. */
+export function formatExecutionSelectionIssues(
+  issues: readonly ExecutionSelectionIssue[],
+): string {
+  return issues.map((issue) => issue.message).join(" ");
+}
+
 export function selectionForProvider(
   provider: CatalogProvider,
   preferredReasoning: ReasoningLevel = DEFAULT_REASONING_LEVEL,

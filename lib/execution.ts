@@ -233,17 +233,15 @@ export function validateExecutionSelection(
   // Nothing concrete: every field inherits at launch, so this catalog cannot
   // contradict the selection and an unavailable catalog is not a refusal.
   if (!providerId && !model && !rawReasoning && !rawTier) {
-    return issues.length > 0
-      ? { ok: false, issues }
-      : {
-          ok: true,
-          selection: {
-            providerId: null,
-            model: null,
-            reasoningLevel: null,
-            serviceTier: null,
-          },
-        };
+    return {
+      ok: true,
+      selection: {
+        providerId: null,
+        model: null,
+        reasoningLevel: null,
+        serviceTier: null,
+      },
+    };
   }
 
   if (!catalog.available) {

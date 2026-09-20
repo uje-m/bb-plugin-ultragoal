@@ -1104,14 +1104,64 @@ describe("intake courier identity", () => {
 });
 
 describe("immediate agent messaging", () => {
-  function seedWorker(state: ReturnType<typeof collabHost>, itemId = "itm_live") {
+  /** One durable child row. Defaults to the worker the existing cases use. */
+  function seedWorker(
+    state: ReturnType<typeof collabHost>,
+    itemId: string | null = "itm_live",
+    overrides: {
+      threadId?: string;
+      rootThreadId?: string;
+      taskName?: string;
+      displayName?: string;
+    } = {},
+  ) {
+    const rootThreadId = overrides.rootThreadId ?? "thr_root";
     state.host.bb.storage.database().prepare(`
       INSERT INTO collab_agents (
         thread_id, root_thread_id, parent_thread_id, task_name, created_at,
         display_name, item_id, role
-      ) VALUES ('thr_worker', 'thr_root', 'thr_root', '/root/worker', 1,
-        'Live worker', ?, 'worker')
-    `).run(itemId);
+      ) VALUES (@thread_id, @root_thread_id, @root_thread_id, @task_name, 1,
+        @display_name, @item_id, 'worker')
+    `).run({
+      thread_id: overrides.threadId ?? "thr_worker",
+      root_thread_id: rootThreadId,
+      task_name: overrides.taskName ?? "/root/worker",
+      display_name: overrides.displayName ?? "Live worker",
+      item_id: itemId,
+    });
+  }
+
+  function failed(result: unknown): boolean {
+    return (
+      typeof result === "object" &&
+      result !== null &&
+      (result as { isError?: boolean }).isError === true
+    );
+  }
+
+  function textOf(result: unknown): string {
+    if (typeof result === "string") return result;
+    return ((result as { content?: Array<{ text?: string }> }).content ?? [])
+      .map((part) => part.text ?? "")
+      .join("");
+  }
+
+  function callTool(
+    state: ReturnType<typeof collabHost>,
+    tool: string,
+    args: Record<string, unknown>,
+    threadId: string,
+  ) {
+    return state.host.harness.behavior.callAgentTool(tool, args, {
+      threadId,
+      projectId: "proj",
+    });
+  }
+
+  function collabOn(state: ReturnType<typeof collabHost>) {
+    const collab = createCollabStore(state.host.bb, { itemStatus: () => "in_progress" });
+    collab.registerTools();
+    return collab;
   }
 
   it("ultragoal_send_message steers a live worker and never touches the composer queue", async () => {
@@ -1158,5 +1208,227 @@ describe("immediate agent messaging", () => {
     );
     assert.equal(state.queued.length, 0);
     assert.deepEqual(state.sent, [{ threadId: "thr_worker", mode: "steer" }]);
+  });
+
+  it("reaches the owning root for /root, root and the owning root's thread id", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    collabOn(state);
+
+    for (const target of ["/root", "root", "thr_root"]) {
+      const result = await callTool(
+        state,
+        "ultragoal_send_message",
+        { target, message: "Need your ruling on the scope fence." },
+        "thr_worker",
+      );
+      assert.equal(failed(result), false, `${target} must reach the owning root: ${textOf(result)}`);
+    }
+    assert.equal(state.queued.length, 0, "root delivery never touches the composer queue");
+    assert.deepEqual(state.sent, [
+      { threadId: "thr_root", mode: "start" },
+      { threadId: "thr_root", mode: "start" },
+      { threadId: "thr_root", mode: "start" },
+    ]);
+  });
+
+  it("never routes a worker to another goal's root", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    seedWorker(state, null, {
+      threadId: "thr_other_worker",
+      rootThreadId: "thr_other_root",
+      taskName: "/root/other_worker",
+      displayName: "Other worker",
+    });
+    collabOn(state);
+
+    const foreign = await callTool(
+      state,
+      "ultragoal_send_message",
+      { target: "thr_other_root", message: "cross-goal" },
+      "thr_worker",
+    );
+    assert.equal(failed(foreign), true, textOf(foreign));
+    assert.match(textOf(foreign), /Agent not found: thr_other_root/);
+    assert.equal(state.sent.length, 0, "another goal's root is unreachable");
+
+    const own = await callTool(
+      state,
+      "ultragoal_send_message",
+      { target: "/root", message: "my own root" },
+      "thr_other_worker",
+    );
+    assert.equal(failed(own), false, textOf(own));
+    assert.deepEqual(
+      state.sent.map((entry) => entry.threadId),
+      ["thr_other_root"],
+      "the alias means the caller's OWN root",
+    );
+  });
+
+  it("fails closed when the root itself addresses /root", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    // A real child whose task_name ends in "/root" is exactly what would
+    // capture the alias if the root caller fell through to the suffix scan.
+    seedWorker(state, null, {
+      threadId: "thr_shadow",
+      taskName: "/root/root",
+      displayName: "Shadow child",
+    });
+    collabOn(state);
+
+    for (const target of ["/root", "root"]) {
+      const result = await callTool(
+        state,
+        "ultragoal_send_message",
+        { target, message: "steer myself?" },
+        "thr_root",
+      );
+      assert.equal(failed(result), true, `${target} must not resolve from the root`);
+      assert.match(textOf(result), new RegExp(`Agent not found: ${target}`));
+    }
+    assert.deepEqual(state.sent, [], "the root never steers itself");
+  });
+
+  it("fails closed for a thread with no durable row", async () => {
+    const state = collabHost();
+    collabOn(state);
+
+    const result = await callTool(
+      state,
+      "ultragoal_send_message",
+      { target: "/root", message: "who owns me?" },
+      "thr_orphan",
+    );
+    assert.equal(failed(result), true, textOf(result));
+    assert.match(textOf(result), /Agent not found: \/root/);
+    assert.deepEqual(state.sent, [], "a rowless thread has no owning root to address");
+  });
+
+  it("keeps canonical, short and thread-id child addressing working", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    seedWorker(state, "itm_peer", {
+      threadId: "thr_peer",
+      taskName: "/root/peer",
+      displayName: "The peer",
+    });
+    collabOn(state);
+
+    for (const target of ["/root/peer", "peer", "thr_peer"]) {
+      const result = await callTool(
+        state,
+        "ultragoal_send_message",
+        { target, message: "child controls" },
+        "thr_worker",
+      );
+      assert.equal(failed(result), false, `${target} must keep reaching the child: ${textOf(result)}`);
+    }
+    assert.deepEqual(state.sent.map((entry) => entry.threadId), ["thr_peer", "thr_peer", "thr_peer"]);
+  });
+
+  it("reserves the root aliases against a child named /root/root", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    seedWorker(state, "itm_shadow", {
+      threadId: "thr_shadow",
+      taskName: "/root/root",
+      displayName: "Shadow child",
+    });
+    collabOn(state);
+
+    for (const target of ["/root", "root"]) {
+      const result = await callTool(
+        state,
+        "ultragoal_send_message",
+        { target, message: "owning root, not the shadow child" },
+        "thr_worker",
+      );
+      assert.equal(failed(result), false, `${target}: ${textOf(result)}`);
+    }
+    assert.deepEqual(state.sent.map((entry) => entry.threadId), ["thr_root", "thr_root"]);
+
+    // ...while the real child keeps the addresses it had: canonical and id.
+    for (const target of ["/root/root", "thr_shadow"]) {
+      const result = await callTool(
+        state,
+        "ultragoal_send_message",
+        { target, message: "real child" },
+        "thr_worker",
+      );
+      assert.equal(failed(result), false, `${target}: ${textOf(result)}`);
+    }
+    assert.deepEqual(state.sent.slice(2).map((entry) => entry.threadId), ["thr_shadow", "thr_shadow"]);
+  });
+
+  it("keeps follow-ups refused for root targets and steering for children", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    collabOn(state);
+
+    for (const target of ["/root", "thr_root"]) {
+      const refused = await callTool(
+        state,
+        "ultragoal_followup_task",
+        { target, message: "steer the root" },
+        "thr_worker",
+      );
+      assert.equal(failed(refused), true, `${target} must stay refused`);
+      assert.match(textOf(refused), /Follow-up tasks can't target the root agent/);
+    }
+    // Bare "root" is not a follow-up alias: it fails to resolve rather than
+    // being caught by the root-target refusal, and must not reach the root.
+    const bare = await callTool(
+      state,
+      "ultragoal_followup_task",
+      { target: "root", message: "steer the root" },
+      "thr_worker",
+    );
+    assert.equal(failed(bare), true);
+    assert.match(textOf(bare), /Agent not found: root/);
+    assert.equal(state.sent.length, 0, "no root follow-up is ever delivered");
+
+    const child = await callTool(
+      state,
+      "ultragoal_followup_task",
+      { target: "worker", message: "clarify the slice" },
+      "thr_root",
+    );
+    assert.equal(failed(child), false, textOf(child));
+    assert.deepEqual(state.sent.map((entry) => entry.threadId), ["thr_worker"]);
+  });
+
+  it("does not widen the lifecycle tools to the root", async () => {
+    const state = collabHost();
+    seedWorker(state);
+    collabOn(state);
+
+    const attempts: Array<[string, Record<string, unknown>]> = [
+      ["ultragoal_interrupt_agent", { target: "/root" }],
+      ["ultragoal_release_slice", { target: "/root", reason: "no" }],
+      ["ultragoal_retire_agent", { target: "/root" }],
+    ];
+    for (const [tool, args] of attempts) {
+      const result = await callTool(state, tool, args, "thr_worker");
+      assert.equal(failed(result), true, `${tool} must refuse the root: ${textOf(result)}`);
+      assert.match(textOf(result), /Agent not found: \/root/);
+    }
+    assert.deepEqual(state.stopped, [], "the root is never stopped");
+    assert.equal(
+      state.host.harness.inspection.sdk.callsTo("threads.archive").length,
+      0,
+      "the root is never archived",
+    );
+
+    const child = await callTool(
+      state,
+      "ultragoal_interrupt_agent",
+      { target: "worker" },
+      "thr_root",
+    );
+    assert.equal(failed(child), false, textOf(child));
+    assert.deepEqual(state.stopped, ["thr_worker"], "existing child controls keep working");
   });
 });

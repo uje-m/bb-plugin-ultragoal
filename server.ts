@@ -2054,6 +2054,7 @@ export default function plugin(bb: BbPluginApi) {
         now,
       );
       const retired = new Set<string>();
+      let freedCapacity = false;
       for (const workerThreadId of candidates) {
         // Confirm each candidate's host directly. The in-memory projection
         // cannot answer this: it drops exactly these workers, so absence there
@@ -2074,6 +2075,7 @@ export default function plugin(bb: BbPluginApi) {
         collab.forget(workerThreadId);
         firstSeenIdle.delete(workerThreadId);
         retired.add(workerThreadId);
+        freedCapacity = true;
         void releaseWorkerRuntime(workerThreadId);
         // Archive it as well, so the rest of the system can tell it is done.
         // Retirement was a fact known only to this plugin: 201 retired workers
@@ -2132,6 +2134,7 @@ export default function plugin(bb: BbPluginApi) {
         // fresh worker (which also carries the current brief contract).
         if ((row?.nudge_count ?? 0) >= MAX_STALL_NUDGES) {
           collab.forget(agent.threadId);
+          freedCapacity = true;
           void releaseWorkerRuntime(agent.threadId);
           bb.log.info(
             `Retired unresponsive worker ${agent.nickname} (${agent.threadId}) after ${row?.nudge_count} nudges on ${rootThreadId}; slice ${agent.itemId} returns to the scheduler`,
@@ -2186,7 +2189,11 @@ export default function plugin(bb: BbPluginApi) {
         }
       }
 
-      await scheduleReady(rootThreadId);
+      // A sweep that returned no capacity has no new fact for the scheduler:
+      // scheduling a pass from an idle heal re-validated the base on every
+      // snapshot and bought a second pass while one was already in flight. A
+      // retirement frees a slot, so that sweep still asks for one pass.
+      if (freedCapacity) await scheduleReady(rootThreadId);
     } catch (error) {
       bb.log.warn(
         `Goal heal pass failed on ${rootThreadId}: ${

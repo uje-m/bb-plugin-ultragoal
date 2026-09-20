@@ -1423,6 +1423,103 @@ describe("large-plan agent tool contracts", () => {
     assert.ok(validationCalls >= 4, "each request is checked in the exact repository before suppression lookup");
   });
 
+  it("runs one scheduling pass per tick, so a revalidated spawn binds the commit it peeled", async () => {
+    const commit = "a".repeat(40);
+    const moved = "e".repeat(40);
+    let mode: "invalid" | "valid" = "invalid";
+    let refNow = commit;
+    let validationCalls = 0;
+    let validCalls = 0;
+    let spawnCalls = 0;
+    const spawnArgs: unknown[] = [];
+    const host = registeredHost(
+      {
+        threads: {
+          get: ({ threadId }) => makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "acp-opencode",
+            environmentId: "env_one_pass",
+            status: "idle",
+          }),
+          list: () => [],
+          spawn: (args: unknown) => {
+            spawnCalls += 1;
+            spawnArgs.push(args);
+            return makeThreadResponse({ id: `thr_one_pass_worker_${spawnCalls}` });
+          },
+          update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        },
+        environments: {
+          get: async () => ({
+            id: "env_one_pass",
+            hostId: "host_source",
+            path: "/srv/project",
+            branchName: "release",
+            mergeBaseBranch: "main",
+          }),
+        },
+      } as CreateFakePluginHostOptions["sdk"],
+      () => {
+        validationCalls += 1;
+        if (mode === "invalid") return { status: "invalid", repository: "/srv/project" };
+        validCalls += 1;
+        const peeled = refNow;
+        // The ref moves right after this peel. An idle heal sweep that bought a
+        // second pass for the same tick would peel the new tip, and the spawn
+        // could no longer bind the commit its own validation returned.
+        if (validCalls > 1) refNow = moved;
+        return { status: "valid", repository: "/srv/project", commit: peeled };
+      },
+    );
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id='thr_one_pass', status='active', max_workers=1 WHERE thread_id='thr_sentinel'",
+    ).run();
+    await host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ step: "One-pass slice", status: "pending", deps: [], files: ["src/one-pass.ts"] }] },
+      { threadId: "thr_one_pass" },
+    );
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const item = db.prepare(
+      "SELECT id, status FROM goal_items WHERE thread_id='thr_one_pass'",
+    ).get() as { id: string; status: string };
+    assert.equal(item.status, "pending");
+    assert.equal(spawnCalls, 0);
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS n FROM invalid_base_suppressions").get() as { n: number }).n,
+      1,
+      "the pass that re-validated the invalid tuple persisted it",
+    );
+    assert.equal(validationCalls, 1, "one trigger runs one scheduling pass");
+
+    mode = "valid";
+    await host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ id: item.id, step: "One-pass slice", status: "pending", deps: [], files: ["src/one-pass.ts"] }] },
+      { threadId: "thr_one_pass" },
+    );
+    for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(validCalls, 1, "a suppressed tick validates the unchanged tuple exactly once");
+    assert.equal(spawnCalls, 0, "an unchanged tuple stays suppressed");
+
+    const retried = await host.harness.behavior.runCli([
+      "revalidate",
+      item.id,
+      "--thread",
+      "thr_one_pass",
+    ]);
+    assert.equal(retried.exitCode, 0, retried.stderr);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(spawnCalls, 1);
+    const args = spawnArgs[0] as {
+      environment?: { workspace?: { baseBranch?: { name?: string } } };
+    };
+    assert.equal(args.environment?.workspace?.baseBranch?.name, commit);
+    assert.equal(refNow, moved, "the ref moved after the peel; the spawn stayed pinned to it");
+  });
+
   it("retries operational validation failures and automatically admits a changed ref", async () => {
     let requestedRef = "broken";
     let phase: "operational" | "invalid" | "valid" = "operational";

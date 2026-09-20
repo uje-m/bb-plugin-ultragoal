@@ -25,29 +25,112 @@ const MAX_PAGES_PER_SYNC = 8;
 const STEER_GRACE_MS = 5 * 60_000;
 const HARD_TTL_MS = 30 * 60_000;
 
-async function listEvents(
-  bb: BbPluginApi,
-  args: {
-    threadId: string;
-    types?: readonly [string, ...string[]];
-    order?: "asc" | "desc";
-    limit?: string;
-    afterSeq?: string;
-  },
-): Promise<Array<Record<string, unknown>>> {
+export type ThreadEventsRead =
+  | { ok: true; events: Array<Record<string, unknown>> }
+  | { ok: false; reason: string };
+
+export interface ThreadEventsReadArgs {
+  threadId: string;
+  types?: readonly [string, ...string[]];
+  order?: "asc" | "desc";
+  limit?: string;
+  afterSeq?: string;
+  /** Page through to the newest matching event seen before paging (high-water mark). */
+  throughHighWater?: boolean;
+}
+
+/** A page is a bare array or an `{events|items}` wrapper; anything else is a
+ * malformed read, never an empty page. */
+function rowsOfPage(result: unknown): Array<Record<string, unknown>> | null {
+  let page: unknown = result;
+  if (!Array.isArray(page)) {
+    const wrapped = (page ?? {}) as { events?: unknown; items?: unknown };
+    page = Array.isArray(wrapped.events) ? wrapped.events : wrapped.items;
+  }
+  if (!Array.isArray(page)) return null;
+  return page.every((row) => Boolean(row) && typeof row === "object")
+    ? (page as Array<Record<string, unknown>>)
+    : null;
+}
+
+async function readEventPage(bb: BbPluginApi, args: ThreadEventsReadArgs): Promise<ThreadEventsRead> {
   try {
-    const result = await bb.sdk.threads.events.list(args as never);
-    if (Array.isArray(result)) return result as unknown as Array<Record<string, unknown>>;
-    const wrapped = result as { events?: unknown[]; items?: unknown[] };
-    return (wrapped.events ?? wrapped.items ?? []) as Array<Record<string, unknown>>;
-  } catch {
-    return [];
+    const rows = rowsOfPage(
+      await bb.sdk.threads.events.list({
+        threadId: args.threadId,
+        types: args.types,
+        order: args.order,
+        limit: args.limit,
+        afterSeq: args.afterSeq,
+      } as never),
+    );
+    return rows === null ? { ok: false, reason: "malformed event page" } : { ok: true, events: rows };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
+/**
+ * The one event reader this plugin classifies from. An SDK error, a malformed
+ * page, or a history it could not page to the high-water mark is a FAILED read,
+ * never an empty one: "no evidence" and "evidence of nothing" differ, and only
+ * the caller may treat them alike. Args behave exactly as the SDK exposes them.
+ */
+export async function readThreadEvents(
+  bb: BbPluginApi,
+  args: ThreadEventsReadArgs,
+): Promise<ThreadEventsRead> {
+  if (!args.throughHighWater) return readEventPage(bb, args);
+  const filter = { threadId: args.threadId, types: args.types };
+  const newest = await readEventPage(bb, { ...filter, order: "desc", limit: "1" });
+  if (!newest.ok) return newest;
+  const mark = newest.events[0] === undefined ? 0 : numericSeq(newest.events[0]);
+  if (mark === null) return { ok: false, reason: "event page carried no numeric sequence" };
+  const events: Array<Record<string, unknown>> = [];
+  let cursor = args.afterSeq ?? "0";
+  let complete = mark === 0 || Number(cursor) >= mark;
+  for (let page = 0; page < MAX_PAGES_PER_SYNC && !complete; page += 1) {
+    const read = await readEventPage(bb, {
+      ...filter,
+      order: "asc",
+      afterSeq: cursor,
+      limit: String(PAGE_SIZE),
+    });
+    if (!read.ok) return read;
+    if (read.events.length === 0) break;
+    const last = numericSeq(read.events.at(-1));
+    if (last === null) return { ok: false, reason: "event page carried no numeric sequence" };
+    events.push(...read.events);
+    cursor = String(last);
+    if (last >= mark) complete = true;
+  }
+  return complete
+    ? { ok: true, events }
+    : {
+        ok: false,
+        reason: `event history truncated before sequence ${mark} after ${MAX_PAGES_PER_SYNC} pages`,
+      };
+}
+
+/** Fail-silent read for the native-task liveness scan, which degrades to "no
+ * visible tasks" rather than taking its caller down. */
+async function listEvents(
+  bb: BbPluginApi,
+  args: ThreadEventsReadArgs,
+): Promise<Array<Record<string, unknown>>> {
+  const read = await readThreadEvents(bb, args);
+  return read.ok ? read.events : [];
+}
+
 function seqOf(row: Record<string, unknown>): number {
-  const seq = row.seq;
-  return typeof seq === "number" && Number.isFinite(seq) ? seq : 0;
+  return numericSeq(row) ?? 0;
+}
+
+/** The row's sequence, or null when it cannot be placed on the sequence line. */
+function numericSeq(row: unknown): number | null {
+  if (!row || typeof row !== "object") return null;
+  const seq = (row as Record<string, unknown>).seq;
+  return typeof seq === "number" && Number.isFinite(seq) ? seq : null;
 }
 
 function toolCallOf(

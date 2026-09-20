@@ -423,3 +423,95 @@ export function orphanInProgressIds(
     .filter((item) => item.status === "in_progress" && !heldItemIds.has(item.id))
     .map((item) => item.id);
 }
+
+/**
+ * What the durable event projection says about one worker's latest request
+ * generation. Only `first_request_aborted`, `stopped_after_acceptance` and a
+ * terminal `failed` release the slice; the rest retain or quarantine it, and
+ * elapsed time never changes that.
+ */
+export type WorkerGeneration =
+  | "never_dispatched"
+  | "running_unconfirmed"
+  | "running_accepted"
+  | "stop_pending"
+  | "ordinary_idle"
+  | "first_request_aborted"
+  | "stopped_after_acceptance"
+  | "failed"
+  | "evidence_unavailable";
+
+/** Whether this generation relinquishes assignment and capacity. */
+export function releasesWorkerGeneration(generation: WorkerGeneration): boolean {
+  return (
+    generation === "first_request_aborted" ||
+    generation === "stopped_after_acceptance" ||
+    generation === "failed"
+  );
+}
+const MANUAL_STOP_REASON = "manual-stop";
+
+function eventSeq(event: Record<string, unknown>): number {
+  const seq = event.seq;
+  return typeof seq === "number" && Number.isFinite(seq) ? seq : 0;
+}
+
+function eventData(event: Record<string, unknown>): Record<string, unknown> {
+  const data = event.data;
+  return data !== null && typeof data === "object" ? (data as Record<string, unknown>) : {};
+}
+
+/**
+ * Classify ONE request generation from durable events: the latest
+ * `client/turn/requested` opens it, a `manual-stop` after that request closes
+ * it, and acceptance joins the request by `requestId === clientRequestId`,
+ * never by timing. `host-daemon-restarted` and `provider-turn-idle` are not
+ * user stops. A negative "not accepted" claim is final only once the host
+ * status is no longer starting/active/stopping: until then the stop is still
+ * settling. Unreadable evidence or host status classifies as unavailable,
+ * which quarantines.
+ */
+export function classifyWorkerGeneration(input: {
+  status: string | null;
+  events: readonly Record<string, unknown>[] | null;
+  /** This wake-up is a terminal failure reported by the host. */
+  failed?: boolean;
+  /** This wake-up is a deletion (or the host reports the thread gone). */
+  deleted?: boolean;
+}): WorkerGeneration {
+  if (input.events === null) return "evidence_unavailable";
+  if (input.deleted === true) return "failed";
+  const status = input.status;
+  if (status === "stopping") return "stop_pending";
+  const latest = input.events.filter((event) => event.type === "client/turn/requested").at(-1);
+  const requestId = latest ? eventData(latest).requestId : null;
+  const after = (event: Record<string, unknown>): boolean =>
+    latest != null && eventSeq(event) > eventSeq(latest);
+  const stopped = input.events.some(
+    (event) =>
+      event.type === "system/thread/interrupted" &&
+      eventData(event).reason === MANUAL_STOP_REASON &&
+      after(event),
+  );
+  const accepted =
+    typeof requestId === "string" &&
+    input.events.some(
+      (event) =>
+        event.type === "turn/input/accepted" && eventData(event).clientRequestId === requestId,
+    );
+  const stopGeneration: WorkerGeneration = accepted
+    ? "stopped_after_acceptance"
+    : "first_request_aborted";
+  if (input.failed === true) return stopped ? stopGeneration : "failed";
+  if (status === null) return "evidence_unavailable";
+  if (status === "active" || status === "starting" || status === "provisioning") {
+    return stopped ? "stop_pending" : accepted ? "running_accepted" : "running_unconfirmed";
+  }
+  if (stopped) return stopGeneration;
+  if (status === "error") return "failed";
+  if (input.events.some((event) => event.type === "turn/completed" && after(event))) {
+    return "ordinary_idle";
+  }
+  if (latest == null) return "never_dispatched";
+  return accepted ? "running_accepted" : "running_unconfirmed";
+}

@@ -41,11 +41,16 @@ import {
 } from "./lib/finding-brief.js";
 import { workRelatedName } from "./lib/names.js";
 import { createItemStore, type ItemStore } from "./lib/items.js";
-import { createItemReservationStore } from "./lib/item-reservations.js";
+import {
+  createItemReservationStore,
+  createLaunchAttemptStore,
+  createSchedulerGenerationStore,
+} from "./lib/item-reservations.js";
 import {
   forgetNativeScan,
   hasPendingNativeTasks,
   listLiveNativeTasks,
+  readThreadEvents,
   type LiveNativeTask,
 } from "./lib/native-sync.js";
 import { currentSliceTitle, shortSliceTitle } from "./lib/titles.js";
@@ -62,10 +67,12 @@ import { createIntegrationRecordStore } from "./lib/integration-record.js";
 import { hostContract } from "./host-contract.js";
 import { projectPane } from "./lib/projection.js";
 import {
+  classifyWorkerGeneration,
   filesOverlap,
   finishedWorkerRetirementCandidates,
   freeSlots,
   ownSliceScope,
+  releasesWorkerGeneration,
   retirementPermittedByHost,
   liveVerifierCount,
   orphanInProgressIds,
@@ -75,6 +82,7 @@ import {
   planWorkerRelease,
   setSharedInfrastructureFiles,
   type ReleaseTarget,
+  type WorkerGeneration,
   threadAcceptsStart,
   threadAcceptsSteer,
   immediateSendMode,
@@ -500,6 +508,10 @@ export default function plugin(bb: BbPluginApi) {
   // the store object — and it lets scheduleReady read the fence directly
   // instead of projecting the crew.
   const reservations = createItemReservationStore(bb.storage.database());
+  // Durable launch-attempt and scheduling generations: SQLite, so a reload
+  // resumes the ladder and the owed pass instead of resetting either.
+  const launchAttempts = createLaunchAttemptStore(bb.storage.database());
+  const scheduleGenerations = createSchedulerGenerationStore(bb.storage.database());
 
   const collab = createCollabStore(bb, {
     onChange: (rootThreadId) => {
@@ -607,11 +619,16 @@ export default function plugin(bb: BbPluginApi) {
       };
     },
     releaseItem(rootThreadId, itemId, reason) {
-      // Same effect as `bb ultragoal release`, reachable by the orchestrator
-      // that can actually see a worker is redundant.
+      // Runs INSIDE the release transaction, so it stays a SQLite write: publish
+      // and scheduling happen afterwards through `onReleased`.
       items.setStatus(rootThreadId, itemId, "pending");
+      // A release is an explicit owner action: the requeued slice starts a fresh
+      // launch generation instead of inheriting an exhausted one.
+      launchAttempts.clear(rootThreadId, itemId);
       markGoalEvent(rootThreadId);
-      bb.log.info(`Orchestrator released ${itemId} on ${rootThreadId}: ${reason}`);
+      bb.log.info(`Released ${itemId} on ${rootThreadId}: ${reason}`);
+    },
+    onReleased(rootThreadId) {
       void publishFresh(rootThreadId);
       void scheduleReady(rootThreadId);
     },
@@ -939,8 +956,6 @@ export default function plugin(bb: BbPluginApi) {
   // and whose file scope is disjoint from in-flight work gets a fresh worker,
   // up to maxWorkers, the moment a slot frees. Items without DAG metadata
   // (legacy plans, native mirrors) keep the old nudge-based staffing.
-  const STAFF_RETRY_MS = 5 * 60_000;
-  const lastStaffTry = new Map<string, number>();
   const scheduling = new Set<string>();
 
   function itemBriefMessage(rootThreadId: string, item: GoalItem, restaffed: boolean): string {
@@ -974,13 +989,85 @@ export default function plugin(bb: BbPluginApi) {
     return lines.join("\n\n");
   }
 
-  /** A plugin reload starts with an empty in-memory cache while durable
-   * collaboration rows and their BB threads remain alive. Scheduling must
-   * rebuild that ownership view before it calculates slots or decides an
-   * in-progress item was abandoned. */
+  /** Durable event types the classifier reads — ruling #4's only admissible
+   * classification source. */
+  const WORKER_GENERATION_EVENTS = [
+    "client/turn/requested", "turn/input/accepted", "turn/completed",
+    "system/thread/interrupted", "system/thread-provisioning",
+  ] as const;
+
+  /** Classify one worker's latest request generation. `failed`/`deleted` are
+   * authoritative host death signals, so unreadable evidence cannot veto them;
+   * every other unreadable classification quarantines. */
+  async function workerGeneration(
+    workerThreadId: string,
+    options: { failed?: boolean; deleted?: boolean } = {},
+  ): Promise<WorkerGeneration> {
+    const authoritative = options.failed === true || options.deleted === true;
+    let status: string | null = null;
+    try {
+      status = (await bb.sdk.threads.get({ threadId: workerThreadId })).status ?? null;
+    } catch {
+      return authoritative ? "failed" : "evidence_unavailable";
+    }
+    const read = await readThreadEvents(bb, {
+      threadId: workerThreadId,
+      types: WORKER_GENERATION_EVENTS,
+      order: "asc",
+      throughHighWater: true,
+    });
+    if (!read.ok) return authoritative ? "failed" : "evidence_unavailable";
+    return classifyWorkerGeneration({
+      status,
+      events: read.events,
+      failed: options.failed,
+      deleted: options.deleted,
+    });
+  }
+
+  /** Release one worker's slice through the atomic transition in
+   * `collab.releaseAssignment`. A transient DB failure is logged, never thrown
+   * out of a detached event listener. */
+  function releaseWorkerSlice(
+    rootThreadId: string,
+    workerThreadId: string,
+    reason: string,
+  ): void {
+    try {
+      const outcome = collab.releaseAssignment(rootThreadId, workerThreadId, reason);
+      if (!outcome.retired) return;
+      let detail = `; slice ${outcome.itemId} already closed`;
+      if (outcome.requeued) detail = `; requeued slice ${outcome.itemId}`;
+      else if (outcome.itemId === null) detail = "; it held no slice";
+      bb.log.info(`Retired ${workerThreadId} on ${rootThreadId}: ${reason}${detail}`);
+    } catch (error) {
+      bb.log.warn(
+        `Release of ${workerThreadId} on ${rootThreadId} failed; it keeps its slice: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** Hydration: a stop that landed while this plugin generation was not
+   * listening is still durable. Release the stop/abort/failure generations;
+   * ordinary idle, pending, running and unreadable ones keep their slot. */
+  async function reconcileDurableGenerations(rootThreadId: string): Promise<void> {
+    for (const row of collab.durableRowsForRoot(rootThreadId)) {
+      if (row.role === "verifier" || !row.itemId) continue;
+      const generation = await workerGeneration(row.threadId);
+      if (!releasesWorkerGeneration(generation)) continue;
+      releaseWorkerSlice(rootThreadId, row.threadId, `reload reconciliation (${generation})`);
+    }
+  }
+
+  /** A reload starts with an empty in-memory cache while durable rows and their
+   * threads stay alive, so scheduling rebuilds that ownership view first. */
   async function hydrateSchedulerOwnership(rootThreadId: string): Promise<boolean> {
     if (agentCache.has(rootThreadId)) return true;
     try {
+      // Reconcile first: a worker released here must not project as a holder.
+      await reconcileDurableGenerations(rootThreadId);
       const listed = await collab.listForRoot(rootThreadId, {
         discover: true,
         refreshLimit: 24,
@@ -1001,7 +1088,45 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function scheduleReady(rootThreadId: string): Promise<void> {
-    if (transferLocked(rootThreadId)) return;
+    // Callers invoke this detached, so a host or SDK failure after they returned
+    // must not surface as an unhandled rejection. A failed pass leaves its
+    // generation owed, so the next trigger (or reload) services it.
+    try {
+      const goal = store.get(rootThreadId);
+      // Every trigger advances the durable generation before any early return: a
+      // trigger during a transfer lock or on a paused goal still owes a pass.
+      if (goal) scheduleGenerations.request(rootThreadId, Date.now());
+      if (transferLocked(rootThreadId)) return;
+      if (
+        !goal ||
+        (goal.status !== "active" && goal.status !== "budget_limited" && goal.status !== "blocked")
+      ) {
+        return;
+      }
+      if (scheduling.has(rootThreadId)) return;
+      scheduling.add(rootThreadId);
+      try {
+        for (;;) {
+          const serviced = scheduleGenerations.requested(rootThreadId);
+          await runSchedulingPass(rootThreadId);
+          // One pass per outstanding generation: a trigger that landed mid-pass
+          // leaves the row dirty and owes exactly one more pass, never a timer or
+          // a recursion. A pass that staffs nothing cannot dirty the row itself.
+          if (!scheduleGenerations.service(rootThreadId, serviced, Date.now())) break;
+        }
+      } finally {
+        scheduling.delete(rootThreadId);
+      }
+    } catch (error) {
+      bb.log.warn(
+        `Scheduling pass failed on ${rootThreadId}; its generation stays owed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  async function runSchedulingPass(rootThreadId: string): Promise<void> {
     const goal = store.get(rootThreadId);
     if (
       !goal ||
@@ -1009,25 +1134,28 @@ export default function plugin(bb: BbPluginApi) {
     ) {
       return;
     }
-    if (scheduling.has(rootThreadId)) return;
-    scheduling.add(rootThreadId);
-    try {
+    {
       const maxWorkers = view(goal).settings.maxWorkers;
       if (!collab.setWorkerCap(rootThreadId, maxWorkers)) return;
       if (!(await hydrateSchedulerOwnership(rootThreadId))) return;
       if (maxWorkers <= 0) return;
+      // A process killed between `acquire` and its worker-row insert leaves a
+      // row with no owner and no spawn in flight, consuming a root slot for
+      // good. Reclaim it at pass entry; a live worker or in-flight spawn is kept.
+      for (const itemId of collab.reclaimItemReservations(rootThreadId)) {
+        const claimed = items.list(rootThreadId).find((row) => row.id === itemId);
+        if (claimed?.status === "in_progress") items.setStatus(rootThreadId, itemId, "pending");
+      }
       const agents = agentCache.get(rootThreadId) ?? [];
       const list = items.list(rootThreadId);
       const openItemIds = new Set(
         list.filter((item) => item.status !== "completed").map((item) => item.id),
       );
       // Plan against the fence's unit of account, never against the projected
-      // crew. `acquire` and the capacity triggers count every durable row plus
-      // every live reservation; a planner that counted fewer — the projection
-      // drops item-less rows whose host is not live — asked for spawns the
-      // fence refused, and STAFF_RETRY_MS turned each refusal into a five-minute
-      // penalty box per ready slice. The retirement sweep in healStalls owns the
-      // rows this count includes and the projection does not.
+      // crew: `acquire` and the capacity triggers count every durable row plus
+      // every live reservation, while the projection drops item-less rows whose
+      // host is not live. The retirement sweep in healStalls owns the rows this
+      // count includes and the projection does not.
       let slots = freeSlots(maxWorkers, reservations.occupancy(rootThreadId));
       if (slots <= 0) return;
       const completedIds = new Set(
@@ -1057,8 +1185,6 @@ export default function plugin(bb: BbPluginApi) {
         // a released slice is re-staffed within seconds under the same wrong
         // brief, and the only way to edit one item was to pause the whole goal.
         if (staffingHolds.isHeld(rootThreadId, item.id)) continue;
-        const lastTry = lastStaffTry.get(item.id);
-        if (lastTry != null && now - lastTry < STAFF_RETRY_MS) continue;
         if (item.deps.some((dep) => !completedIds.has(dep))) continue;
         if (
           item.files.length > 0 &&
@@ -1103,7 +1229,6 @@ export default function plugin(bb: BbPluginApi) {
           for (const holder of holders) collab.forget(holder.threadId);
           restaffed = true;
         }
-        lastStaffTry.set(item.id, now);
         const still = store.get(rootThreadId);
         if (
           !still ||
@@ -1112,6 +1237,11 @@ export default function plugin(bb: BbPluginApi) {
           return;
         }
         let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
+        // Consume one durable attempt BEFORE dispatch: a crash between this
+        // record and the spawn burns the attempt instead of double-launching,
+        // and the 15s/1m/5m ladder is the only pacing. A generation that ended
+        // in a durable block returns false, so no pass can restart it.
+        if (!launchAttempts.begin(rootThreadId, item.id, now)) continue;
         try {
           result = await collab.spawnWorker({
             parentThreadId: rootThreadId,
@@ -1147,6 +1277,9 @@ export default function plugin(bb: BbPluginApi) {
             if (item.status === "pending") items.setStatus(rootThreadId, item.id, "pending");
             continue;
           }
+          // The slice is durably staffed: this launch generation is over and the
+          // next one starts at attempt one.
+          launchAttempts.clear(rootThreadId, item.id);
           slots -= 1;
           staffed = true;
           markGoalEvent(rootThreadId);
@@ -1160,8 +1293,6 @@ export default function plugin(bb: BbPluginApi) {
         const latest = store.get(rootThreadId);
         if (latest) publish(rootThreadId, view(latest));
       }
-    } finally {
-      scheduling.delete(rootThreadId);
     }
   }
 
@@ -4499,6 +4630,15 @@ export default function plugin(bb: BbPluginApi) {
         return;
       }
       if (child.role !== "verifier") {
+        // The durable projection decides whether this worker still owns its
+        // slice (ruling #4). A manual stop, or an abort before the provider
+        // accepted the turn, releases and requeues it exactly once; ordinary
+        // idle, stop-pending and unreadable evidence retain it.
+        const generation = await workerGeneration(thread.id);
+        if (releasesWorkerGeneration(generation)) {
+          releaseWorkerSlice(parentRoot, thread.id, `idle classified ${generation}`);
+          return;
+        }
         const claim = collab.reportOf(thread.id);
         if (
           completeItemFor(parentRoot, child.item_id, claim?.evidence ?? lastAssistantText, {
@@ -4730,11 +4870,20 @@ export default function plugin(bb: BbPluginApi) {
     const failedChild = collab.rowOf(thread.id);
     if (failedChild && failedChild.root_thread_id !== thread.id) {
       // A failed child is dead, and its durable row is not. Leaving it live
-      // wedges a slot two ways: as a worker it keeps consuming root capacity,
-      // and as a verifier it keeps `verifiersFor` reporting a dependant, which
-      // blocks its SOURCE worker from ever being retired. Its slice returns to
-      // the queue through the ordinary orphan reclaim.
-      collab.forget(thread.id);
+      // wedges a slot two ways: as a worker it consumes root capacity, and as a
+      // verifier it blocks its SOURCE worker from ever being retired. The host
+      // signal is authoritative; the projection only labels which release it
+      // was. A verifier holds someone else's slice, so it is retired without a
+      // requeue.
+      if (failedChild.role === "verifier") {
+        collab.forget(thread.id);
+      } else {
+        releaseWorkerSlice(
+          failedChild.root_thread_id,
+          thread.id,
+          `failed (${await workerGeneration(thread.id, { failed: true })})`,
+        );
+      }
       markGoalEvent(failedChild.root_thread_id);
       void publishFresh(failedChild.root_thread_id);
       void scheduleReady(failedChild.root_thread_id);
@@ -4749,16 +4898,24 @@ export default function plugin(bb: BbPluginApi) {
     );
   });
 
-  bb.events.on("thread.deleted", ({ thread }) => {
+  bb.events.on("thread.deleted", async ({ thread }) => {
     if (transferLocked(thread.id)) return;
     running.delete(thread.id);
     forgetNativeScan(thread.id);
-    // A deleted child cannot come back, so its durable row is pure leak: it
-    // holds a root slot, and as a verifier row it blocks its source worker's
-    // retirement forever.
+    // A deleted child cannot come back, so its durable row is pure leak. The
+    // deletion is authoritative: a worker's slice is requeued through the one
+    // release transition, a verifier's row is retired without requeueing.
     const deletedChild = collab.rowOf(thread.id);
     if (deletedChild && deletedChild.root_thread_id !== thread.id) {
-      collab.forget(thread.id);
+      if (deletedChild.role === "verifier") {
+        collab.forget(thread.id);
+      } else {
+        releaseWorkerSlice(
+          deletedChild.root_thread_id,
+          thread.id,
+          `deleted (${await workerGeneration(thread.id, { deleted: true })})`,
+        );
+      }
       markGoalEvent(deletedChild.root_thread_id);
       void publishFresh(deletedChild.root_thread_id);
       void scheduleReady(deletedChild.root_thread_id);
@@ -5008,21 +5165,56 @@ export default function plugin(bb: BbPluginApi) {
         }
         const plan = planWorkerRelease(targets, threadId);
         if (!plan.ok) return { exitCode: 1, stderr: `${plan.reason}.` };
+        // Stop every target BEFORE mutating any of them: a failed stop must
+        // refuse rather than requeue a slice whose worker may still be running.
+        for (const { threadId: workerId } of plan.release) {
+          try {
+            await bb.sdk.threads.stop({ threadId: workerId });
+          } catch (error) {
+            return {
+              exitCode: 1,
+              stderr: `Refused to release: stopping ${workerId} failed (${
+                error instanceof Error ? error.message : String(error)
+              }). Its slice stays quarantined; retry the release, or stop the thread by hand.`,
+            };
+          }
+        }
         const released: string[] = [];
-        for (const { threadId: workerId, itemId } of plan.release) {
-          collab.forget(workerId);
-          void releaseWorkerRuntime(workerId);
-          if (itemId) items.setStatus(threadId, itemId, "pending");
-          released.push(itemId ? `${workerId} -> ${itemId}` : workerId);
+        const skipped: string[] = [];
+        for (const { threadId: workerId } of plan.release) {
+          // One atomic transition: retire the row, drop its reservation and
+          // requeue the slice — or leave the assignment exactly as it was.
+          const outcome = collab.releaseAssignment(threadId, workerId, "owner release");
+          if (!outcome.retired) {
+            skipped.push(`${workerId} (no live assignment)`);
+            continue;
+          }
+          await bb.sdk.threads.archive({ threadId: workerId }).catch(() => undefined);
+          const itemId = outcome.itemId;
+          if (!outcome.requeued || itemId === null) {
+            skipped.push(
+              `${workerId} (${
+                itemId === null ? "it held no slice" : "its item is already closed"
+              })`,
+            );
+            continue;
+          }
+          // An explicit owner action also ends a launch-blocked generation.
+          launchAttempts.clear(threadId, itemId);
+          released.push(`${workerId} -> ${itemId}`);
         }
         markGoalEvent(threadId);
-        void publishFresh(threadId);
-        void scheduleReady(threadId);
         return {
           exitCode: 0,
-          stdout: hold
-            ? `Released ${released.length} slice(s) and held ${target} out of scheduling: ${released.join(", ")}. Editing the item lifts the hold.`
-            : `Released ${released.length} slice(s) back to pending: ${released.join(", ")}`,
+          stdout: [
+            released.length
+              ? `Released ${released.length} slice(s) back to pending: ${released.join(", ")}.`
+              : "Released no slices back to pending.",
+            skipped.length ? `No slice was requeued for: ${skipped.join(", ")}.` : "",
+            hold ? `Held ${target} out of scheduling. Editing the item lifts the hold.` : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
         };
       }
 
@@ -5144,6 +5336,10 @@ export default function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: `Removed ${itemId}; every finding that pointed at it is resolved.` };
         }
         if (unhold && step === undefined && files === undefined && check === undefined) {
+          // Asking for the slice to be schedulable again also ends a
+          // launch-blocked generation; leaving it blocked would answer the
+          // command with silence.
+          launchAttempts.clear(threadId, itemId);
           const lifted = staffingHolds.lift(threadId, itemId);
           if (lifted) {
             markGoalEvent(threadId);
@@ -5191,7 +5387,9 @@ export default function plugin(bb: BbPluginApi) {
         const next = patched.items.find((row) => row.id === itemId) ?? item;
         // The edit is what the hold was waiting for. Lifting it here rather
         // than on a second command is the point: a hold nobody remembers to
-        // lift is just a lost slice.
+        // lift is just a lost slice. An edited brief is also an explicit owner
+        // action that ends a launch-blocked generation.
+        launchAttempts.clear(threadId, itemId);
         const lifted = staffingHolds.lift(threadId, itemId);
         markGoalEvent(threadId);
         void publishFresh(threadId);

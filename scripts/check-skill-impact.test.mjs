@@ -377,6 +377,78 @@ test("no changed-path source is a setup error unless --no-diff is explicit", () 
   });
 });
 
+// A mechanical rename of the registration API (registerTool -> defineTool) leaves
+// the extractor with no tool name while the root still declares a tool-shaped call
+// site and a role surface. The family filter would then accept every documented
+// name, so an underivable registry is a setup error, not a pass.
+const RENAMED_SERVER_TS =
+  'bb.agents.defineTool({ name: "ultragoal_start" });\n' +
+  'bb.agents.configure(() => ({ tools: ["ultragoal_start"] }));\n';
+const FROBNICATE_DOC = "---\nname: demo\ndescription: Demo.\n---\n\nCall `ultragoal_frobnicate` now.\n";
+const PROSE_DOC =
+  "---\nname: demo\ndescription: Demo.\n---\n\n`plan_status` and `token_budget` are prose parameters.\n";
+
+test("arm A: an empty registry with live registration evidence is a setup error", () => {
+  withRepo({ "server.ts": RENAMED_SERVER_TS, "skills/demo/SKILL.md": FROBNICATE_DOC }, (root) => {
+    const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+    assert.equal(status, 2, out);
+    assert.match(out, /skill-impact: usage: .*empty registry/);
+  });
+});
+
+// Partial data: the call site is gone but the declared role surface alone still
+// proves the root registers tools.
+test("arm A2: an empty registry with only a role surface is a setup error", () => {
+  withRepo(
+    {
+      "server.ts": 'bb.agents.configure(() => ({ tools: ["ultragoal_start"] }));\n',
+      "skills/demo/SKILL.md": FROBNICATE_DOC,
+    },
+    (root) => {
+      const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+      assert.equal(status, 2, out);
+      assert.match(out, /empty registry/);
+    },
+  );
+});
+
+// Empty result: evidence but no documented tool-shaped span leaves the filter
+// nothing to judge, so the gate still answers.
+test("arm A3: registration evidence without a documented tool span still passes", () => {
+  withRepo(
+    {
+      "server.ts": RENAMED_SERVER_TS,
+      "skills/demo/SKILL.md": "---\nname: demo\ndescription: Demo.\n---\n\nNo code spans here.\n",
+    },
+    (root) => {
+      const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+      assert.equal(status, 0, out);
+    },
+  );
+});
+
+test("arm B: a root with no registration evidence keeps prose parameters valid", () => {
+  withRepo({ "server.ts": "export const x = 1;\n", "skills/demo/SKILL.md": PROSE_DOC }, (root) => {
+    const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+    assert.equal(status, 0, out);
+  });
+});
+
+// A bare configure() only arranges permissions/middleware: no registered tool and
+// no role surface is genuinely tool-less.
+test("a bare agents configure call is not registration evidence", () => {
+  withRepo(
+    {
+      "server.ts": "bb.agents.configure((context) => {\n  return { permissions: context.permissions };\n});\n",
+      "skills/demo/SKILL.md": PROSE_DOC,
+    },
+    (root) => {
+      const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+      assert.equal(status, 0, out);
+    },
+  );
+});
+
 // The ESM loader resolves the entry point to its real path while argv[1] keeps
 // the caller's path, so a checker reached through a symlinked script or a
 // symlinked scripts directory (macOS /tmp, `current`-style release links, a

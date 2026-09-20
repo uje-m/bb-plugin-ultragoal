@@ -299,12 +299,16 @@ function isTestOrToolingSource(path) {
 function collectRegistry(root) {
   const registered = new Set();
   const collab = new Set();
+  let registrationEvidence = false;
   const sources = listFiles(root, (path) => {
     if (!/\.(ts|tsx|mts|cts|mjs|cjs|js)$/.test(path)) return false;
     return !isTestOrToolingSource(relative(root, path).split(sep).join("/"));
   });
   for (const source of sources) {
     const text = readText(source);
+    // A tool-shaped agents-API call site the extractor cannot name (a renamed
+    // registration factory, for example) still proves the root registers tools.
+    if (/bb\.agents\.\w*[Tt]ool\w*\s*\(/.test(text)) registrationEvidence = true;
     for (const match of text.matchAll(/registerTool\s*\(\s*\{/g)) {
       const body = readBalancedBody(text, match.index + match[0].length - 1, "{", "}");
       const name = body.match(/\bname\s*:\s*"([^"]+)"/);
@@ -324,7 +328,7 @@ function collectRegistry(root) {
       if (/\.\.\.\s*COLLAB_TOOL_NAMES\b/.test(body)) for (const name of collab) surfaces.add(name);
     }
   }
-  return { registry: new Set([...registered, ...collab]), surfaces };
+  return { registry: new Set([...registered, ...collab]), surfaces, registrationEvidence };
 }
 
 function documentedTools(root) {
@@ -345,11 +349,22 @@ function documentedTools(root) {
 }
 
 function toolNameViolations(root) {
-  const { registry, surfaces } = collectRegistry(root);
+  const { registry, surfaces, registrationEvidence } = collectRegistry(root);
+  const documented = documentedTools(root);
+  // With an empty registry the family filter has an empty domain and silently
+  // accepts every documented name. When the same sources still declare a
+  // tool-shaped call site or a role surface, the registry is underivable rather
+  // than empty, so refuse to answer instead of failing open.
+  if (registry.size === 0 && documented.length > 0 && (registrationEvidence || surfaces.size > 0)) {
+    throw new UsageError(
+      "refusing to evaluate documented tool names against an empty registry: " +
+        `${root} declares tool registration evidence but no registered tool name could be derived`,
+    );
+  }
   const families = new Set([...registry].map((name) => name.slice(0, name.indexOf("_"))));
   const violations = [];
   const seen = new Set();
-  for (const { name, path } of documentedTools(root)) {
+  for (const { name, path } of documented) {
     const family = name.slice(0, name.indexOf("_"));
     if (!families.has(family) || surfaces.has(name)) continue;
     const key = `${name}\u0000${path}`;

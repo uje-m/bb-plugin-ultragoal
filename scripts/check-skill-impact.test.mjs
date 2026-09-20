@@ -72,7 +72,7 @@ function runChecker(root, args = [], env = {}) {
     cwd: root,
     env: { ...process.env, GITHUB_EVENT_PATH: "", ...env },
   });
-  return { status: proc.status, out: `${proc.stdout}${proc.stderr}` };
+  return { status: proc.status, stdout: proc.stdout, stderr: proc.stderr, out: `${proc.stdout}${proc.stderr}` };
 }
 
 function bodyArgs(root, body) {
@@ -390,9 +390,9 @@ const PROSE_DOC =
 
 test("arm A: an empty registry with live registration evidence is a setup error", () => {
   withRepo({ "server.ts": RENAMED_SERVER_TS, "skills/demo/SKILL.md": FROBNICATE_DOC }, (root) => {
-    const { status, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
+    const { status, stderr, out } = runChecker(root, [...bodyArgs(root, ""), "--changed", "docs/notes.md"]);
     assert.equal(status, 2, out);
-    assert.match(out, /skill-impact: usage: .*empty registry/);
+    assert.match(stderr, /skill-impact: usage: .*empty registry/);
   });
 });
 

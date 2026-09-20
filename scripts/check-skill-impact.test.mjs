@@ -3,7 +3,7 @@
 // Run: node --test scripts/check-skill-impact.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -376,6 +376,39 @@ test("no changed-path source is a setup error unless --no-diff is explicit", () 
     assert.equal(malformedPayload.status, 2, malformedPayload.out);
   });
 });
+
+// The ESM loader resolves the entry point to its real path while argv[1] keeps
+// the caller's path, so a checker reached through a symlinked script or a
+// symlinked scripts directory (macOS /tmp, `current`-style release links, a
+// symlinked checkout) used to skip main() and exit 0 with empty output: a green
+// skill-impact result that evaluated nothing.
+test(
+  "the checker still evaluates when reached through a symlinked path",
+  { skip: process.platform === "win32" && "creating symlinks needs privileges on Windows" },
+  () => {
+    withRepo({}, (root) => {
+      const linkDir = mkdtempSync(join(tmpdir(), "skill-impact-link-"));
+      try {
+        const body = bodyArgs(root, "");
+        const linkedFile = join(linkDir, "checker.mjs");
+        symlinkSync(CHECKER, linkedFile);
+        symlinkSync(dirname(CHECKER), join(linkDir, "scripts"));
+        for (const script of [linkedFile, join(linkDir, "scripts", "check-skill-impact.mjs")]) {
+          const proc = spawnSync(
+            process.execPath,
+            [script, "--root", root, ...body, "--changed", "server.ts"],
+            { encoding: "utf8", cwd: root, env: { ...process.env, GITHUB_EVENT_PATH: "" } },
+          );
+          const out = `${proc.stdout}${proc.stderr}`;
+          assert.equal(proc.status, 1, `${script}: ${out}`);
+          assert.match(out, /skill-impact: missing-declaration/);
+        }
+      } finally {
+        rmSync(linkDir, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 // Test-only and script-only registrations are exercised in the role-aware test
 // above; this one proves the registry still accepts a `name` literal that sits

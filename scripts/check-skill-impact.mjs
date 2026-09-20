@@ -21,7 +21,7 @@
 //
 // Exit 0 pass | 1 violations (one stdout line per violation) | 2 usage/setup.
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -498,6 +498,21 @@ function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The ESM loader resolves the entry point to its real path while argv[1] keeps
+// whatever path the caller used, so a checker reached through a symlinked
+// script or scripts directory (macOS /tmp, `current`-style release links, a
+// symlinked checkout) failed a plain resolve() comparison: main() never ran and
+// the gate exited 0 having evaluated nothing. Compare real paths so the guard
+// cannot fail open.
+function isCliEntry(argvPath, moduleUrl) {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(argvPath) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntry(process.argv[1], import.meta.url)) {
   process.exitCode = main();
 }

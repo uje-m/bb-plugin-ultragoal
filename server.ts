@@ -23,7 +23,7 @@ import {
 } from "./lib/prompts.js";
 import { lastUserText, parseSlashGoal } from "./lib/slash.js";
 import { formatGoalCard, goalToolResponse, isUnfinished } from "./lib/status.js";
-import { COLLAB_TOOL_NAMES, createCollabStore, INTAKE_COURIER_DISPLAY_NAME, isIntakeCourier } from "./lib/collab.js";
+import { COLLAB_TOOL_NAMES, createCollabStore, INTAKE_COURIER_DISPLAY_NAME, isIntakeCourier, type ValidatedWorkerBase } from "./lib/collab.js";
 import { createDecisionStore } from "./lib/decisions.js";
 import { decisionIdsInTimeline, deliverAnsweredDecisions } from "./lib/decision-delivery.js";
 import {
@@ -1271,31 +1271,43 @@ export default function plugin(bb: BbPluginApi) {
           );
           continue;
         }
-        const suppressed = invalidBaseSuppressions.get(
-          rootThreadId,
-          item.id,
-          base.repository,
-          base.requestedRef,
-        );
-        if (suppressed) continue;
-        if (base.status === "invalid") {
-          const diagnostic = [
-            `Base ref ${JSON.stringify(base.requestedRef)} is missing or does not peel to a commit in ${base.repository}.`,
-            "The work item and goal remain open; no worker or worktree was allocated.",
-            `Correct the repository/ref tuple, or explicitly retry the unchanged tuple with bb ultragoal revalidate ${item.id} --thread ${rootThreadId}.`,
-          ].join(" ");
-          invalidBaseSuppressions.suppress({
+        // A root with no environment names no base to validate: there is
+        // nothing to reject, bind or suppress, so the spawn proceeds on the
+        // project default exactly as before this wiring.
+        let validatedBase: ValidatedWorkerBase | undefined;
+        if (base.status !== "no_environment") {
+          const suppressed = invalidBaseSuppressions.get(
             rootThreadId,
-            itemId: item.id,
+            item.id,
+            base.repository,
+            base.requestedRef,
+          );
+          if (suppressed) continue;
+          if (base.status === "invalid") {
+            const diagnostic = [
+              `Base ref ${JSON.stringify(base.requestedRef)} is missing or does not peel to a commit in ${base.repository}.`,
+              "The work item and goal remain open; no worker or worktree was allocated.",
+              `Correct the repository/ref tuple, or explicitly retry the unchanged tuple with bb ultragoal revalidate ${item.id} --thread ${rootThreadId}.`,
+            ].join(" ");
+            invalidBaseSuppressions.suppress({
+              rootThreadId,
+              itemId: item.id,
+              repository: base.repository,
+              requestedRef: base.requestedRef,
+              diagnostic,
+              suppressedAt: now,
+            });
+            markGoalEvent(rootThreadId);
+            bb.log.warn(`Scheduler suppressed invalid base for ${item.id} on ${rootThreadId}: ${diagnostic}`);
+            void publishFresh(rootThreadId);
+            continue;
+          }
+          validatedBase = {
+            hostId: base.hostId,
             repository: base.repository,
             requestedRef: base.requestedRef,
-            diagnostic,
-            suppressedAt: now,
-          });
-          markGoalEvent(rootThreadId);
-          bb.log.warn(`Scheduler suppressed invalid base for ${item.id} on ${rootThreadId}: ${diagnostic}`);
-          void publishFresh(rootThreadId);
-          continue;
+            commit: base.commit,
+          };
         }
         let result: Awaited<ReturnType<typeof collab.spawnWorker>>;
         // Consume one durable attempt BEFORE dispatch: a crash between this
@@ -1313,12 +1325,7 @@ export default function plugin(bb: BbPluginApi) {
               agents.map((agent) => agent.nickname),
             ),
             message: itemBriefMessage(rootThreadId, item, restaffed),
-            validatedBase: {
-              hostId: base.hostId,
-              repository: base.repository,
-              requestedRef: base.requestedRef,
-              commit: base.commit,
-            },
+            validatedBase,
           });
         } catch (error) {
           result = { error: error instanceof Error ? error.message : String(error) };
@@ -1384,17 +1391,20 @@ export default function plugin(bb: BbPluginApi) {
         repository: string;
         requestedRef: string;
       }
+    // A root that names no environment has no commit-ish base and no
+    // integration branch, so there is nothing to reject, bind or suppress.
+    | { status: "no_environment" }
     | { status: "operational_error"; reason: string };
 
   // The scheduler may only allocate from a base the host has resolved to an
-  // exact commit in an exact repository. A root with no environment is
-  // unresolvable: the spawn would be cut from the project default, a request
-  // this pipeline can neither validate nor remember.
+  // exact commit in an exact repository. A root with no environment is the one
+  // exception: the spawn is cut from the project default, exactly as before
+  // this wiring, and the pass skips validation instead of refusing.
   async function resolveSchedulerBase(rootThreadId: string): Promise<SchedulerBase> {
     try {
       const root = await bb.sdk.threads.get({ threadId: rootThreadId });
       if (!root.environmentId) {
-        return { status: "operational_error", reason: "root thread has no environment" };
+        return { status: "no_environment" };
       }
       const environment = await bb.sdk.environments.get({ environmentId: root.environmentId });
       const hostId = environment.hostId;
@@ -2054,7 +2064,6 @@ export default function plugin(bb: BbPluginApi) {
         now,
       );
       const retired = new Set<string>();
-      let freedCapacity = false;
       for (const workerThreadId of candidates) {
         // Confirm each candidate's host directly. The in-memory projection
         // cannot answer this: it drops exactly these workers, so absence there
@@ -2075,7 +2084,6 @@ export default function plugin(bb: BbPluginApi) {
         collab.forget(workerThreadId);
         firstSeenIdle.delete(workerThreadId);
         retired.add(workerThreadId);
-        freedCapacity = true;
         void releaseWorkerRuntime(workerThreadId);
         // Archive it as well, so the rest of the system can tell it is done.
         // Retirement was a fact known only to this plugin: 201 retired workers
@@ -2134,7 +2142,6 @@ export default function plugin(bb: BbPluginApi) {
         // fresh worker (which also carries the current brief contract).
         if ((row?.nudge_count ?? 0) >= MAX_STALL_NUDGES) {
           collab.forget(agent.threadId);
-          freedCapacity = true;
           void releaseWorkerRuntime(agent.threadId);
           bb.log.info(
             `Retired unresponsive worker ${agent.nickname} (${agent.threadId}) after ${row?.nudge_count} nudges on ${rootThreadId}; slice ${agent.itemId} returns to the scheduler`,
@@ -2189,11 +2196,7 @@ export default function plugin(bb: BbPluginApi) {
         }
       }
 
-      // A sweep that returned no capacity has no new fact for the scheduler:
-      // scheduling a pass from an idle heal re-validated the base on every
-      // snapshot and bought a second pass while one was already in flight. A
-      // retirement frees a slot, so that sweep still asks for one pass.
-      if (freedCapacity) await scheduleReady(rootThreadId);
+      await scheduleReady(rootThreadId);
     } catch (error) {
       bb.log.warn(
         `Goal heal pass failed on ${rootThreadId}: ${
@@ -2265,10 +2268,6 @@ export default function plugin(bb: BbPluginApi) {
       const reclaimed = reclaimOrphanInProgress(goal.threadId);
       if (reclaimed > 0) {
         bb.log.info(`Demoted ${reclaimed} unheld in_progress slice(s) on ${goal.threadId}`);
-        // A demoted orphan has no durable worker row for the heal sweep to
-        // retire, so its sweep never reports freed capacity. This reclaim is
-        // the only trigger that can restaff the slice it just requeued.
-        void scheduleReady(goal.threadId);
       }
       void healStalls(goal.threadId);
     } catch (error) {

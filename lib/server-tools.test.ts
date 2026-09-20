@@ -1520,6 +1520,72 @@ describe("large-plan agent tool contracts", () => {
     assert.equal(refNow, moved, "the ref moved after the peel; the spawn stayed pinned to it");
   });
 
+  it("restaffs a slice reclaimed as an orphan by the snapshot that demoted it", async () => {
+    let spawnCalls = 0;
+    const host = registeredHost(
+      {
+        threads: {
+          get: ({ threadId }) => makeThreadResponse({
+            id: threadId,
+            projectId: "proj",
+            providerId: "acp-opencode",
+            environmentId: "env_orphan",
+            status: "idle",
+          }),
+          list: () => [],
+          spawn: () => {
+            spawnCalls += 1;
+            return makeThreadResponse({ id: `thr_orphan_worker_${spawnCalls}` });
+          },
+          update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        },
+        environments: {
+          get: async () => ({
+            id: "env_orphan",
+            hostId: "host_orphan",
+            path: "/srv/orphan",
+            branchName: "main",
+          }),
+        },
+      } as CreateFakePluginHostOptions["sdk"],
+      () => ({ status: "valid", repository: "/srv/orphan", commit: "d".repeat(40) }),
+    );
+    const db = host.bb.storage.database();
+    db.prepare(
+      "UPDATE goals SET thread_id='thr_orphan', status='active', max_workers=1 WHERE thread_id='thr_sentinel'",
+    ).run();
+    const items = createItemStore(host.bb);
+    const orphan = items.add(
+      "thr_orphan",
+      "Slice whose worker vanished without a durable row",
+      "in_progress",
+      { files: ["src/orphan.ts"] },
+    )!;
+    // healStalls can also request a pass, but only for a durable row it retires.
+    // An empty worker table keeps the reclaim under test the only reason to run.
+    assert.equal(
+      (db.prepare(
+        "SELECT COUNT(*) AS n FROM collab_agents WHERE root_thread_id='thr_orphan'",
+      ).get() as { n: number }).n,
+      0,
+    );
+
+    const state = await host.harness.behavior.callAgentTool(
+      "ultragoal_state",
+      {},
+      { threadId: "thr_orphan" },
+    );
+    assert.equal(isToolError(state), false, toolText(state));
+    // The state pass reclaims the orphan and requests scheduling detached, so
+    // poll for the restaff instead of asserting right after the awaited call.
+    for (let index = 0; index < 60; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(spawnCalls, 1, "the snapshot that demoted the orphan must restaff it");
+    assert.equal(items.list("thr_orphan").find((row) => row.id === orphan.id)!.status, "in_progress");
+  });
+
   it("retries operational validation failures and automatically admits a changed ref", async () => {
     let requestedRef = "broken";
     let phase: "operational" | "invalid" | "valid" = "operational";

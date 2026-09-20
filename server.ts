@@ -2265,6 +2265,10 @@ export default function plugin(bb: BbPluginApi) {
       const reclaimed = reclaimOrphanInProgress(goal.threadId);
       if (reclaimed > 0) {
         bb.log.info(`Demoted ${reclaimed} unheld in_progress slice(s) on ${goal.threadId}`);
+        // A demoted orphan has no durable worker row for the heal sweep to
+        // retire, so its sweep never reports freed capacity. This reclaim is
+        // the only trigger that can restaff the slice it just requeued.
+        void scheduleReady(goal.threadId);
       }
       void healStalls(goal.threadId);
     } catch (error) {

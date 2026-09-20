@@ -1847,6 +1847,17 @@ export default function plugin(bb: BbPluginApi) {
       );
       for (const agent of agents) {
         if (agent.role !== "worker" || agent.threadId === rootThreadId) continue;
+        const row = collab.rowOf(agent.threadId);
+        // The worker's own durable report ends automatic recovery, and the
+        // check sits BEFORE every status branch: an observed `running` must not
+        // strike-reset a blocked worker, and neither the nudge nor the
+        // retirement branch may touch it. Only the operator's explicit release
+        // moves a blocked slice.
+        if (row?.report_status === "blocked") {
+          // A later unblock starts a fresh grace window, never the pre-block one.
+          firstSeenIdle.delete(agent.threadId);
+          continue;
+        }
         if (agent.status !== "idle") {
           firstSeenIdle.delete(agent.threadId);
           if (agent.status === "running" || agent.status === "starting") {
@@ -1861,7 +1872,6 @@ export default function plugin(bb: BbPluginApi) {
         // with the findings). Past the fail cap the slice is the
         // orchestrator's call, not a nudge loop's.
         if (liveVerifierSources.has(agent.threadId)) continue;
-        const row = collab.rowOf(agent.threadId);
         if ((row?.verify_fails ?? 0) >= MAX_VERIFY_FAILS) continue;
         // A worker that has been nudged repeatedly and still never reports is
         // wedged: retire it and let the scheduler restaff the slice with a
@@ -2216,12 +2226,29 @@ export default function plugin(bb: BbPluginApi) {
     if (options?.requirePass) {
       if (parseVerifierVerdict(report) !== "pass") return false;
     } else {
-      if (view(goal).settings.verifyEnabled) return false;
       // The recorded tool claim decides; the text sentinel remains only as a
       // transitional fallback for workers briefed before the tools existed.
       const contract = options?.recordedClaim ?? structuredReport(report);
-      if (contract === "blocked") markGoalEvent(rootThreadId);
+      if (contract === "blocked") {
+        const workerThreadId = options?.workerThreadId ?? null;
+        // Read the durable row BEFORE writing it: it is the only stable memory
+        // of a prior block. Blocker prose is never compared — a model
+        // paraphrases, and a timestamp makes any text look new.
+        const prior = workerThreadId ? collab.reportOf(workerThreadId) : null;
+        // A sentinel worker never reached slice_blocked, so nothing is durable
+        // yet. Store the same record the tool stores, scoped to the reporting
+        // worker — the requirePass branch above already returned, so a verifier
+        // can never stamp its source worker.
+        if (options?.recordedClaim == null && workerThreadId) {
+          collab.setReport(workerThreadId, "blocked", report ?? "");
+        }
+        if (prior?.status !== "blocked") markGoalEvent(rootThreadId);
+      }
+      // A blocked slice must become durable even when verification is on, or
+      // the healer has nothing to read and nudges it like ordinary in-flight
+      // work.
       if (contract !== "done") return false;
+      if (view(goal).settings.verifyEnabled) return false;
     }
     const item = items
       .list(rootThreadId)
@@ -3994,8 +4021,11 @@ export default function plugin(bb: BbPluginApi) {
           isError: true,
         };
       }
+      // One wake per blocking transition: the durable row is the memory, so a
+      // repeat block (however it is worded) is the same state, not a new event.
+      const prior = collab.reportOf(threadId);
       collab.setReport(threadId, "blocked", blocker);
-      markGoalEvent(row.root_thread_id);
+      if (prior?.status !== "blocked") markGoalEvent(row.root_thread_id);
       return {
         content: [
           { type: "text", text: "Blocked report recorded. End your turn - the orchestrator will act." },

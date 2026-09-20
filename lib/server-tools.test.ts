@@ -2682,3 +2682,341 @@ describe("remediation retirement end to end", () => {
     }
   });
 });
+
+describe("durable blocked slices", () => {
+  const ROOT = "thr_durable_root";
+
+  // A goal root whose crew exists as real SQLite rows and whose host answers a
+  // per-thread status. Heal passes are driven through the awaited lifecycle path
+  // production uses — a state read republishes and starts one — never directly.
+  function durableHost(options?: {
+    rootStatus?: "idle" | "active";
+    workerStatus?: (threadId: string) => "idle" | "active";
+    maxWorkers?: number;
+    lastContinueAt?: number;
+  }) {
+    const spawned: string[] = [];
+    const archived: string[] = [];
+    const statusOf = options?.workerStatus ?? (() => "idle" as const);
+    let spawnCount = 0;
+    const threadResponse = (threadId: string, status: "idle" | "active") =>
+      makeThreadResponse({
+        id: threadId,
+        projectId: "proj",
+        providerId: "acp-opencode",
+        environmentId: null,
+        parentThreadId: threadId === ROOT ? null : ROOT,
+        status,
+      });
+    const nextThread = () => {
+      spawnCount += 1;
+      const id = `thr_replacement_${spawnCount}`;
+      spawned.push(id);
+      return threadResponse(id, "active");
+    };
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) =>
+          threadResponse(threadId, threadId === ROOT ? options?.rootStatus ?? "idle" : statusOf(threadId)),
+        list: () => [],
+        spawn: async () => nextThread(),
+        fork: async () => nextThread(),
+        output: () => ({ output: null }),
+        send: () => ({ ok: true }),
+        stop: () => ({ ok: true }),
+        archive: async ({ threadId }) => {
+          archived.push(threadId);
+          return { archivedThreadIds: [threadId], ok: true as const };
+        },
+        update: ({ threadId }) => makeThreadResponse({ id: threadId }),
+        timeline: () => ({ rows: [] }),
+        interactions: { list: async () => [], resolve: async () => ({}) },
+      },
+    });
+    const db = host.bb.storage.database();
+    // progress_update_minutes = 0 turns the heartbeat off, so a root wake can
+    // only come from a goal event — the thing the wake case counts.
+    db.prepare(
+      `UPDATE goals SET thread_id = ?, status = 'active', max_workers = ?, verify_enabled = 0,
+         progress_update_minutes = 0, last_continue_at = ?
+       WHERE thread_id = 'thr_sentinel'`,
+    ).run(ROOT, options?.maxWorkers ?? 4, options?.lastContinueAt ?? Date.now());
+    const items = createItemStore(host.bb);
+    const settle = async () => {
+      for (let index = 0; index < 60; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    const agentRow = (threadId: string) =>
+      db.prepare(
+        "SELECT report_status, report_evidence, nudge_count, retired_at FROM collab_agents WHERE thread_id = ?",
+      ).get(threadId) as {
+        report_status: string | null;
+        report_evidence: string | null;
+        nudge_count: number | null;
+        retired_at: number | null;
+      };
+    const itemRow = (itemId: string) => items.list(ROOT).find((row) => row.id === itemId)!;
+    const liveOwners = (itemId: string) =>
+      (
+        db.prepare(
+          "SELECT thread_id FROM collab_agents WHERE root_thread_id = ? AND item_id = ? AND retired_at IS NULL",
+        ).all(ROOT, itemId) as Array<{ thread_id: string }>
+      ).map((row) => row.thread_id);
+    const sendsTo = (threadId: string) =>
+      host.harness.inspection.sdk.callsTo("threads.send").filter((call) => (call[0] as { threadId?: string }).threadId === threadId);
+    const heal = async () => {
+      const state = await host.harness.behavior.callAgentTool("ultragoal_state", {}, { threadId: ROOT });
+      assert.equal(isToolError(state), false, toolText(state));
+      await settle();
+    };
+    const idle = async (threadId: string, lastAssistantText: string) => {
+      const result = await host.harness.behavior.emitThreadEvent("thread.idle", {
+        thread: threadResponse(threadId, "idle"),
+        lastAssistantText,
+      });
+      await settle();
+      return result;
+    };
+    const spawnWorker = async (itemId: string, slug: string, step: string) => {
+      const result = await host.harness.behavior.callAgentTool(
+        "ultragoal_spawn_agent",
+        { task_name: slug, display_name: `Worker ${slug}`, item_id: itemId, message: `SLICE (item_id=${itemId}): ${step}` },
+        { threadId: ROOT },
+      );
+      assert.equal(isToolError(result), false, toolText(result));
+      const row = db
+        .prepare("SELECT thread_id FROM collab_agents WHERE root_thread_id = ? AND task_name = ?")
+        .get(ROOT, `/root/${slug}`) as { thread_id: string };
+      return row.thread_id;
+    };
+    /** One claimed slice plus the worker that owns it. */
+    const slice = async (slug: string, step: string, file: string) => {
+      const item = items.add(ROOT, step, "pending", { files: [file] })!;
+      return { item, worker: await spawnWorker(item.id, slug, step) };
+    };
+    const block = async (threadId: string, blocker: string) => {
+      const result = await host.harness.behavior.callAgentTool("slice_blocked", { blocker }, { threadId });
+      assert.equal(isToolError(result), false, toolText(result));
+    };
+    return { host, db, items, spawned, archived, settle, heal, idle, slice, spawnWorker, block, agentRow, itemRow, liveOwners, sendsTo };
+  }
+
+  it("persists a text-sentinel blocked report exactly as the tool path does", async () => {
+    const fx = durableHost();
+    // Verification on: the durability of a worker's own block must not depend
+    // on whether a verifier is watching it.
+    fx.db.prepare("UPDATE goals SET verify_enabled = 1 WHERE thread_id = ?").run(ROOT);
+    const sentinel = await fx.slice("sentinel_worker", "Slice blocked through the text sentinel", "src/sentinel.ts");
+    const tool = await fx.slice("tool_worker", "Slice blocked through the tool", "src/tool.ts");
+
+    const blocker = "The upstream schema freeze blocks this slice until the owner lifts it.";
+    await fx.block(tool.worker, blocker);
+    await fx.idle(sentinel.worker, `Cannot proceed.\nULTRAGOAL_BLOCKED: ${blocker}`);
+
+    const sentinelRow = fx.agentRow(sentinel.worker);
+    const toolRow = fx.agentRow(tool.worker);
+    assert.equal(sentinelRow.report_status, "blocked", "a text sentinel must establish durable blocking state");
+    assert.equal(toolRow.report_status, "blocked");
+    for (const row of [sentinelRow, toolRow]) {
+      const stored = JSON.parse(row.report_evidence ?? "{}") as { version?: number; evidence?: string; finding_evidence?: unknown };
+      assert.equal(stored.version, 1, "both paths store the same report record shape");
+      assert.equal(JSON.stringify(stored.finding_evidence), "[]");
+      assert.match(stored.evidence ?? "", /upstream schema freeze/);
+    }
+    assert.equal(fx.itemRow(sentinel.item.id).status, "in_progress", "a blocked slice stays owned");
+    assert.equal(fx.itemRow(tool.item.id).status, "in_progress");
+  });
+
+  it("keeps a running blocked worker's strike count while an unblocked control resets", async () => {
+    const fx = durableHost({ workerStatus: () => "active" });
+    const blocked = await fx.slice("running_blocked", "Blocked slice with a host that reads running", "src/blocked.ts");
+    const control = await fx.slice("running_control", "Ordinary slice with a host that reads running", "src/control.ts");
+    await fx.block(blocked.worker, "Blocked while the host still reads this worker as running.");
+    fx.db.prepare("UPDATE collab_agents SET nudge_count = 2 WHERE thread_id IN (?, ?)").run(blocked.worker, control.worker);
+
+    await fx.heal();
+
+    assert.equal(fx.agentRow(blocked.worker).nudge_count, 2, "an observed running must not strike-reset a blocked worker");
+    assert.equal(fx.agentRow(control.worker).nudge_count, 0, "an observed running still strike-resets ordinary work");
+  });
+
+  it("does not nudge or retire a durably blocked idle worker", async () => {
+    const fx = durableHost();
+    const blocked = await fx.slice("blocked_idle", "Blocked idle slice past the nudge cap", "src/blocked-idle.ts");
+    await fx.block(blocked.worker, "Blocked and idle: the operator owns the next move.");
+    fx.db.prepare("UPDATE collab_agents SET nudge_count = 3, last_nudge_at = ? WHERE thread_id = ?").run(Date.now() - 16 * 60_000, blocked.worker);
+    const spawnsBefore = fx.spawned.length;
+
+    await fx.heal();
+
+    const row = fx.agentRow(blocked.worker);
+    assert.equal(row.retired_at, null, "a blocked worker is never retired for being unresponsive");
+    assert.equal(row.nudge_count, 3, "a blocked worker is never nudged");
+    assert.equal(row.report_status, "blocked");
+    assert.equal(fx.itemRow(blocked.item.id).status, "in_progress", "the blocked slice stays with its owner");
+    assert.deepEqual(fx.liveOwners(blocked.item.id), [blocked.worker]);
+    assert.equal(fx.sendsTo(blocked.worker).length, 0, "no stall nudge reaches a blocked worker");
+    assert.equal(fx.spawned.length, spawnsBefore, "no replacement worker is spawned for the held slice");
+  });
+
+  it("still nudges and retires ordinary idle workers on schedule", async (t) => {
+    const realNow = Date.now();
+    t.mock.timers.enable({ apis: ["Date"] });
+    t.mock.timers.setTime(realNow);
+    const fx = durableHost();
+    const stale = await fx.slice("stale_idle", "Ordinary idle slice past the nudge cap", "src/stale.ts");
+    const nudge = await fx.slice("nudge_idle", "Ordinary idle slice inside the nudge cap", "src/nudge.ts");
+    const finished = await fx.slice("done_worker", "Slice that closes through a done report", "src/done.ts");
+    const done = await fx.host.harness.behavior.callAgentTool(
+      "slice_done",
+      { evidence: "commit deadbee; the slice check passed" },
+      { threadId: finished.worker },
+    );
+    assert.equal(isToolError(done), false, toolText(done));
+    await fx.idle(finished.worker, "Worker finished and called slice_done.");
+    assert.equal(fx.itemRow(finished.item.id).status, "completed", "ordinary completion still closes the slice");
+    fx.db.prepare("UPDATE collab_agents SET nudge_count = 3, last_nudge_at = ? WHERE thread_id = ?").run(realNow - 16 * 60_000, stale.worker);
+    fx.db.prepare("UPDATE collab_agents SET nudge_count = 2, last_nudge_at = ? WHERE thread_id = ?").run(realNow - 16 * 60_000, nudge.worker);
+
+    await fx.heal(); // retires the stale and finished rows, seeds the nudge grace window
+    assert.notEqual(fx.agentRow(stale.worker).retired_at, null, "ordinary unresponsive workers still retire");
+    assert.notEqual(fx.agentRow(finished.worker).retired_at, null, "finished-worker retirement still fires");
+    assert.ok(fx.archived.includes(finished.worker), "the retired worker is archived");
+
+    t.mock.timers.setTime(realNow + 181_000);
+    await fx.heal(); // the grace window has elapsed
+
+    assert.equal(fx.agentRow(nudge.worker).nudge_count, 3, "ordinary idle workers are still nudged");
+    assert.equal(fx.sendsTo(nudge.worker).length, 1, "exactly one stall nudge reaches the ordinary worker");
+  });
+
+  it("keeps a blocked slice held, and the healer off it, across a plugin reload", async () => {
+    const fx = durableHost();
+    const blocked = await fx.slice("reload_blocked", "Blocked slice that must survive a reload", "src/reload.ts");
+    await fx.block(blocked.worker, "Blocked before the plugin reloads.");
+    fx.db.prepare("UPDATE collab_agents SET nudge_count = 3 WHERE thread_id = ?").run(blocked.worker);
+    const spawnsBefore = fx.spawned.length;
+
+    const reloaded = await fx.host.harness.lifecycle.reload(plugin);
+    hosts.push(reloaded);
+    const state = await reloaded.harness.behavior.callAgentTool("ultragoal_state", {}, { threadId: ROOT });
+    assert.equal(isToolError(state), false, toolText(state));
+    await fx.settle();
+
+    // The old generation's handle is closed by the reload; read the durable rows
+    // through the live one.
+    const liveDb = reloaded.bb.storage.database();
+    const row = liveDb
+      .prepare("SELECT report_status, nudge_count, retired_at FROM collab_agents WHERE thread_id = ?")
+      .get(blocked.worker) as { report_status: string | null; nudge_count: number | null; retired_at: number | null };
+    assert.equal(row.retired_at, null, "a reload must not retire a durably blocked worker");
+    assert.equal(row.nudge_count, 3, "a reload must not strike-reset a blocked worker");
+    assert.equal(row.report_status, "blocked");
+    const itemStatus = liveDb.prepare("SELECT status FROM goal_items WHERE id = ?").get(blocked.item.id) as { status: string };
+    assert.equal(itemStatus.status, "in_progress", "the blocked slice stays held after reload");
+    const owners = liveDb
+      .prepare("SELECT thread_id FROM collab_agents WHERE root_thread_id = ? AND item_id = ? AND retired_at IS NULL")
+      .all(ROOT, blocked.item.id) as Array<{ thread_id: string }>;
+    assert.deepEqual(owners.map((owner) => owner.thread_id), [blocked.worker]);
+    const liveRows = liveDb.prepare("SELECT COUNT(*) AS n FROM collab_agents WHERE root_thread_id = ? AND retired_at IS NULL").get(ROOT) as { n: number };
+    assert.equal(liveRows.n, 1, "only the blocked owner remains live after reload");
+    assert.equal(fx.spawned.length, spawnsBefore, "no replacement is staffed for the blocked slice");
+  });
+
+  it("wakes the root once per blocking transition", async (t) => {
+    const realNow = Date.now();
+    t.mock.timers.enable({ apis: ["Date"] });
+    t.mock.timers.setTime(realNow);
+    const fx = durableHost({ lastContinueAt: realNow - 10_000 });
+    const held = await fx.slice("wake_worker", "Blocked slice whose reports must not re-wake the root", "src/wake.ts");
+    const rootSends = () => fx.sendsTo(ROOT);
+
+    await fx.block(held.worker, "Blocker one: the schema freeze has not been lifted yet.");
+    await fx.idle(held.worker, "Ending the turn after the blocked report.");
+    assert.equal(rootSends().length, 1, "the first blocked report wakes the root exactly once");
+
+    // Past the 8s start-in-flight window, so a second wake would really send.
+    t.mock.timers.setTime(realNow + 10_000);
+    await fx.block(held.worker, "Second wording: the same schema freeze still blocks this slice.");
+    await fx.idle(held.worker, "Ending the turn after the repeat blocked report.");
+    assert.equal(rootSends().length, 1, "a repeat block with new wording is not a new transition");
+
+    await fx.host.harness.behavior.callAgentTool(
+      "slice_done",
+      { evidence: "commit deadbee; the blocked slice's check passed before re-blocking" },
+      { threadId: held.worker },
+    );
+    await fx.block(held.worker, "Third: a genuinely new blocking transition after a done report.");
+    await fx.idle(held.worker, "Ending the turn after the post-done blocked report.");
+    assert.equal(rootSends().length, 2, "a block after a done report wakes the root again");
+  });
+
+  it("keeps release and --hold authoritative for a blocked slice", async () => {
+    const fx = durableHost();
+    const released = await fx.slice("release_blocked", "Blocked slice released back to the queue", "src/release.ts");
+    const held = await fx.slice("hold_blocked", "Blocked slice released under a hold", "src/hold.ts");
+    await fx.block(released.worker, "Blocked until the operator releases the slice.");
+    await fx.block(held.worker, "Blocked until the operator releases it under a hold.");
+
+    // Close the fence first so the release itself is observable: the slice must
+    // reach `pending` with no owner before capacity returns.
+    const empty = await fx.host.harness.behavior.runCli(["workers", "0", "--thread", ROOT]);
+    assert.equal(empty.exitCode, 0, empty.stderr);
+    await fx.settle();
+
+    const release = await fx.host.harness.behavior.runCli(["release", released.item.id, "--thread", ROOT]);
+    assert.equal(release.exitCode, 0, release.stderr);
+    await fx.settle();
+    assert.notEqual(fx.agentRow(released.worker).retired_at, null, "release retires the blocked row");
+    assert.equal(fx.agentRow(released.worker).report_status, "blocked", "the durable report survives retirement");
+    assert.equal(fx.itemRow(released.item.id).status, "pending", "the released slice returns to the queue");
+    assert.deepEqual(fx.liveOwners(released.item.id), [], "no live owner remains after release");
+
+    const cap = await fx.host.harness.behavior.runCli(["workers", "2", "--thread", ROOT]);
+    assert.equal(cap.exitCode, 0, cap.stderr);
+    await fx.settle();
+    const replacements = fx.liveOwners(released.item.id);
+    assert.equal(replacements.length, 1, "exactly one replacement claimant");
+    assert.notEqual(replacements[0], released.worker, "the replacement is a fresh thread, not the blocked owner");
+    assert.equal(fx.itemRow(released.item.id).status, "in_progress", "the replacement claimed the slice");
+
+    const hold = await fx.host.harness.behavior.runCli(["release", held.item.id, "--hold", "--thread", ROOT]);
+    assert.equal(hold.exitCode, 0, hold.stderr);
+    assert.match(hold.stdout ?? "", /held/i);
+    await fx.settle();
+    assert.notEqual(fx.agentRow(held.worker).retired_at, null, "--hold still retires the blocked row");
+    assert.equal(fx.itemRow(held.item.id).status, "pending", "a held slice waits in the queue");
+    const kick = await fx.host.harness.behavior.runCli(["workers", "2", "--thread", ROOT]);
+    assert.equal(kick.exitCode, 0, kick.stderr);
+    await fx.settle();
+    assert.deepEqual(fx.liveOwners(held.item.id), [], "a scheduler kick must not lift the hold");
+    const unhold = await fx.host.harness.behavior.runCli(["item", held.item.id, "--unhold", "--thread", ROOT]);
+    assert.equal(unhold.exitCode, 0, unhold.stderr);
+    await fx.settle();
+    assert.equal(fx.liveOwners(held.item.id).length, 1, "lifting the hold staffs exactly one replacement");
+    assert.equal(fx.itemRow(held.item.id).status, "in_progress");
+  });
+
+  it("keeps the verifier path authoritative and never stamps the source worker", async () => {
+    const fx = durableHost();
+    fx.db.prepare("UPDATE goals SET verify_enabled = 1 WHERE thread_id = ?").run(ROOT);
+    const judged = await fx.slice("verified_worker", "Slice judged by an independent verifier", "src/verified.ts");
+    const seedVerifier = (threadId: string) =>
+      fx.db.prepare(`
+        INSERT INTO collab_agents (
+          thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+          display_name, item_id, role, source_thread_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'verifier', ?)
+      `).run(threadId, ROOT, ROOT, `/root/${threadId}`, Date.now(), threadId, judged.item.id, judged.worker);
+    seedVerifier("thr_verifier_one");
+
+    await fx.idle("thr_verifier_one", "ULTRAGOAL_BLOCKED\nVERIFY_FAIL: the work is not finished");
+    assert.equal(fx.agentRow(judged.worker).report_status, null, "the verifier path never stamps the source worker");
+    assert.equal(fx.itemRow(judged.item.id).status, "in_progress");
+
+    seedVerifier("thr_verifier_two");
+    await fx.idle("thr_verifier_two", "VERIFY_PASS: the work checks out");
+    assert.equal(fx.itemRow(judged.item.id).status, "completed", "a passing verifier still closes the slice");
+  });
+});

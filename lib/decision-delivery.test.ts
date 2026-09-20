@@ -3,11 +3,15 @@ import assert from "node:assert/strict";
 import { createFakePluginHost, type FakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { createDecisionStore, type DecisionStore } from "./decisions.ts";
 import {
+  createRootWakeupStore,
   decisionAnswerMarker,
   decisionAnswerMessage,
   decisionIdsInTimeline,
   deliverAnsweredDecisions,
+  reconcileWakeup,
+  wakeupMarker,
   type PendingDecision,
+  type RootWakeupStore,
 } from "./decision-delivery.ts";
 import { createGoalStore } from "./store.ts";
 
@@ -49,6 +53,30 @@ function hostWithStore(pluginId: string, preCreateOldTable = false): { decisions
 
 function pending(id: string, answer = "yes"): PendingDecision {
   return { id, question: `Question for ${id}?`, answer };
+}
+
+/** A wakeup ledger over its own fake host, so durability is real SQLite state. */
+function wakeupHost(pluginId: string): {
+  store: RootWakeupStore;
+  db: ReturnType<FakePluginHost["bb"]["storage"]["database"]>;
+} {
+  const host = createFakePluginHost({ pluginId });
+  hosts.push(host);
+  const db = host.bb.storage.database();
+  return { store: createRootWakeupStore(db), db };
+}
+
+function rowCount(
+  db: ReturnType<FakePluginHost["bb"]["storage"]["database"]>,
+  threadId?: string,
+): number {
+  const row =
+    threadId === undefined
+      ? (db.prepare("SELECT COUNT(*) AS n FROM goal_root_wakeups").get() as { n: number })
+      : (db
+          .prepare("SELECT COUNT(*) AS n FROM goal_root_wakeups WHERE thread_id = ?")
+          .get(threadId) as { n: number });
+  return row.n;
 }
 
 describe("owner decision delivery state", () => {
@@ -195,5 +223,326 @@ describe("timeline delivery detection", () => {
   it("does not confuse one decision's marker with another's", () => {
     const rows = [`${decisionAnswerMarker("dec_a")}: done`];
     assert.deepEqual(decisionIdsInTimeline(rows, ["dec_ab"]), new Set());
+  });
+});
+
+describe("durable per-root wakeup ledger", () => {
+  it("coalesces a burst of 100 events into one row per root", () => {
+    const { store, db } = wakeupHost("wakeup-coalesce-test");
+    for (let index = 0; index < 100; index += 1) {
+      store.note("thr_root_a", `change ${index}`, 1000 + index);
+    }
+    const row = store.get("thr_root_a")!;
+    assert.equal(row.revision, 100, "the single row counts every event");
+    assert.equal(row.settledRevision, 0);
+    assert.equal(row.state, "pending");
+    assert.equal(row.summary, "change 99");
+    assert.equal(row.createdAt, 1000);
+    assert.equal(row.updatedAt, 1099);
+    assert.equal(row.queueMessageId, null);
+    assert.equal(row.queueUpdatedAt, null);
+    assert.equal(rowCount(db, "thr_root_a"), 1, "one row per root, not one row per event");
+    assert.equal(store.outstanding("thr_root_a")?.revision, 100);
+
+    store.note("thr_root_b", "second root", 2000);
+    assert.equal(rowCount(db, "thr_root_b"), 1);
+    assert.equal(store.outstanding("thr_root_b")?.revision, 1);
+    assert.deepEqual(
+      store.listOutstanding().map((entry) => entry.threadId),
+      ["thr_root_a", "thr_root_b"],
+      "each root owns its own outstanding wakeup",
+    );
+  });
+
+  it("refuses a blank summary before writing and trims the one it stores", () => {
+    const { store, db } = wakeupHost("wakeup-summary-test");
+    assert.throws(() => store.note("thr_root", "   ", 1), /blank/i);
+    assert.equal(store.get("thr_root"), null);
+    assert.equal(rowCount(db), 0, "a refused note writes nothing at all");
+    assert.equal(store.note("thr_root", "  padded  ", 5).summary, "padded");
+  });
+
+  it("reports nothing outstanding for a root that never woke", () => {
+    const { store } = wakeupHost("wakeup-absent-test");
+    assert.equal(store.get("thr_none"), null);
+    assert.equal(store.outstanding("thr_none"), null);
+    assert.deepEqual(store.listOutstanding(), []);
+  });
+
+  it("settles the observed revision exactly once and refuses duplicate, stale and absent settles", () => {
+    const { store } = wakeupHost("wakeup-cas-test");
+    store.note("thr_root", "one", 1);
+    store.note("thr_root", "two", 2);
+    store.note("thr_root", "three", 3);
+
+    const settled = store.settle("thr_root", 3, { kind: "dispatched" }, 10)!;
+    assert.equal(settled.settledRevision, 3);
+    assert.equal(settled.state, "dispatched");
+    assert.equal(store.outstanding("thr_root"), null);
+
+    assert.equal(
+      store.settle("thr_root", 3, { kind: "dispatched" }, 11),
+      null,
+      "the same revision cannot settle twice",
+    );
+    assert.equal(
+      store.settle("thr_root", 1, { kind: "queued", messageId: "q1", queueUpdatedAt: 5 }, 12),
+      null,
+      "a stale revision cannot overwrite the committed settle",
+    );
+    assert.equal(
+      store.settle("thr_absent", 1, { kind: "dispatched" }, 13),
+      null,
+      "a root with no row has nothing to settle",
+    );
+    assert.equal(store.get("thr_root")!.updatedAt, 10, "refused CAS attempts write nothing");
+    assert.equal(store.get("thr_root")!.state, "dispatched");
+  });
+
+  it("keeps a queued message identity across later events instead of re-creating it", () => {
+    const { store } = wakeupHost("wakeup-queue-identity-test");
+    store.note("thr_root", "first", 1);
+    const queued = store.settle(
+      "thr_root",
+      1,
+      { kind: "queued", messageId: "q7", queueUpdatedAt: 5 },
+      2,
+    )!;
+    assert.equal(queued.state, "queued");
+    assert.equal(queued.queueMessageId, "q7");
+    assert.equal(queued.queueUpdatedAt, 5);
+    assert.equal(store.outstanding("thr_root"), null, "a queued message is the outstanding delivery");
+
+    for (let index = 0; index < 5; index += 1) store.note("thr_root", `more ${index}`, 3 + index);
+    const outstanding = store.outstanding("thr_root")!;
+    assert.equal(outstanding.revision, 6);
+    assert.equal(outstanding.state, "queued", "a queued row keeps its state through new events");
+    assert.equal(outstanding.queueMessageId, "q7");
+    assert.equal(outstanding.queueUpdatedAt, 5);
+    assert.equal(outstanding.settledRevision, 1);
+    assert.equal(
+      reconcileWakeup({
+        row: outstanding,
+        queue: { ok: true, rows: [{ id: "q7", content: "an older copy" }] },
+        timeline: { ok: true, rows: [] },
+      }),
+      "queued",
+      "the retained queued row is updated in place, never re-created",
+    );
+  });
+
+  it("refuses a queued outcome with a blank message id or a non-finite timestamp", () => {
+    const { store } = wakeupHost("wakeup-invalid-queue-test");
+    store.note("thr_root", "work", 1);
+    assert.throws(
+      () => store.settle("thr_root", 1, { kind: "queued", messageId: "   ", queueUpdatedAt: 1 }, 2),
+      /message id/,
+    );
+    assert.throws(
+      () =>
+        store.settle(
+          "thr_root",
+          1,
+          { kind: "queued", messageId: "q1", queueUpdatedAt: Number.NaN },
+          2,
+        ),
+      /finite/,
+    );
+    const row = store.get("thr_root")!;
+    assert.equal(row.settledRevision, 0, "a half identity never records a settle");
+    assert.equal(row.state, "pending");
+    assert.equal(row.queueMessageId, null);
+    assert.equal(row.updatedAt, 1);
+  });
+
+  it("retains an event that arrived during settlement and yields exactly one follow-up", () => {
+    const { store } = wakeupHost("wakeup-during-settle-test");
+    store.note("thr_root", "revision one", 1);
+    store.note("thr_root", "revision two", 2);
+
+    const applied = store.settle("thr_root", 1, { kind: "dispatched" }, 3)!;
+    assert.equal(applied.settledRevision, 1, "the outcome covered only the revision it settled");
+    assert.equal(applied.revision, 2, "the newer event is not lost");
+    assert.equal(applied.state, "pending");
+    assert.equal(store.outstanding("thr_root")!.revision, 2);
+
+    const followUp = store.settle("thr_root", 2, { kind: "dispatched" }, 4)!;
+    assert.equal(followUp.settledRevision, 2);
+    assert.equal(store.outstanding("thr_root"), null, "exactly one follow-up clears the row");
+    assert.equal(store.settle("thr_root", 2, { kind: "dispatched" }, 5), null);
+  });
+
+  it("records a queued identity even when a newer event keeps the row pending", () => {
+    const { store } = wakeupHost("wakeup-during-settle-queued-test");
+    store.note("thr_root", "one", 1);
+    store.note("thr_root", "two", 2);
+    const applied = store.settle(
+      "thr_root",
+      1,
+      { kind: "queued", messageId: "q9", queueUpdatedAt: 7 },
+      3,
+    )!;
+    assert.equal(applied.settledRevision, 1);
+    assert.equal(applied.revision, 2);
+    assert.equal(applied.state, "pending", "newer unsettled work is pending again");
+    assert.equal(applied.queueMessageId, "q9", "the queued identity is still recorded");
+    assert.equal(applied.queueUpdatedAt, 7);
+    assert.equal(store.outstanding("thr_root")!.revision, 2);
+  });
+
+  it("keeps an unknown send outcome outstanding instead of settling it", () => {
+    const { store } = wakeupHost("wakeup-unknown-test");
+    store.note("thr_root", "uncertain send", 1);
+    const applied = store.settle("thr_root", 1, { kind: "unknown" }, 2)!;
+    assert.equal(applied.state, "unknown");
+    assert.equal(applied.settledRevision, 0, "an unreadable outcome settles nothing");
+    assert.equal(applied.updatedAt, 2);
+    assert.equal(store.outstanding("thr_root")?.state, "unknown");
+
+    store.note("thr_root", "more work", 3);
+    const afterNote = store.outstanding("thr_root")!;
+    assert.equal(afterNote.state, "unknown", "uncertainty survives later events");
+    assert.equal(afterNote.revision, 2);
+    assert.equal(afterNote.settledRevision, 0);
+  });
+
+  it("survives a reload through a second store over the same database", () => {
+    const { store, db } = wakeupHost("wakeup-reload-test");
+    store.note("thr_root", "pending across reload", 1);
+    store.settle("thr_root", 1, { kind: "queued", messageId: "q9", queueUpdatedAt: 7 }, 2);
+    store.note("thr_root", "arrived before the reload", 3);
+
+    const reloaded = createRootWakeupStore(db);
+    const row = reloaded.get("thr_root")!;
+    assert.equal(row.queueMessageId, "q9");
+    assert.equal(row.queueUpdatedAt, 7);
+    assert.equal(row.revision, 2);
+    assert.equal(row.settledRevision, 1);
+    assert.equal(row.state, "queued");
+    assert.equal(row.summary, "arrived before the reload");
+    assert.equal(row.createdAt, 1);
+    assert.equal(row.updatedAt, 3);
+    assert.deepEqual(reloaded.outstanding("thr_root"), row);
+  });
+});
+
+describe("wakeup reconciliation policy", () => {
+  it("treats a covered or absent row as settled, even with unreadable evidence", () => {
+    const { store } = wakeupHost("wakeup-reconcile-settled-test");
+    const unreadable = { queue: { ok: false, rows: [] }, timeline: { ok: false, rows: [] } };
+    assert.equal(reconcileWakeup({ row: null, ...unreadable }), "settled");
+
+    store.note("thr_root", "handled", 1);
+    store.settle("thr_root", 1, { kind: "dispatched" }, 2);
+    assert.equal(reconcileWakeup({ row: store.get("thr_root"), ...unreadable }), "settled");
+  });
+
+  it("holds when either evidence source is unreadable and sends only on readable absence", () => {
+    const { store } = wakeupHost("wakeup-reconcile-hold-test");
+    store.note("thr_root", "uncertain", 1);
+    const row = store.outstanding("thr_root")!;
+    assert.equal(
+      reconcileWakeup({ row, queue: { ok: true, rows: [] }, timeline: { ok: false, rows: [] } }),
+      "hold",
+      "unreadable history never claims delivery",
+    );
+    assert.equal(
+      reconcileWakeup({ row, queue: { ok: false, rows: [] }, timeline: { ok: true, rows: [] } }),
+      "hold",
+      "unreadable queue evidence never authorizes a blind resend",
+    );
+    assert.equal(
+      reconcileWakeup({ row, queue: { ok: false, rows: [] }, timeline: { ok: false, rows: [] } }),
+      "hold",
+    );
+    assert.equal(
+      reconcileWakeup({ row, queue: { ok: true, rows: [] }, timeline: { ok: true, rows: [] } }),
+      "send",
+      "readable evidence that shows nothing landed is the reconciled resend path",
+    );
+  });
+
+  it("proves delivery from the marker in nested history rows", () => {
+    const { store } = wakeupHost("wakeup-reconcile-history-test");
+    store.note("thr_root", "landed", 1);
+    const marker = wakeupMarker("thr_root");
+    assert.equal(marker, "ULTRAWAKE (thr_root)");
+    assert.equal(
+      reconcileWakeup({
+        row: store.outstanding("thr_root"),
+        queue: { ok: true, rows: [] },
+        timeline: {
+          ok: true,
+          rows: [
+            {
+              id: "row_1",
+              content: [{ type: "text", text: `chatter then ${marker}: acted on` }],
+            },
+          ],
+        },
+      }),
+      "dispatched",
+    );
+    assert.equal(
+      reconcileWakeup({
+        row: store.outstanding("thr_root"),
+        queue: { ok: true, rows: [] },
+        timeline: { ok: true, rows: [wakeupMarker("thr_other")] },
+      }),
+      "send",
+      "another root's marker is not this root's proof",
+    );
+  });
+
+  it("matches the queue by message identity or marker and never re-creates it", () => {
+    const { store } = wakeupHost("wakeup-reconcile-queue-test");
+    store.note("thr_root", "first", 1);
+    store.settle("thr_root", 1, { kind: "queued", messageId: "q7", queueUpdatedAt: 5 }, 2);
+    store.note("thr_root", "more", 3);
+    const row = store.outstanding("thr_root")!;
+    assert.equal(
+      reconcileWakeup({
+        row,
+        queue: { ok: true, rows: [{ id: "q7", content: "older copy" }] },
+        timeline: { ok: true, rows: [] },
+      }),
+      "queued",
+    );
+    assert.equal(
+      reconcileWakeup({
+        row,
+        queue: { ok: true, rows: [{ id: "q8", content: `WIP ${wakeupMarker("thr_root")}` }] },
+        timeline: { ok: true, rows: [] },
+      }),
+      "queued",
+      "content carrying the marker is the same proof when the identity moved",
+    );
+    assert.equal(
+      reconcileWakeup({
+        row,
+        queue: { ok: true, rows: [{ id: "unrelated", content: "other" }] },
+        timeline: { ok: true, rows: [] },
+      }),
+      "send",
+      "a queue without the identity is not evidence that anything landed",
+    );
+  });
+
+  it("decides without mutating the durable row", () => {
+    const { store } = wakeupHost("wakeup-reconcile-pure-test");
+    store.note("thr_root", "pending", 1);
+    const before = store.get("thr_root")!;
+    reconcileWakeup({
+      row: before,
+      queue: { ok: true, rows: [] },
+      timeline: { ok: true, rows: [] },
+    });
+    reconcileWakeup({
+      row: before,
+      queue: { ok: false, rows: [] },
+      timeline: { ok: false, rows: [] },
+    });
+    assert.deepEqual(store.get("thr_root"), before);
+    assert.equal(store.outstanding("thr_root")!.revision, 1);
   });
 });

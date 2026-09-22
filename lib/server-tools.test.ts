@@ -2084,6 +2084,230 @@ describe("large-plan agent tool contracts", () => {
   });
 });
 
+describe("owner decision cards: one active card per root", () => {
+  const callTool = async (
+    host: FakePluginHost,
+    name: string,
+    input: unknown,
+    threadId: string,
+  ): Promise<{ isError: boolean; text: string }> => {
+    const result = await host.harness.behavior.callAgentTool(name, input, { threadId });
+    return { isError: isToolError(result), text: toolText(result) };
+  };
+
+  const startGoal = async (host: FakePluginHost, threadId: string, objective: string) => {
+    const started = await callTool(host, "ultragoal_start", { objective }, threadId);
+    assert.equal(started.isError, false, started.text);
+  };
+
+  const requestDecision = async (
+    host: FakePluginHost,
+    threadId: string,
+    question: string,
+  ): Promise<string> => {
+    const requested = await callTool(
+      host,
+      "request_decision",
+      { question, context: "One active card per root is under test.", options: ["yes", "no"] },
+      threadId,
+    );
+    assert.equal(requested.isError, false, requested.text);
+    const parsed = JSON.parse(requested.text) as {
+      decision_id: string;
+      status: string;
+      note: string;
+    };
+    assert.match(parsed.decision_id, /^dec_/);
+    assert.equal(parsed.status, "open");
+    assert.ok(parsed.note.length > 0, "the tool answer keeps its note");
+    return parsed.decision_id;
+  };
+
+  const ownerCards = (host: FakePluginHost, rootId: string) =>
+    host.harness.pendingInteractions.filter(
+      (interaction) =>
+        interaction.threadId === rootId && interaction.rendererId === "owner-decision",
+    );
+
+  const cardDecisionId = (card: { payload?: unknown } | undefined): string | undefined =>
+    (card?.payload as { decisionId?: string } | null | undefined)?.decisionId;
+
+  const openDecisionIds = (text: string): string[] => {
+    const parsed = JSON.parse(text) as {
+      goal: { openDecisions: Array<{ decision_id: string }> };
+    };
+    return parsed.goal.openDecisions.map((decision) => decision.decision_id);
+  };
+
+  const decisionStatus = (host: FakePluginHost, id: string): string | undefined =>
+    (
+      host.bb.storage.database()
+        .prepare("SELECT status FROM goal_decisions WHERE id = ?")
+        .get(id) as { status: string } | undefined
+    )?.status;
+
+  // Detached keeper continuations (submit/cancel handlers, promotion) settle on
+  // microtasks plus one timer turn; wait for them without a fake clock.
+  const drain = async () => {
+    for (let index = 0; index < 10; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  };
+
+  it("raises one owner card per root, keeps the second decision durable, and promotes it when the first resolves", async () => {
+    const host = registeredHost();
+    const root = "thr_card_promotion";
+    await startGoal(host, root, "Prove one active owner card per root with durable promotion");
+
+    // request_decision returns after the durable save while its card is the
+    // single live interaction: it never waits on the card.
+    const first = await requestDecision(host, root, "First owner decision: land the slice alone?");
+    await drain();
+    assert.equal(decisionStatus(host, first), "open", "the decision must be durably saved");
+    assert.equal(ownerCards(host, root).length, 1, "one active card after the first request");
+
+    // A second open decision on the same root must not raise a competing card.
+    const second = await requestDecision(host, root, "Second owner decision: raise the cap too?");
+    await drain();
+    assert.equal(decisionStatus(host, second), "open", "the second decision stays durably open");
+
+    const state = await callTool(host, "ultragoal_state", {}, root);
+    assert.equal(state.isError, false, state.text);
+    assert.deepEqual(
+      openDecisionIds(state.text).sort(),
+      [first, second].sort(),
+      "both open decisions stay visible in ultragoal_state",
+    );
+
+    const active = ownerCards(host, root);
+    assert.equal(
+      active.length,
+      1,
+      `at most one active owner card per root (base raises both concurrently: ${active.length})`,
+    );
+    assert.equal(
+      cardDecisionId(active[0]),
+      first,
+      "the first requested decision holds the active card",
+    );
+
+    // Resolving the active card promotes the durable second decision.
+    host.harness.submitInteraction(active[0]!.id, "yes, land it");
+    await drain();
+    assert.equal(decisionStatus(host, first), "answered", "the submitted answer commits");
+
+    const promoted = ownerCards(host, root);
+    assert.equal(promoted.length, 1, "exactly one active card after promotion");
+    assert.equal(
+      cardDecisionId(promoted[0]),
+      second,
+      "the second decision is durably promoted to the active card",
+    );
+
+    // The promoted card is answerable through the same guarded path.
+    host.harness.submitInteraction(promoted[0]!.id, "no, keep the cap");
+    await drain();
+    assert.equal(decisionStatus(host, second), "answered");
+    assert.equal(ownerCards(host, root).length, 0, "no card outlives its resolution");
+  });
+
+  it("leaves a dismissed decision open, visible, and CLI-answerable, and promotes the next open one", async () => {
+    const host = registeredHost();
+    const root = "thr_card_dismiss";
+    await startGoal(host, root, "Prove dismissal never answers, withdraws, or re-raises a decision");
+
+    const dismissed = await requestDecision(host, root, "Dismiss me and still answer via CLI?");
+    const waiting = await requestDecision(host, root, "Hold the next card until the first leaves?");
+    await drain();
+    const before = ownerCards(host, root);
+    assert.equal(before.length, 1, "the second open decision must not raise a competing card");
+    assert.equal(cardDecisionId(before[0]), dismissed);
+
+    host.harness.cancelInteraction(before[0]!.id);
+    await drain();
+    assert.equal(decisionStatus(host, dismissed), "open", "a dismissed card's decision stays open");
+    const state = await callTool(host, "ultragoal_state", {}, root);
+    assert.deepEqual(
+      openDecisionIds(state.text).sort(),
+      [dismissed, waiting].sort(),
+      "the dismissed decision stays visible in state",
+    );
+    const promoted = ownerCards(host, root);
+    assert.equal(promoted.length, 1, "exactly one card is live after the dismissal");
+    assert.equal(
+      cardDecisionId(promoted[0]),
+      waiting,
+      "promotion must skip the dismissed decision and take the next open one",
+    );
+
+    const cli = await host.harness.behavior.runCli([
+      "decide",
+      dismissed,
+      "answered after dismissal",
+      "--thread",
+      root,
+    ]);
+    assert.equal(cli.exitCode, 0, `decide CLI must answer a dismissed decision: ${cli.stderr}`);
+    assert.equal(decisionStatus(host, dismissed), "answered");
+  });
+
+  it("returns the decision id with its card as the only live interaction", async () => {
+    const host = registeredHost();
+    const root = "thr_card_prompt";
+    await startGoal(host, root, "Prove request_decision returns after the durable save, not after the card");
+
+    // The tool already returned while the card is still pending: it never
+    // waited for the answer, and the row is durable and open underneath it.
+    const decisionId = await requestDecision(host, root, "Is the row durable before the tool returns?");
+    assert.equal(decisionStatus(host, decisionId), "open");
+    const cards = ownerCards(host, root);
+    assert.equal(cards.length, 1, "the request's card must be the only live interaction");
+    assert.equal(cardDecisionId(cards[0]), decisionId);
+    assert.equal(cards[0]?.threadId, root);
+  });
+
+  it("returns the committed answer to a conflicting second resolve_decision without overwriting", async () => {
+    const host = registeredHost();
+    const root = "thr_card_conflict";
+    await startGoal(host, root, "Prove conflicts cannot overwrite the committed answer");
+
+    const decisionId = await requestDecision(host, root, "Which answer commits first?");
+    await drain();
+    const resolved = await callTool(
+      host,
+      "resolve_decision",
+      { decision: decisionId, resolution: "answered", answer: "first committed answer" },
+      root,
+    );
+    assert.equal(resolved.isError, false, resolved.text);
+
+    const conflict = await callTool(
+      host,
+      "resolve_decision",
+      { decision: decisionId, resolution: "answered", answer: "second conflicting answer" },
+      root,
+    );
+    assert.equal(conflict.isError, false, conflict.text);
+    const committed = JSON.parse(conflict.text) as { answer: string; status: string };
+    assert.equal(committed.status, "answered");
+    assert.equal(
+      committed.answer,
+      "first committed answer",
+      "a conflicting second resolution returns the committed answer",
+    );
+    const row = host.bb.storage.database()
+      .prepare("SELECT status, answer FROM goal_decisions WHERE id = ?")
+      .get(decisionId) as { status: string; answer: string };
+    assert.equal(row.status, "answered");
+    assert.equal(
+      row.answer,
+      "first committed answer",
+      "the committed answer is never overwritten by a conflict",
+    );
+  });
+});
+
 describe("resolve_finding end to end", () => {
   const PLUGIN_REPO = "/Users/braedonsaunders/Documents/bb-plugin-ultragoal";
 

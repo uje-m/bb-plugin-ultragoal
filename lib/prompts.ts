@@ -17,6 +17,36 @@ const WORKER_BRIEF = readFileSync(join(templatesDir, "worker_brief.md"), "utf8")
  * a 1,000-slice goal costs roughly the same context as a 20-slice goal.
  */
 export const MAX_PLAN_INSTRUCTION_CHARS = 6_000;
+/**
+ * Hard ceiling for every prompt rendered automatically rather than requested
+ * by a turn: BB's server rejects request bodies above ~8000 characters, so a
+ * longer wake-up never reaches the model. One bound covers all five surfaces.
+ * The untrusted objective absorbs the trim first, and the assembled text is
+ * capped once more as a structural backstop.
+ *
+ * It sits below the request limit on purpose: the bound is not always the whole
+ * request. The controlled-root-takeover handoff joins a transfer marker and a
+ * fixed ~265-character paragraph to continuationPrompt in one send, so a
+ * prompt rendered AT the request limit is still rejected exactly when the
+ * takeover fires. The gap is that composition's headroom; a new composed
+ * callsite budgets itself here rather than appending past the limit.
+ */
+export const MAX_PROMPT_CHARS = 7_500;
+/**
+ * Objective room reserved before the bounded plan instruction takes its share,
+ * so a 1,000-item goal cannot squeeze the task statement out of its own
+ * wake-up. The objective is still the first thing trimmed down to this floor.
+ */
+const MIN_OBJECTIVE_CHARS = 600;
+const OBJECTIVE_TRUNCATION_MARKER =
+  "\n… objective truncated to fit the request limit; the goal pane holds the full text.";
+/**
+ * A ref longer than this is not embedded: it would have to be truncated, and a
+ * shortened ref names a branch that does not exist. The cap is about what can
+ * be handed over verbatim, not about what git permits a ref to be.
+ */
+const MAX_INTEGRATION_BRANCH_CHARS = 200;
+const MAX_PROMPT_DECISION_IDS = 50;
 const MAX_PROMPT_STEP_CHARS = 220;
 const MAX_PROMPT_AGENT_CHARS = 120;
 const MAX_IN_PROGRESS_ITEMS = 20;
@@ -35,15 +65,24 @@ const MAX_AGENT_SECTION_CHARS = 1_400;
  * and the maintained base is `integration`. Two workers were aimed at it; both
  * were careful enough to refuse, and the third would have rebased a factory
  * candidate onto unrelated history, surfacing much later as an unexplained
- * conflict. When the environment cannot be read the brief says so and sends the
- * worker to look the branch up — a guessed branch name is the failure itself.
+ * conflict. A missing environment and a name too long to hand over verbatim
+ * are different facts and the brief keeps them apart: the first says the name
+ * could not be read and fails closed, the second says it was read, must come
+ * from the worker's own environment or the goal's standing rules, and must
+ * never be guessed — a shortened ref names a branch that does not exist.
  */
 export function workerQualityBrief(integrationBranch: string | null): string {
   const named = (integrationBranch ?? "").trim();
-  const baseBranch = named
-    ? `This goal's integration branch is the LOCAL ref \`${named}\` — rebase onto that exact name (your worktree shares the project checkout's refs), and onto no other, however the repository's default branch is named.`
-    : "This goal's integration branch could not be read from its environment: resolve it from the repo's agent docs or this goal's standing rules before you rebase, and never assume `main` — in some repositories `main` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it, which is why this name is normally resolved for you. If those sources do not name it, call slice_blocked rather than rebase onto a guess.";
-  return render(WORKER_BRIEF.trim(), { base_branch: baseBranch });
+  let baseBranch: string;
+  if (named.length === 0) {
+    baseBranch =
+      "This goal's integration branch could not be read from its environment: resolve it from the repo's agent docs or this goal's standing rules before you rebase, and never assume `main` — in some repositories `main` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it, which is why this name is normally resolved for you. If those sources do not name it, call slice_blocked rather than rebase onto a guess.";
+  } else if (named.length > MAX_INTEGRATION_BRANCH_CHARS) {
+    baseBranch = `This goal's integration branch WAS read from its environment, but its name is ${named.length} characters long — too long to embed in this brief, and a shortened copy would name a branch that does not exist. Your worktree was cut from that exact ref, so its name is available from your own environment's base/merge-base branch and from this goal's standing rules: read it there and rebase onto that exact ref, onto no other, however the repository's default branch is named. Never assume \`main\` — in some repositories \`main\` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it. If neither source names it, ask your owning root with \`ultragoal_send_message\` (target \`/root\`) for the exact ref rather than rebase onto a guess.`;
+  } else {
+    baseBranch = `This goal's integration branch is the LOCAL ref \`${named}\` — rebase onto that exact name (your worktree shares the project checkout's refs), and onto no other, however the repository's default branch is named.`;
+  }
+  return hardCap(render(WORKER_BRIEF.trim(), { base_branch: baseBranch }), MAX_PROMPT_CHARS);
 }
 
 function escapeXml(input: string): string {
@@ -97,9 +136,83 @@ function fitLines(lines: readonly string[], maxChars: number): string[] {
   return kept;
 }
 
-export function planInstruction(goal: GoalSnapshot): string {
+/**
+ * Trim the untrusted objective to whatever the fixed frame leaves. It is
+ * unbounded user data and therefore the first thing to give, so no decision
+ * or plan line is ever dropped to make room for it.
+ */
+function fitObjective(
+  template: string,
+  values: Record<string, string>,
+  objective: string,
+): string {
+  const escaped = escapeXml(objective);
+  const room = MAX_PROMPT_CHARS - render(template, { ...values, objective: "" }).length;
+  if (escaped.length <= room) return escaped;
+  let kept = escaped.slice(0, Math.max(0, room - OBJECTIVE_TRUNCATION_MARKER.length));
+  // Never end in a half-written escape or half a surrogate pair.
+  kept = kept.replace(/&[a-z]*$/, "").replace(/[\uD800-\uDBFF]$/, "");
+  return `${kept.trimEnd()}${OBJECTIVE_TRUNCATION_MARKER}`;
+}
+
+function renderBounded(
+  template: string,
+  goal: GoalSnapshot,
+  values: Record<string, string>,
+): string {
+  return hardCap(
+    render(template, { ...values, objective: fitObjective(template, values, goal.objective) }),
+    MAX_PROMPT_CHARS,
+  );
+}
+
+/** A root prompt whose plan instruction is sized to leave the objective its floor. */
+function renderWithPlan(
+  template: string,
+  goal: GoalSnapshot,
+  values: Record<string, string>,
+): string {
+  const frame = render(template, { ...values, objective: "", plan_instruction: "" }).length;
+  const planChars = Math.max(
+    0,
+    MAX_PROMPT_CHARS - frame - MIN_OBJECTIVE_CHARS - OBJECTIVE_TRUNCATION_MARKER.length,
+  );
+  return renderBounded(template, goal, {
+    ...values,
+    plan_instruction: planInstruction(goal, planChars),
+  });
+}
+
+/** The one line a root must never lose while decisions are open. */
+function decisionsLine(goal: GoalSnapshot): string[] {
+  if (goal.decisions.length === 0) return [];
+  const listed = goal.decisions.slice(0, MAX_PROMPT_DECISION_IDS);
+  return [
+    `DECISIONS: ${goal.decisions.length} owner decision(s) await the user (${listed
+      .map((decision) => decision.id)
+      .join(", ")}${
+      goal.decisions.length > listed.length
+        ? ` +${goal.decisions.length - listed.length} more`
+        : ""
+    }). Do not re-ask, do not proceed on assumptions, and do not treat this as blocked — continue all work that does not depend on the answer.`,
+  ];
+}
+
+export function planInstruction(
+  goal: GoalSnapshot,
+  maxChars: number = MAX_PLAN_INSTRUCTION_CHARS,
+): string {
   if (goal.items.length === 0) {
-    return "The UltraGoal pane has no requirements yet. Call ultragoal_patch at the start of this turn with concrete remaining work derived from current evidence: independent, file-disjoint work items with deps/files/check so the scheduler can staff them in parallel. Keep that plan current as you discover or finish work. Do not treat a plan patch as a substitute for doing the work.";
+    // The plan is empty but the decisions are not: this arm returns before the
+    // working set is built, so it carries the marker itself — a root woken
+    // with no plan still has to know which decisions await the user.
+    return hardCap(
+      [
+        ...decisionsLine(goal),
+        "The UltraGoal pane has no requirements yet. Call ultragoal_patch at the start of this turn with concrete remaining work derived from current evidence: independent, file-disjoint work items with deps/files/check so the scheduler can staff them in parallel. Keep that plan current as you discover or finish work. Do not treat a plan patch as a substitute for doing the work.",
+      ].join("\n"),
+      maxChars,
+    );
   }
   const completedIds = new Set(
     goal.items.filter((item) => item.status === "completed").map((item) => item.id),
@@ -204,15 +317,6 @@ export function planInstruction(goal: GoalSnapshot): string {
     }
   }
 
-  const decisionsLine =
-    goal.decisions.length > 0
-      ? [
-          `DECISIONS: ${goal.decisions.length} owner decision(s) await the user (${goal.decisions
-            .slice(0, 20)
-            .map((decision) => decision.id)
-            .join(", ")}${goal.decisions.length > 20 ? ` +${goal.decisions.length - 20} more` : ""}). Do not re-ask, do not proceed on assumptions, and do not treat this as blocked — continue all work that does not depend on the answer.`,
-        ]
-      : [];
   const findingsLine =
     goal.findings.open > 0
       ? [
@@ -223,15 +327,17 @@ export function planInstruction(goal: GoalSnapshot): string {
       : [];
   const summaryLine = `Plan summary: ${goal.items.length} total; ${completedIds.size} completed; ${inProgress.length} in progress; ${ready.length} ready; ${blocked.length} blocked. Completed slice bodies are intentionally omitted.`;
   const headingLine = "Current bounded working set (ultragoal_patch is patch-style: send only changed/new work items; omitted items are preserved):";
+  // Decision markers lead the tail: the plan hardCap trims from the end, so
+  // the one line a root must never lose is the first thing it would keep.
   const tailLines = [
+    ...decisionsLine(goal),
     ...agentLines,
     ...schedulerLines,
-    ...decisionsLine,
     ...findingsLine,
   ];
   const reservedOmissionChars = 180;
   const fixedChars = [summaryLine, headingLine, ...tailLines].join("\n").length;
-  const itemBudget = Math.max(0, MAX_PLAN_INSTRUCTION_CHARS - fixedChars - reservedOmissionChars);
+  const itemBudget = Math.max(0, maxChars - fixedChars - reservedOmissionChars);
   const workingLines = fitLines(candidates.map(lineForItem), itemBudget);
   const omitted = open.length - workingLines.length;
   const omissionLine =
@@ -240,31 +346,26 @@ export function planInstruction(goal: GoalSnapshot): string {
       : null;
   return hardCap(
     [summaryLine, headingLine, ...workingLines, ...(omissionLine ? [omissionLine] : []), ...tailLines].join("\n"),
-    MAX_PLAN_INSTRUCTION_CHARS,
+    maxChars,
   );
 }
 
 export function progressPrompt(goal: GoalSnapshot): string {
-  return render(PROGRESS, {
-    objective: escapeXml(goal.objective),
-    plan_instruction: planInstruction(goal),
+  return renderWithPlan(PROGRESS, goal, {
     max_workers: String(goal.settings.maxWorkers),
     ...budgetFields(goal),
   });
 }
 
 export function continuationPrompt(goal: GoalSnapshot): string {
-  return render(CONTINUATION, {
-    objective: escapeXml(goal.objective),
-    plan_instruction: planInstruction(goal),
+  return renderWithPlan(CONTINUATION, goal, {
     max_workers: String(goal.settings.maxWorkers),
     ...budgetFields(goal),
   });
 }
 
 export function budgetLimitPrompt(goal: GoalSnapshot): string {
-  return render(BUDGET_LIMIT, {
-    objective: escapeXml(goal.objective),
+  return renderBounded(BUDGET_LIMIT, goal, {
     time_used_seconds: String(goal.timeUsedSeconds),
     tokens_used: String(goal.tokensUsed),
     token_budget: goal.tokenBudget == null ? "none" : String(goal.tokenBudget),
@@ -272,10 +373,7 @@ export function budgetLimitPrompt(goal: GoalSnapshot): string {
 }
 
 export function objectiveUpdatedPrompt(goal: GoalSnapshot): string {
-  return render(OBJECTIVE_UPDATED, {
-    objective: escapeXml(goal.objective),
-    ...budgetFields(goal),
-  });
+  return renderBounded(OBJECTIVE_UPDATED, goal, budgetFields(goal));
 }
 
 export function remainingTokens(goal: GoalSnapshot): number | null {

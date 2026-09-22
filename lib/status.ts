@@ -5,7 +5,7 @@ export const DEFAULT_GOAL_PAGE_LIMIT = 40;
 export const MAX_GOAL_PAGE_LIMIT = 100;
 const MAX_STATUS_ITEMS = 40;
 const MAX_STATUS_AGENTS = 20;
-const MAX_STATUS_DECISIONS = 20;
+export const MAX_STATUS_DECISIONS = 20;
 
 export type PlanStatusFilter = "open" | "pending" | "in_progress" | "completed" | "all";
 
@@ -122,6 +122,11 @@ export function formatGoalCard(goal: GoalSnapshot): string {
       `DELIVERY PENDING: [${decision.id}] answer recorded but not yet delivered to the orchestrator — ${decision.answer ?? ""}`,
     );
   }
+  if (goal.undeliveredDecisions.length > MAX_STATUS_DECISIONS) {
+    lines.push(
+      `DELIVERY PENDING: … ${goal.undeliveredDecisions.length - MAX_STATUS_DECISIONS} more answered-but-undelivered decision(s) omitted`,
+    );
+  }
   if (
     goal.findings.open + goal.findings.fixed + goal.findings.fixedUnverified + goal.findings.dismissed >
     0
@@ -214,11 +219,13 @@ export function goalToolResponse(
             })),
             // Answered but not yet steered into the root: a stalled answer the
             // status surface could not report before, so it read as healthy.
-            pendingDeliveryDecisions: goal.undeliveredDecisions.map((decision) => ({
-              decision_id: decision.id,
-              question: decision.question,
-              answer: decision.answer,
-            })),
+            pendingDeliveryDecisions: goal.undeliveredDecisions
+              .slice(0, MAX_STATUS_DECISIONS)
+              .map((decision) => ({
+                decision_id: decision.id,
+                question: decision.question,
+                answer: decision.answer,
+              })),
             openFindings: openFindings.slice(0, 20).map((finding) => ({
               finding_id: finding.id,
               title: finding.title,

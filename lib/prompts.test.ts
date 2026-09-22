@@ -1,13 +1,32 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  budgetLimitPrompt,
   continuationPrompt,
   MAX_PLAN_INSTRUCTION_CHARS,
+  MAX_PROMPT_CHARS,
+  objectiveUpdatedPrompt,
   planInstruction,
   progressPrompt,
   workerQualityBrief,
 } from "./prompts.ts";
 import { makeLargeGoal } from "./test-goal.ts";
+
+function makeWorstCaseGoal() {
+  const goal = makeLargeGoal();
+  goal.objective = `Objective marker: ${"expanded requirement detail ".repeat(220)}`;
+  goal.decisions = Array.from({ length: 25 }, (_, index) => ({
+    id: `dec_${String(index).padStart(3, "0")}`,
+    question: `Owner choice ${index}?`,
+    context: null,
+    options: ["yes", "no"],
+    status: "open" as const,
+    answer: null,
+    createdAt: index,
+    deliveredAt: null,
+  }));
+  return goal;
+}
 
 describe("bounded UltraGoal prompts", () => {
   it("keeps a 1,000-item plan at or below 6KB without completed bodies", () => {
@@ -24,7 +43,7 @@ describe("bounded UltraGoal prompts", () => {
     const goal = makeLargeGoal();
     const continuation = continuationPrompt(goal);
     const progress = progressPrompt(goal);
-    assert.ok(continuation.length < 8_500, `continuation was ${continuation.length} chars`);
+    assert.ok(continuation.length <= MAX_PROMPT_CHARS, `continuation was ${continuation.length} chars`);
     assert.ok(progress.length < 8_000, `progress was ${progress.length} chars`);
     assert.doesNotMatch(continuation, /COMPLETED_BODY_/);
     assert.doesNotMatch(progress, /COMPLETED_BODY_/);
@@ -33,6 +52,111 @@ describe("bounded UltraGoal prompts", () => {
     assert.match(workerQualityBrief("integration"), /Workers never push/);
     assert.doesNotMatch(workerQualityBrief("integration"), /pushing origin is solely/i);
     assert.match(continuation, /compact wake-up, not a new goal/);
+  });
+
+  it("holds every automatically rendered prompt inside the request limit", () => {
+    // BB's server rejects request bodies above ~8000 characters, and the old
+    // surfaces had no shared bound: a 6,000-character objective rendered
+    // continuationPrompt at ~13.6k, so the wake-up never reached the model.
+    const goal = makeWorstCaseGoal();
+    const longBranch = `factory/${"overlong-branch-name-".repeat(60)}`;
+    const rendered: Array<[string, string]> = [
+      ["continuationPrompt", continuationPrompt(goal)],
+      ["progressPrompt", progressPrompt(goal)],
+      ["budgetLimitPrompt", budgetLimitPrompt(goal)],
+      ["objectiveUpdatedPrompt", objectiveUpdatedPrompt(goal)],
+      ["workerQualityBrief", workerQualityBrief(longBranch)],
+    ];
+    assert.ok(MAX_PROMPT_CHARS <= 8_000, `bound was ${MAX_PROMPT_CHARS}`);
+    for (const [name, text] of rendered) {
+      assert.ok(text.length <= MAX_PROMPT_CHARS, `${name} was ${text.length} chars`);
+    }
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      assert.match(text, /Objective marker: /);
+      assert.match(text, /objective truncated to fit the request limit/);
+    }
+    for (const text of [budgetLimitPrompt(goal), objectiveUpdatedPrompt(goal)]) {
+      assert.match(text, /Objective marker: /);
+    }
+  });
+
+  it("keeps the DECISIONS line and every decision id when the objective is trimmed", () => {
+    // The objective is untrusted data and is trimmed first; a decision marker
+    // sliced away to make room for it is a failed round, not a compact one.
+    const goal = makeWorstCaseGoal();
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      const decisionsLine = text.split("\n").find((line) => line.startsWith("DECISIONS:"));
+      assert.ok(decisionsLine, "the DECISIONS line survives compaction");
+      assert.match(decisionsLine, /25 owner decision\(s\) await the user/);
+      for (const decision of goal.decisions) {
+        assert.match(decisionsLine, new RegExp(decision.id));
+      }
+    }
+  });
+
+  it("reserves headroom for the one composed automatic send", () => {
+    // The bound is not always the whole request. The controlled-root-takeover
+    // handoff (server.ts:1808-1810) joins the transfer marker and this fixed
+    // handoff paragraph to continuationPrompt before a single sendSteering, so
+    // a continuation rendered AT the bound is still over BB's ~8000 limit
+    // exactly when a transfer fires.
+    const transferMarker = "[ultragoal transfer:thr_aaaaaaaaaaaaaaaa->thr_bbbbbbbbbbbbbbbb]";
+    const takeoverHandoff =
+      "CONTROLLED ROOT TAKEOVER COMPLETE. You are now the UltraGoal orchestrator. Existing remediation state, work items, counters, and provider-pinned workers were transferred durably. Continue from this bounded handoff; do not replay the old startup prompt.";
+    const composed = [transferMarker, takeoverHandoff, continuationPrompt(makeWorstCaseGoal())].join(
+      "\n\n",
+    );
+    assert.ok(composed.length <= 8_000, `composed takeover handoff was ${composed.length} chars`);
+  });
+
+  it("keeps the DECISIONS line and every decision id when the plan is still empty", () => {
+    // The empty-plan arm returns before the working set is built, so a goal
+    // with open decisions but no items yet (the start-up patch is pending)
+    // used to wake with no DECISIONS marker at all.
+    const goal = makeWorstCaseGoal();
+    goal.items = [];
+    goal.agents = [];
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      const decisionsLine = text.split("\n").find((line) => line.startsWith("DECISIONS:"));
+      assert.ok(decisionsLine, "the DECISIONS line survives the empty-plan arm");
+      assert.match(decisionsLine, /25 owner decision\(s\) await the user/);
+      for (const decision of goal.decisions) {
+        assert.match(decisionsLine, new RegExp(decision.id));
+      }
+      assert.match(text, /no requirements yet/);
+    }
+  });
+
+  it("sends routine questions to the owning root without creating owner decisions", () => {
+    const goal = makeLargeGoal();
+    const continuation = continuationPrompt(goal);
+    const progress = progressPrompt(goal);
+    for (const brief of [workerQualityBrief("integration"), workerQualityBrief(null)]) {
+      for (const literal of [
+        "owning root",
+        "ultragoal_send_message",
+        "no owner decision",
+        "request_decision",
+      ]) {
+        assert.match(brief, new RegExp(literal));
+      }
+      // The owning root has no canonical task name a worker can derive: the
+      // reserved alias is the only target that resolves, so it is named.
+      assert.match(brief, /target: "\/root"/);
+    }
+    for (const literal of [
+      "owning root",
+      "ultragoal_send_message",
+      "request_decision",
+      "not an owner decision",
+      "timeout",
+      "approval",
+    ]) {
+      assert.match(continuation, new RegExp(literal));
+    }
+    assert.match(continuation, /routine/i);
+    assert.match(progress, /owning root/);
+    assert.match(progress, /routine/i);
   });
 });
 
@@ -59,11 +183,37 @@ describe("worker quality brief plumbing", () => {
     assert.match(brief, /slice_blocked/);
   });
 
-  it("leaves no unrendered placeholder in either arm", () => {
+  it("tells the truth about an integration ref that was read but is too long to embed", () => {
+    // A 202-character ref is not missing. The old arm collapsed "too long to
+    // embed" into "could not be read from its environment" — a false fact
+    // about the environment that steered the worker into slice_blocked on
+    // readable input, which is exactly AC A1's long-branch worst case.
+    const longBranch = `factory/${"x".repeat(194)}`;
+    assert.equal(longBranch.length, 202);
+    const brief = workerQualityBrief(longBranch);
+    assert.doesNotMatch(brief, /could not be read/);
+    assert.match(brief, /WAS read/);
+    assert.match(brief, /too long to embed/);
+    // Never a truncated ref: a shortened name points at a branch that does not exist.
+    assert.ok(!brief.includes(longBranch), "the over-long ref is not embedded");
+    assert.match(brief, /Never assume `main`/);
+    assert.match(brief, /`\/root`/);
+    assert.ok(brief.length <= MAX_PROMPT_CHARS, `brief was ${brief.length} chars`);
+    // The unreadable case keeps its own, different fact.
+    assert.match(workerQualityBrief(null), /could not be read from its environment/);
+    assert.match(workerQualityBrief(null), /slice_blocked/);
+  });
+
+  it("leaves no unrendered placeholder in any arm", () => {
     // render() substitutes a missing key with "", so a renamed placeholder
     // would blank the branch name rather than fail loudly.
-    assert.doesNotMatch(workerQualityBrief("integration"), /\{\{/);
-    assert.doesNotMatch(workerQualityBrief(null), /\{\{/);
+    for (const brief of [
+      workerQualityBrief("integration"),
+      workerQualityBrief(null),
+      workerQualityBrief(`factory/${"x".repeat(194)}`),
+    ]) {
+      assert.doesNotMatch(brief, /\{\{/);
+    }
   });
 
   it("pins the battery to the exact command and forbids a bare substitute", () => {

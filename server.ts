@@ -1512,8 +1512,10 @@ export default function plugin(bb: BbPluginApi) {
   // Owner decisions render as native center-pane question cards
   // (bb.ui.requestInput + the plugin's owner-decision renderer). Interactions
   // cap at one hour, so a keeper re-raises the card until the durable decision
-  // record is answered; answering from the CLI aborts the live card.
-  const decisionKeepers = new Set<string>();
+  // record is answered; answering from the CLI aborts the live card. One card
+  // is active per root: the keeper map is keyed by goal thread, and the durable
+  // open rows pick which decision holds it.
+  const decisionKeepers = new Map<string, string>();
   const decisionDismissed = new Set<string>();
   const decisionAborts = new Map<string, AbortController>();
   const decisionPromptBackoff = new Map<string, number>();
@@ -1533,7 +1535,7 @@ export default function plugin(bb: BbPluginApi) {
     // A thread that already owns an unfinished goal is its owner. The goal of
     // an ancestor is only the fallback for a thread that owns none: inheriting
     // it over the caller's own goal would retarget every tool and decision onto
-    // the ancestor while view(), publish() and ensureDecisionPrompts() stay on
+    // the ancestor while view(), publish() and promoteDecisionPrompt() stay on
     // the caller's row, leaving that goal ungated and unanswerable.
     if (own && isUnfinished(own.status)) return own;
     const row = collab.rowOf(threadId);
@@ -1633,6 +1635,9 @@ export default function plugin(bb: BbPluginApi) {
     if (!resolved) return false;
     markGoalEvent(goalThreadId);
     decisionAborts.get(decisionId)?.abort();
+    // The answer is committed, so the root is free for its next durable open
+    // decision now — promotion never waits on delivery or a keeper's unwind.
+    promoteDecisionPrompt(goalThreadId);
     const goal = store.get(goalThreadId);
     if (goal) publish(goalThreadId, view(goal));
     bb.log.info(`Owner decision ${decisionId} answered on ${goalThreadId}: ${answer.slice(0, 80)}`);
@@ -1640,11 +1645,35 @@ export default function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  /** The root's live card, or null when its decision already left open. The
+   * durable row is the authority: an entry left behind by a keeper that is
+   * still unwinding does not hold the root once its decision is resolved. */
+  function liveDecisionCard(goalThreadId: string): string | null {
+    const active = decisionKeepers.get(goalThreadId);
+    if (active == null) return null;
+    return decisions.get(goalThreadId, active)?.status === "open" ? active : null;
+  }
+
+  /** Promote the root's single next card from the durable open rows: the oldest
+   * open decision that is neither dismissed nor already live. A raise can
+   * decline (backoff), so the loop tries the next row rather than lose the
+   * promotion. */
+  function promoteDecisionPrompt(goalThreadId: string): void {
+    if (liveDecisionCard(goalThreadId) !== null) return;
+    decisionKeepers.delete(goalThreadId);
+    for (const decision of decisions.list(goalThreadId, "open")) {
+      if (decisionDismissed.has(decision.id)) continue;
+      raiseDecisionPrompt(goalThreadId, decision.id);
+      if (decisionKeepers.get(goalThreadId) === decision.id) return;
+    }
+  }
+
   function raiseDecisionPrompt(goalThreadId: string, decisionId: string): void {
-    if (decisionKeepers.has(decisionId) || decisionDismissed.has(decisionId)) return;
+    if (decisionKeepers.get(goalThreadId) === decisionId || decisionDismissed.has(decisionId)) return;
+    if (liveDecisionCard(goalThreadId) !== null) return;
     const failedAt = decisionPromptBackoff.get(decisionId);
     if (failedAt != null && Date.now() - failedAt < DECISION_PROMPT_BACKOFF_MS) return;
-    decisionKeepers.add(decisionId);
+    decisionKeepers.set(goalThreadId, decisionId);
     void (async () => {
       try {
         while (true) {
@@ -1707,15 +1736,20 @@ export default function plugin(bb: BbPluginApi) {
           return;
         }
       } finally {
-        decisionKeepers.delete(decisionId);
+        if (decisionKeepers.get(goalThreadId) === decisionId) {
+          decisionKeepers.delete(goalThreadId);
+        }
+        // A card that left open — answered, withdrawn, or dismissed — releases
+        // the root immediately. A lifecycle cancel leaves its decision open and
+        // the pulse sweep re-raises it, so that exit is not promoted here.
+        if (
+          decisionDismissed.has(decisionId) ||
+          decisions.get(goalThreadId, decisionId)?.status !== "open"
+        ) {
+          promoteDecisionPrompt(goalThreadId);
+        }
       }
     })();
-  }
-
-  function ensureDecisionPrompts(goalThreadId: string): void {
-    for (const decision of decisions.list(goalThreadId, "open")) {
-      raiseDecisionPrompt(goalThreadId, decision.id);
-    }
   }
 
   async function releaseWorkerRuntime(workerThreadId: string): Promise<void> {
@@ -3462,7 +3496,7 @@ export default function plugin(bb: BbPluginApi) {
           await reviveErroredRoot(threadId);
           continue;
         }
-        ensureDecisionPrompts(threadId);
+        promoteDecisionPrompt(threadId);
         // Retry every owner row a capacity full or failed spawn left queued. The
         // pass is detached, never awaited: it awaits an unbounded host spawn, and
         // one wedged root must not stop every later root in this sweep. Its own
@@ -4529,6 +4563,9 @@ export default function plugin(bb: BbPluginApi) {
       }
       decisionAborts.get(resolved.id)?.abort();
       markGoalEvent(owner);
+      // A resolution that took the active card frees the root for its next
+      // durable open decision without waiting for the keeper to unwind.
+      promoteDecisionPrompt(owner);
       // The guarded store answers with the row as committed — the FIRST
       // resolution — so a non-null result is not proof this call wrote it. Only
       // a resolution carrying exactly what this caller supplied is held in-band

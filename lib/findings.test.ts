@@ -17,10 +17,10 @@ afterEach(async () => {
   while (hosts.length > 0) await hosts.pop()!.harness.lifecycle.dispose();
 });
 
-// The register's table as lib/store.ts first created it: no base_ref. The
-// column is owned by createFindingStore (worker-brief precedent), so this
-// fixture is also the pre-column database every existing install has.
-const GOAL_FINDINGS_DDL = `CREATE TABLE goal_findings (
+function freshFindings() {
+  const host = createFakePluginHost({ pluginId: `findings-test-${hosts.length}` });
+  hosts.push(host);
+  host.bb.storage.database().exec(`CREATE TABLE goal_findings (
       id TEXT PRIMARY KEY,
       thread_id TEXT NOT NULL,
       fingerprint TEXT NOT NULL,
@@ -37,12 +37,7 @@ const GOAL_FINDINGS_DDL = `CREATE TABLE goal_findings (
       project_id TEXT,
       UNIQUE(thread_id, fingerprint)
     )
-  `;
-
-function freshFindings() {
-  const host = createFakePluginHost({ pluginId: `findings-test-${hosts.length}` });
-  hosts.push(host);
-  host.bb.storage.database().exec(GOAL_FINDINGS_DDL);
+  `);
   return createFindingStore(host.bb);
 }
 
@@ -281,16 +276,12 @@ describe("finding project provenance", () => {
 });
 
 describe("the resolved PR head a finding names", () => {
-  it("persists baseRef verbatim modulo trim and round-trips it", () => {
-    // No tracker client exists here, so the filer resolves the ref in its own
-    // environment and the register stores exactly what it was handed — apart
-    // from the trim every sibling field gets. The next slice resolves nothing.
+  it("persists baseRef trim-only and round-trips it", () => {
+    // No tracker client exists here, so the filer resolved the ref and the
+    // register stores exactly that ref — never a PR number or URL to resolve.
     const findings = freshFindings();
     const rec = findings.report("thr_g", {
-      title: "Defect on the PR branch",
-      file: "a.ts:1",
-      evidence: "e",
-      baseRef: "  PR/Fix-58-Head  ",
+      title: "Defect on the PR branch", file: "a.ts:1", evidence: "e", baseRef: "  PR/Fix-58-Head  ",
     });
     assert.equal(rec.finding.baseRef, "PR/Fix-58-Head");
     assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, "PR/Fix-58-Head");
@@ -299,96 +290,60 @@ describe("the resolved PR head a finding names", () => {
   });
 
   it("leaves baseRef null when the filer named no PR", () => {
-    // The overwhelming majority of findings name no PR. Absent must read as
-    // "none", never as a ref to resolve.
+    // Absent must read as "none", never as a ref something should resolve.
     const findings = freshFindings();
-    const rec = findings.report("thr_g", { title: "No PR named", file: "a.ts:1", evidence: "e" });
+    const rec = findings.report("thr_g", { title: "No PR", file: "a.ts:1", evidence: "e" });
     assert.equal(rec.finding.baseRef, null);
     assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, null);
     assert.equal(findings.remediationQueue("thr_g")[0]?.baseRef, null);
   });
 
   it("parses a GoalFinding object recorded before the field existed", () => {
-    // Findings recorded before this field carry no key at all. The schema is
-    // additive and never defaulted, so they keep parsing untouched.
-    const parsed = goalFindingSchema.safeParse({
-      id: "fnd_legacy",
-      fingerprint: "fp",
-      title: "Legacy finding",
-      file: "a.ts:1",
-      evidence: "e",
-      status: "open",
-      itemId: null,
-      createdAt: 1,
+    // Additive and never defaulted, so pre-change objects keep parsing.
+    const legacy = goalFindingSchema.safeParse({
+      id: "fnd_legacy", fingerprint: "fp", title: "Legacy", file: "a.ts:1",
+      evidence: "e", status: "open", itemId: null, createdAt: 1,
     });
-    assert.ok(parsed.success);
-    assert.equal(parsed.data.baseRef, undefined);
-    assert.equal(
-      goalFindingSchema.safeParse({ ...parsed.data, baseRef: null }).success,
-      true,
-      "an explicit null (a row whose column is empty) parses too",
-    );
+    assert.ok(legacy.success);
+    assert.equal(legacy.data.baseRef, undefined);
+    assert.equal(goalFindingSchema.safeParse({ ...legacy.data, baseRef: null }).success, true);
   });
 
   it("refuses a non-ref-shaped baseRef, naming what to supply instead", () => {
-    // A PR number or URL would have to be resolved by something downstream and
-    // no tracker client exists in-repo, so the shape is refused at the single
-    // boundary that records it.
+    // Resolving a PR number or URL needs a tracker client this plugin
+    // deliberately lacks, so the shape is refused at the one recording boundary.
     for (const ref of [
-      "https://github.com/uje-m/bb-plugin-ultragoal/pull/58",
-      "pr 58 head",
-      "-pr/58-head",
-      "pr/../58-head",
-      "58",
+      "https://github.com/uje-m/bb-plugin-ultragoal/pull/58", "pr 58 head",
+      "-pr/58-head", "pr/../58-head", "58",
     ]) {
       const parsed = goalFindingBaseRefSchema.safeParse(ref);
       assert.equal(parsed.success, false, `${ref} must be refused`);
       assert.match(parsed.error?.issues[0]?.message ?? "", /head branch or head SHA/);
     }
-    assert.equal(
-      goalFindingBaseRefSchema.safeParse("a".repeat(MAX_BASE_REF_CHARS + 1)).success,
-      false,
-      "the fail-closed length bound applies",
-    );
+    // The fail-closed length bound refuses before the shape refine is reached.
+    assert.equal(goalFindingBaseRefSchema.safeParse("a".repeat(MAX_BASE_REF_CHARS + 1)).success, false);
   });
 
   it("accepts a branch name, a hex SHA, and the empty placeholder", () => {
-    for (const ref of [
-      "pr/58-head",
-      "fix/R4-finding-baseref",
-      "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-      "a1b2c3d",
-      "a".repeat(MAX_BASE_REF_CHARS),
-    ]) {
+    for (const ref of ["pr/58-head", "fix/R4-finding-baseref", "a1b2c3d",
+      "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", "a".repeat(MAX_BASE_REF_CHARS)]) {
       assert.equal(goalFindingBaseRefSchema.safeParse(ref).success, true, `${ref} must be accepted`);
     }
-    // Deliberate: a legacy or placeholder Finding carrying "" keeps parsing.
-    // Non-empty is enforced at the filing boundary, not at the shape layer.
+    // Deliberate: a legacy or placeholder Finding carrying "" keeps parsing;
+    // non-empty is the filing boundary's rule, not the shape's.
     assert.equal(goalFindingBaseRefSchema.safeParse("").success, true);
   });
 
   it("adds the column to a table that predates it, at store creation", () => {
-    // Owned here, not in lib/store.ts's shared migration list, which records
-    // progress by array index and has silently skipped an appended statement
-    // before. A database whose goal_findings predates the column self-heals at
-    // store creation, exactly as worker-brief does with its provenance column.
-    const host = createFakePluginHost({ pluginId: `findings-base-ref-${hosts.length}` });
-    hosts.push(host);
-    const db = host.bb.storage.database();
-    db.exec(GOAL_FINDINGS_DDL);
-    const columns = () =>
-      (db.prepare("PRAGMA table_info(goal_findings)").all() as Array<{ name: string }>).map(
-        (column) => column.name,
-      );
-    assert.equal(columns().includes("base_ref"), false, "the fixture table predates the column");
-    const findings = createFindingStore(host.bb);
-    assert.equal(columns().includes("base_ref"), true, "store creation adds it");
-    const rec = findings.report("thr_g", {
-      title: "Self-healed",
-      file: "a.ts:1",
-      evidence: "e",
-      baseRef: "pr/58-head",
-    });
+    // freshFindings' CREATE TABLE is the pre-column register; the store owns
+    // the self-heal (worker-brief precedent), not lib/store.ts's positional
+    // migration list.
+    const findings = freshFindings();
+    const db = hosts[hosts.length - 1]!.bb.storage.database();
+    const columns = (db.prepare("PRAGMA table_info(goal_findings)").all() as Array<{ name: string }>)
+      .map((column) => column.name);
+    assert.equal(columns.includes("base_ref"), true);
+    const rec = findings.report("thr_g", { title: "Self-healed", file: "a.ts:1", evidence: "e", baseRef: "pr/58-head" });
     assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, "pr/58-head");
   });
 });

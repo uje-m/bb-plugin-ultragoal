@@ -131,10 +131,9 @@ function newId(): string {
 
 export function createFindingStore(bb: BbPluginApi) {
   const db = bb.storage.database();
-  // Owned here rather than in the shared migration list, which records progress
-  // by array index and has silently skipped an appended statement before. A
-  // database whose goal_findings predates base_ref self-heals at store
-  // creation, the way worker-brief self-heals its provenance column.
+  // Owned here, not in the shared migration list (which records progress by
+  // array index and has silently skipped an appended statement before), so a
+  // pre-column goal_findings self-heals the way worker-brief does.
   const columns = new Set(
     (db.prepare("PRAGMA table_info(goal_findings)").all() as Array<{ name: string }>).map(
       (column) => column.name,
@@ -191,11 +190,7 @@ export function createFindingStore(bb: BbPluginApi) {
          * host — never from the agent's own description of where it works.
          */
         projectId?: string | null;
-        /**
-         * The open PR's resolved head ref or SHA, given by the filer because
-         * nothing here has a tracker client. Stored ref-shaped only: a PR
-         * number or URL is refused at the boundary before this call.
-         */
+        /** The open PR's resolved head ref or SHA, given by the filer. Ref-shaped only. */
         baseRef?: string | null;
       },
     ): { created: boolean; finding: GoalFinding } {

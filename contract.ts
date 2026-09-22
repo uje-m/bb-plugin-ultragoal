@@ -157,36 +157,28 @@ export const goalFindingStatusSchema = z.enum([
 ]);
 
 /**
- * Fail-closed bound on a finding's baseRef, matching the integration-branch
- * bound in lib/prompts.ts (MAX_INTEGRATION_BRANCH_CHARS = 200): anything
- * longer is a pasted description, not a ref.
+ * Fail-closed bound, matching lib/prompts.ts MAX_INTEGRATION_BRANCH_CHARS:
+ * anything longer is a pasted description, not a ref.
  */
 export const MAX_BASE_REF_CHARS = 200;
 
 /**
- * The one shape check for a finding's baseRef: a git ref name or a hex SHA,
- * already resolved by the filer. This plugin has no tracker client and stays
- * provider-neutral, so a PR number or URL is REFUSED rather than resolved
- * here — the next slice turns an unresolvable ref into a named diagnostic,
- * never a silent fallback. Validation only: nothing here resolves a ref.
- *
- * An empty string passes on purpose; non-empty is the filing boundary's rule
- * (server.ts), so a legacy or placeholder Finding carrying "" keeps parsing.
+ * The one shape check for a finding's baseRef: a git ref name or a hex SHA the
+ * filer already RESOLVED. This plugin has no tracker client and stays provider-
+ * neutral, so a PR number or URL is refused, never resolved here — the next
+ * slice turns an unresolvable ref into a named diagnostic. Nothing in this
+ * schema resolves anything. An empty string passes on purpose: non-empty is the
+ * filing boundary's rule, so a legacy or placeholder Finding carrying "" keeps
+ * parsing.
  */
 export const goalFindingBaseRefSchema = z
   .string()
   .max(MAX_BASE_REF_CHARS)
   .refine(
     (ref) =>
-      !ref.includes("://") &&
-      !/\s/.test(ref) &&
-      !ref.startsWith("-") &&
-      !ref.split("/").includes("..") &&
-      !/^\d+$/.test(ref),
-    {
-      message:
-        `Supply the PR's already-resolved head branch or head SHA instead (e.g. "pr/58-head" or a 40-hex sha): a URL, whitespace, a leading "-", a ".." segment, or a bare PR number is refused.`,
-    },
+      !ref.includes("://") && !/\s/.test(ref) && !ref.startsWith("-") &&
+      !ref.split("/").includes("..") && !/^\d+$/.test(ref),
+    { message: `Supply the PR's already-resolved head branch or head SHA (e.g. "pr/58-head" or a 40-hex sha): a URL, whitespace, a leading "-", a ".." segment, or a bare PR number is refused.` },
   );
 
 export const goalFindingSchema = z.object({

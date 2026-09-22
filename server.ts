@@ -4428,12 +4428,9 @@ export default function plugin(bb: BbPluginApi) {
         .string()
         .optional()
         .describe("Owner-visible verification metadata. It is not injected into another agent's prompt."),
-      baseRef: goalFindingBaseRefSchema
-        .min(1)
-        .optional()
-        .describe(
-          "The already-resolved head branch or head SHA of the open PR this finding names. A PR number or URL is refused \u2014 resolve it in your own environment before filing.",
-        ),
+      baseRef: goalFindingBaseRefSchema.min(1).optional().describe(
+        "The already-resolved head branch or head SHA of the open PR this finding names. A PR number or URL is refused \u2014 resolve it in your own environment before filing.",
+      ),
     }),
     async execute({ title, file, evidence, fix_files, check, baseRef }, { threadId }) {
       const rootThreadId = await goalThreadIdOfCaller(threadId);

@@ -18,6 +18,8 @@ interface FindingRow {
   check_cmd: string | null;
   /** BB project the FILING thread stood in; null on pre-column rows. */
   project_id: string | null;
+  /** The open PR's resolved head ref or SHA the finding names; null when none. */
+  base_ref: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -96,6 +98,7 @@ function rowToFinding(row: FindingRow): GoalFinding {
     status: row.status,
     itemId: row.item_id,
     createdAt: row.created_at,
+    baseRef: row.base_ref ?? null,
   };
 }
 
@@ -128,6 +131,18 @@ function newId(): string {
 
 export function createFindingStore(bb: BbPluginApi) {
   const db = bb.storage.database();
+  // Owned here rather than in the shared migration list, which records progress
+  // by array index and has silently skipped an appended statement before. A
+  // database whose goal_findings predates base_ref self-heals at store
+  // creation, the way worker-brief self-heals its provenance column.
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(goal_findings)").all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+  if (!columns.has("base_ref")) {
+    db.exec("ALTER TABLE goal_findings ADD COLUMN base_ref TEXT");
+  }
   const byThread = db.prepare(
     "SELECT * FROM goal_findings WHERE thread_id = ? ORDER BY created_at ASC, id ASC",
   );
@@ -139,10 +154,10 @@ export function createFindingStore(bb: BbPluginApi) {
   const insert = db.prepare(`
     INSERT INTO goal_findings (
       id, thread_id, fingerprint, title, file, evidence, status, item_id,
-      resolution_note, fix_files, check_cmd, project_id, created_at, updated_at
+      resolution_note, fix_files, check_cmd, project_id, base_ref, created_at, updated_at
     ) VALUES (
       @id, @thread_id, @fingerprint, @title, @file, @evidence, @status, @item_id,
-      @resolution_note, @fix_files, @check_cmd, @project_id, @created_at, @updated_at
+      @resolution_note, @fix_files, @check_cmd, @project_id, @base_ref, @created_at, @updated_at
     )
   `);
   const setStatus = db.prepare(`
@@ -176,6 +191,12 @@ export function createFindingStore(bb: BbPluginApi) {
          * host — never from the agent's own description of where it works.
          */
         projectId?: string | null;
+        /**
+         * The open PR's resolved head ref or SHA, given by the filer because
+         * nothing here has a tracker client. Stored ref-shaped only: a PR
+         * number or URL is refused at the boundary before this call.
+         */
+        baseRef?: string | null;
       },
     ): { created: boolean; finding: GoalFinding } {
       const fingerprint = fingerprintOf(input.file, input.title);
@@ -198,6 +219,7 @@ export function createFindingStore(bb: BbPluginApi) {
             : null,
         check_cmd: input.check?.trim() || null,
         project_id: input.projectId?.trim() || null,
+        base_ref: input.baseRef?.trim() || null,
         created_at: now,
         updated_at: now,
       };

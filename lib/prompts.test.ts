@@ -94,6 +94,39 @@ describe("bounded UltraGoal prompts", () => {
     }
   });
 
+  it("reserves headroom for the one composed automatic send", () => {
+    // The bound is not always the whole request. The controlled-root-takeover
+    // handoff (server.ts:1808-1810) joins the transfer marker and this fixed
+    // handoff paragraph to continuationPrompt before a single sendSteering, so
+    // a continuation rendered AT the bound is still over BB's ~8000 limit
+    // exactly when a transfer fires.
+    const transferMarker = "[ultragoal transfer:thr_aaaaaaaaaaaaaaaa->thr_bbbbbbbbbbbbbbbb]";
+    const takeoverHandoff =
+      "CONTROLLED ROOT TAKEOVER COMPLETE. You are now the UltraGoal orchestrator. Existing remediation state, work items, counters, and provider-pinned workers were transferred durably. Continue from this bounded handoff; do not replay the old startup prompt.";
+    const composed = [transferMarker, takeoverHandoff, continuationPrompt(makeWorstCaseGoal())].join(
+      "\n\n",
+    );
+    assert.ok(composed.length <= 8_000, `composed takeover handoff was ${composed.length} chars`);
+  });
+
+  it("keeps the DECISIONS line and every decision id when the plan is still empty", () => {
+    // The empty-plan arm returns before the working set is built, so a goal
+    // with open decisions but no items yet (the start-up patch is pending)
+    // used to wake with no DECISIONS marker at all.
+    const goal = makeWorstCaseGoal();
+    goal.items = [];
+    goal.agents = [];
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      const decisionsLine = text.split("\n").find((line) => line.startsWith("DECISIONS:"));
+      assert.ok(decisionsLine, "the DECISIONS line survives the empty-plan arm");
+      assert.match(decisionsLine, /25 owner decision\(s\) await the user/);
+      for (const decision of goal.decisions) {
+        assert.match(decisionsLine, new RegExp(decision.id));
+      }
+      assert.match(text, /no requirements yet/);
+    }
+  });
+
   it("sends routine questions to the owning root without creating owner decisions", () => {
     const goal = makeLargeGoal();
     const continuation = continuationPrompt(goal);
@@ -107,6 +140,9 @@ describe("bounded UltraGoal prompts", () => {
       ]) {
         assert.match(brief, new RegExp(literal));
       }
+      // The owning root has no canonical task name a worker can derive: the
+      // reserved alias is the only target that resolves, so it is named.
+      assert.match(brief, /target: "\/root"/);
     }
     for (const literal of [
       "owning root",
@@ -147,11 +183,37 @@ describe("worker quality brief plumbing", () => {
     assert.match(brief, /slice_blocked/);
   });
 
-  it("leaves no unrendered placeholder in either arm", () => {
+  it("tells the truth about an integration ref that was read but is too long to embed", () => {
+    // A 202-character ref is not missing. The old arm collapsed "too long to
+    // embed" into "could not be read from its environment" — a false fact
+    // about the environment that steered the worker into slice_blocked on
+    // readable input, which is exactly AC A1's long-branch worst case.
+    const longBranch = `factory/${"x".repeat(194)}`;
+    assert.equal(longBranch.length, 202);
+    const brief = workerQualityBrief(longBranch);
+    assert.doesNotMatch(brief, /could not be read/);
+    assert.match(brief, /WAS read/);
+    assert.match(brief, /too long to embed/);
+    // Never a truncated ref: a shortened name points at a branch that does not exist.
+    assert.ok(!brief.includes(longBranch), "the over-long ref is not embedded");
+    assert.match(brief, /Never assume `main`/);
+    assert.match(brief, /`\/root`/);
+    assert.ok(brief.length <= MAX_PROMPT_CHARS, `brief was ${brief.length} chars`);
+    // The unreadable case keeps its own, different fact.
+    assert.match(workerQualityBrief(null), /could not be read from its environment/);
+    assert.match(workerQualityBrief(null), /slice_blocked/);
+  });
+
+  it("leaves no unrendered placeholder in any arm", () => {
     // render() substitutes a missing key with "", so a renamed placeholder
     // would blank the branch name rather than fail loudly.
-    assert.doesNotMatch(workerQualityBrief("integration"), /\{\{/);
-    assert.doesNotMatch(workerQualityBrief(null), /\{\{/);
+    for (const brief of [
+      workerQualityBrief("integration"),
+      workerQualityBrief(null),
+      workerQualityBrief(`factory/${"x".repeat(194)}`),
+    ]) {
+      assert.doesNotMatch(brief, /\{\{/);
+    }
   });
 
   it("pins the battery to the exact command and forbids a bare substitute", () => {

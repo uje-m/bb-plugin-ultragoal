@@ -23,8 +23,15 @@ export const MAX_PLAN_INSTRUCTION_CHARS = 6_000;
  * longer wake-up never reaches the model. One bound covers all five surfaces.
  * The untrusted objective absorbs the trim first, and the assembled text is
  * capped once more as a structural backstop.
+ *
+ * It sits below the request limit on purpose: the bound is not always the whole
+ * request. The controlled-root-takeover handoff joins a transfer marker and a
+ * fixed ~265-character paragraph to continuationPrompt in one send, so a
+ * prompt rendered AT the request limit is still rejected exactly when the
+ * takeover fires. The gap is that composition's headroom; a new composed
+ * callsite budgets itself here rather than appending past the limit.
  */
-export const MAX_PROMPT_CHARS = 8_000;
+export const MAX_PROMPT_CHARS = 7_500;
 /**
  * Objective room reserved before the bounded plan instruction takes its share,
  * so a 1,000-item goal cannot squeeze the task statement out of its own
@@ -34,8 +41,9 @@ const MIN_OBJECTIVE_CHARS = 600;
 const OBJECTIVE_TRUNCATION_MARKER =
   "\n… objective truncated to fit the request limit; the goal pane holds the full text.";
 /**
- * A longer value cannot be a real branch name; handing over a truncated ref
- * would send the worker to a branch that does not exist.
+ * A ref longer than this is not embedded: it would have to be truncated, and a
+ * shortened ref names a branch that does not exist. The cap is about what can
+ * be handed over verbatim, not about what git permits a ref to be.
  */
 const MAX_INTEGRATION_BRANCH_CHARS = 200;
 const MAX_PROMPT_DECISION_IDS = 50;
@@ -57,15 +65,23 @@ const MAX_AGENT_SECTION_CHARS = 1_400;
  * and the maintained base is `integration`. Two workers were aimed at it; both
  * were careful enough to refuse, and the third would have rebased a factory
  * candidate onto unrelated history, surfacing much later as an unexplained
- * conflict. When the environment cannot be read the brief says so and sends the
- * worker to look the branch up — a guessed branch name is the failure itself.
+ * conflict. A missing environment and a name too long to hand over verbatim
+ * are different facts and the brief keeps them apart: the first says the name
+ * could not be read and fails closed, the second says it was read, must come
+ * from the worker's own environment or the goal's standing rules, and must
+ * never be guessed — a shortened ref names a branch that does not exist.
  */
 export function workerQualityBrief(integrationBranch: string | null): string {
   const named = (integrationBranch ?? "").trim();
-  const baseBranch =
-    named.length > 0 && named.length <= MAX_INTEGRATION_BRANCH_CHARS
-      ? `This goal's integration branch is the LOCAL ref \`${named}\` — rebase onto that exact name (your worktree shares the project checkout's refs), and onto no other, however the repository's default branch is named.`
-      : "This goal's integration branch could not be read from its environment: resolve it from the repo's agent docs or this goal's standing rules before you rebase, and never assume `main` — in some repositories `main` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it, which is why this name is normally resolved for you. If those sources do not name it, call slice_blocked rather than rebase onto a guess.";
+  let baseBranch: string;
+  if (named.length === 0) {
+    baseBranch =
+      "This goal's integration branch could not be read from its environment: resolve it from the repo's agent docs or this goal's standing rules before you rebase, and never assume `main` — in some repositories `main` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it, which is why this name is normally resolved for you. If those sources do not name it, call slice_blocked rather than rebase onto a guess.";
+  } else if (named.length > MAX_INTEGRATION_BRANCH_CHARS) {
+    baseBranch = `This goal's integration branch WAS read from its environment, but its name is ${named.length} characters long — too long to embed in this brief, and a shortened copy would name a branch that does not exist. Your worktree was cut from that exact ref, so its name is available from your own environment's base/merge-base branch and from this goal's standing rules: read it there and rebase onto that exact ref, onto no other, however the repository's default branch is named. Never assume \`main\` — in some repositories \`main\` is a passive upstream tracker and the maintained base is another branch. Do not go looking in the root thread's checkout; your worktree cannot see it. If neither source names it, ask your owning root with \`ultragoal_send_message\` (target \`/root\`) for the exact ref rather than rebase onto a guess.`;
+  } else {
+    baseBranch = `This goal's integration branch is the LOCAL ref \`${named}\` — rebase onto that exact name (your worktree shares the project checkout's refs), and onto no other, however the repository's default branch is named.`;
+  }
   return hardCap(render(WORKER_BRIEF.trim(), { base_branch: baseBranch }), MAX_PROMPT_CHARS);
 }
 
@@ -167,12 +183,36 @@ function renderWithPlan(
   });
 }
 
+/** The one line a root must never lose while decisions are open. */
+function decisionsLine(goal: GoalSnapshot): string[] {
+  if (goal.decisions.length === 0) return [];
+  const listed = goal.decisions.slice(0, MAX_PROMPT_DECISION_IDS);
+  return [
+    `DECISIONS: ${goal.decisions.length} owner decision(s) await the user (${listed
+      .map((decision) => decision.id)
+      .join(", ")}${
+      goal.decisions.length > listed.length
+        ? ` +${goal.decisions.length - listed.length} more`
+        : ""
+    }). Do not re-ask, do not proceed on assumptions, and do not treat this as blocked — continue all work that does not depend on the answer.`,
+  ];
+}
+
 export function planInstruction(
   goal: GoalSnapshot,
   maxChars: number = MAX_PLAN_INSTRUCTION_CHARS,
 ): string {
   if (goal.items.length === 0) {
-    return "The UltraGoal pane has no requirements yet. Call ultragoal_patch at the start of this turn with concrete remaining work derived from current evidence: independent, file-disjoint work items with deps/files/check so the scheduler can staff them in parallel. Keep that plan current as you discover or finish work. Do not treat a plan patch as a substitute for doing the work.";
+    // The plan is empty but the decisions are not: this arm returns before the
+    // working set is built, so it carries the marker itself — a root woken
+    // with no plan still has to know which decisions await the user.
+    return hardCap(
+      [
+        ...decisionsLine(goal),
+        "The UltraGoal pane has no requirements yet. Call ultragoal_patch at the start of this turn with concrete remaining work derived from current evidence: independent, file-disjoint work items with deps/files/check so the scheduler can staff them in parallel. Keep that plan current as you discover or finish work. Do not treat a plan patch as a substitute for doing the work.",
+      ].join("\n"),
+      maxChars,
+    );
   }
   const completedIds = new Set(
     goal.items.filter((item) => item.status === "completed").map((item) => item.id),
@@ -277,19 +317,6 @@ export function planInstruction(
     }
   }
 
-  const listedDecisions = goal.decisions.slice(0, MAX_PROMPT_DECISION_IDS);
-  const decisionsLine =
-    goal.decisions.length > 0
-      ? [
-          `DECISIONS: ${goal.decisions.length} owner decision(s) await the user (${listedDecisions
-            .map((decision) => decision.id)
-            .join(", ")}${
-            goal.decisions.length > listedDecisions.length
-              ? ` +${goal.decisions.length - listedDecisions.length} more`
-              : ""
-          }). Do not re-ask, do not proceed on assumptions, and do not treat this as blocked — continue all work that does not depend on the answer.`,
-        ]
-      : [];
   const findingsLine =
     goal.findings.open > 0
       ? [
@@ -303,7 +330,7 @@ export function planInstruction(
   // Decision markers lead the tail: the plan hardCap trims from the end, so
   // the one line a root must never lose is the first thing it would keep.
   const tailLines = [
-    ...decisionsLine,
+    ...decisionsLine(goal),
     ...agentLines,
     ...schedulerLines,
     ...findingsLine,

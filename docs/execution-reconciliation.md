@@ -205,3 +205,33 @@ passes 106 of 106. Both checks are independent of the repository's own
 worktree plus the fork tracker through `gh`. Their run logs are not committed,
 so the counts are reproduced by re-running the scripts rather than by reading a
 stored log.
+
+## Issue #44 premature-close reconciliation (2026-09-22)
+
+An owner flag that [#44](https://github.com/uje-m/bb-plugin-ultragoal/issues/44)
+was not actually done prompted a read-only audit that found the issue closed as
+COMPLETED while its acceptance gate was open. The tracker timeline records two
+manual closes (`commit_id` null): 2026-09-20T05:50:44Z, one second after PR
+[#50](https://github.com/uje-m/bb-plugin-ultragoal/pull/50) merged, and
+2026-09-22T12:50:16Z, one second after PR
+[#59](https://github.com/uje-m/bb-plugin-ultragoal/pull/59) merged and before
+sibling PR [#60](https://github.com/uje-m/bb-plugin-ultragoal/pull/60) merged
+at 2026-09-22T12:57:08Z; a reopening at 2026-09-21T00:15:10Z sits between
+them. At that second close only the following #44 receipts were landed:
+[#48](https://github.com/uje-m/bb-plugin-ultragoal/pull/48) (2026-09-20T21:29:24Z),
+[#50](https://github.com/uje-m/bb-plugin-ultragoal/pull/50) (2026-09-20T05:50:43Z),
+[#59](https://github.com/uje-m/bb-plugin-ultragoal/pull/59) (2026-09-22T12:50:14Z),
+and [#60](https://github.com/uje-m/bb-plugin-ultragoal/pull/60) (2026-09-22T12:57:08Z).
+Fresh slices C and D were unlanded: slice C (itm_mucipwx5_holwbg) had sole run
+wf_e4fced2ab4fe in flight with no candidate commit or submitted PR, slice D
+(itm_mucirwou_vjlwh5) was blocked behind C, and gate itm_muciuz19_iftbp1 —
+which closes #44 only if every acceptance criterion and PR receipt is proven
+on current main, and otherwise reports the exact missing item — was pending.
+origin/main read back identical to slice C's pinned base daa7ed7, so no slice
+C or D content had landed outside a PR. The issue was reopened at
+2026-09-22T16:28:48Z and read back OPEN. The committed reconciliation checks
+now age out on tracker open-state — they snapshot the 2026-09-15 frontier and
+fail on later ticket closures (for example #22), not on this document's
+content; pristine and edited trees produce identical counts. This receipt
+documents the reconciliation only; the tracker remains authoritative, and the
+gate — not this document — decides any later closure.

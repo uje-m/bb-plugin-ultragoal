@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { rpcContract, type GoalAgent, type GoalDecision, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
+import { goalFindingBaseRefSchema, rpcContract, type GoalAgent, type GoalDecision, type GoalItem, type GoalSnapshot, type GoalStatus } from "./contract.js";
 import {
   accountGoalProgress,
   readThreadTokens,
@@ -4189,6 +4189,11 @@ export default function plugin(bb: BbPluginApi) {
       ownSlice?: boolean;
       /** Resolved by the caller from the filing thread, never from tool args. */
       projectId?: string | null;
+      /**
+       * The open PR's resolved head ref or SHA the finding names. Shape-checked
+       * at the filing boundary; nothing downstream resolves a PR number or URL.
+       */
+      baseRef?: string | null;
     },
   ): Promise<{ created: boolean; findingId: string; fixItemId: string | null; status: string }> {
     const result = findings.report(rootThreadId, {
@@ -4198,6 +4203,7 @@ export default function plugin(bb: BbPluginApi) {
       fixFiles: input.fixFiles,
       check: input.check,
       projectId: input.projectId,
+      baseRef: input.baseRef,
     });
     if (result.created && input.ownSlice) {
       // An outside auditor filing a proven blocker can demand its own slice.
@@ -4422,8 +4428,14 @@ export default function plugin(bb: BbPluginApi) {
         .string()
         .optional()
         .describe("Owner-visible verification metadata. It is not injected into another agent's prompt."),
+      baseRef: goalFindingBaseRefSchema
+        .min(1)
+        .optional()
+        .describe(
+          "The already-resolved head branch or head SHA of the open PR this finding names. A PR number or URL is refused \u2014 resolve it in your own environment before filing.",
+        ),
     }),
-    async execute({ title, file, evidence, fix_files, check }, { threadId }) {
+    async execute({ title, file, evidence, fix_files, check, baseRef }, { threadId }) {
       const rootThreadId = await goalThreadIdOfCaller(threadId);
       const goal = store.get(rootThreadId);
       if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
@@ -4439,6 +4451,7 @@ export default function plugin(bb: BbPluginApi) {
         fixFiles: fix_files,
         check,
         projectId: await projectOfThread(threadId),
+        baseRef,
       });
       if (!registered.created) {
         return {
@@ -5312,12 +5325,24 @@ export default function plugin(bb: BbPluginApi) {
         let check: string | null = null;
         let fixFiles: string[] = [];
         let ownSlice = false;
+        let baseRef: string | null = null;
         const titleParts: string[] = [];
         for (let i = 0; i < tokens.length; i += 1) {
           const token = tokens[i];
           if (token === "--file") { file = tokens[++i] ?? ""; continue; }
           if (token === "--evidence") { evidence = tokens[++i] ?? ""; continue; }
           if (token === "--check") { check = tokens[++i] ?? null; continue; }
+          if (token === "--base-ref") {
+            const value = tokens[++i];
+            if (value === undefined) {
+              return {
+                exitCode: 1,
+                stderr: "--base-ref needs a value: the PR's already-resolved head branch or head SHA",
+              };
+            }
+            baseRef = value;
+            continue;
+          }
           if (token === "--own-slice") { ownSlice = true; continue; }
           if (token === "--fix-files") {
             fixFiles = (tokens[++i] ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
@@ -5330,15 +5355,24 @@ export default function plugin(bb: BbPluginApi) {
           return {
             exitCode: 1,
             stderr:
-              'Usage: bb ultragoal finding "<title>" --file <path[:line]> --evidence "<proof>" [--fix-files a,b] [--check <cmd>] [--own-slice] [--thread <id>]',
+              'Usage: bb ultragoal finding "<title>" --file <path[:line]> --evidence "<proof>" [--fix-files a,b] [--check <cmd>] [--base-ref <branch|sha>] [--own-slice] [--thread <id>]',
           };
+        }
+        if (baseRef !== null) {
+          const shape = goalFindingBaseRefSchema.min(1).safeParse(baseRef);
+          if (!shape.success) {
+            return {
+              exitCode: 1,
+              stderr: `--base-ref refused: ${shape.error.issues[0]?.message ?? "not ref-shaped"}`,
+            };
+          }
         }
         const goal = store.get(threadId);
         if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) {
           return { exitCode: 1, stderr: "No active UltraGoal on this thread." };
         }
         const registered = await registerFinding(threadId, {
-          title, file, evidence, fixFiles, check, ownSlice,
+          title, file, evidence, fixFiles, check, ownSlice, baseRef,
           projectId: await projectOfThread(threadId),
         });
         return {

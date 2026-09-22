@@ -156,6 +156,39 @@ export const goalFindingStatusSchema = z.enum([
   "dismissed",
 ]);
 
+/**
+ * Fail-closed bound on a finding's baseRef, matching the integration-branch
+ * bound in lib/prompts.ts (MAX_INTEGRATION_BRANCH_CHARS = 200): anything
+ * longer is a pasted description, not a ref.
+ */
+export const MAX_BASE_REF_CHARS = 200;
+
+/**
+ * The one shape check for a finding's baseRef: a git ref name or a hex SHA,
+ * already resolved by the filer. This plugin has no tracker client and stays
+ * provider-neutral, so a PR number or URL is REFUSED rather than resolved
+ * here — the next slice turns an unresolvable ref into a named diagnostic,
+ * never a silent fallback. Validation only: nothing here resolves a ref.
+ *
+ * An empty string passes on purpose; non-empty is the filing boundary's rule
+ * (server.ts), so a legacy or placeholder Finding carrying "" keeps parsing.
+ */
+export const goalFindingBaseRefSchema = z
+  .string()
+  .max(MAX_BASE_REF_CHARS)
+  .refine(
+    (ref) =>
+      !ref.includes("://") &&
+      !/\s/.test(ref) &&
+      !ref.startsWith("-") &&
+      !ref.split("/").includes("..") &&
+      !/^\d+$/.test(ref),
+    {
+      message:
+        `Supply the PR's already-resolved head branch or head SHA instead (e.g. "pr/58-head" or a 40-hex sha): a URL, whitespace, a leading "-", a ".." segment, or a bare PR number is refused.`,
+    },
+  );
+
 export const goalFindingSchema = z.object({
   id: z.string(),
   fingerprint: z.string(),
@@ -165,6 +198,13 @@ export const goalFindingSchema = z.object({
   status: goalFindingStatusSchema,
   itemId: z.string().nullable(),
   createdAt: z.number().int(),
+  /**
+   * The open PR this finding was filed against, named by the head ref the
+   * filer already resolved. Absent or null when it names none; never
+   * defaulted, so a pre-change GoalFinding object without the key still
+   * parses. Nothing here resolves a ref — see goalFindingBaseRefSchema.
+   */
+  baseRef: goalFindingBaseRefSchema.nullish(),
 });
 
 export const goalSnapshotSchema = z.object({

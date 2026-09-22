@@ -1,13 +1,32 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  budgetLimitPrompt,
   continuationPrompt,
   MAX_PLAN_INSTRUCTION_CHARS,
+  MAX_PROMPT_CHARS,
+  objectiveUpdatedPrompt,
   planInstruction,
   progressPrompt,
   workerQualityBrief,
 } from "./prompts.ts";
 import { makeLargeGoal } from "./test-goal.ts";
+
+function makeWorstCaseGoal() {
+  const goal = makeLargeGoal();
+  goal.objective = `Objective marker: ${"expanded requirement detail ".repeat(220)}`;
+  goal.decisions = Array.from({ length: 25 }, (_, index) => ({
+    id: `dec_${String(index).padStart(3, "0")}`,
+    question: `Owner choice ${index}?`,
+    context: null,
+    options: ["yes", "no"],
+    status: "open" as const,
+    answer: null,
+    createdAt: index,
+    deliveredAt: null,
+  }));
+  return goal;
+}
 
 describe("bounded UltraGoal prompts", () => {
   it("keeps a 1,000-item plan at or below 6KB without completed bodies", () => {
@@ -24,7 +43,7 @@ describe("bounded UltraGoal prompts", () => {
     const goal = makeLargeGoal();
     const continuation = continuationPrompt(goal);
     const progress = progressPrompt(goal);
-    assert.ok(continuation.length < 8_500, `continuation was ${continuation.length} chars`);
+    assert.ok(continuation.length <= MAX_PROMPT_CHARS, `continuation was ${continuation.length} chars`);
     assert.ok(progress.length < 8_000, `progress was ${progress.length} chars`);
     assert.doesNotMatch(continuation, /COMPLETED_BODY_/);
     assert.doesNotMatch(progress, /COMPLETED_BODY_/);
@@ -33,6 +52,75 @@ describe("bounded UltraGoal prompts", () => {
     assert.match(workerQualityBrief("integration"), /Workers never push/);
     assert.doesNotMatch(workerQualityBrief("integration"), /pushing origin is solely/i);
     assert.match(continuation, /compact wake-up, not a new goal/);
+  });
+
+  it("holds every automatically rendered prompt inside the request limit", () => {
+    // BB's server rejects request bodies above ~8000 characters, and the old
+    // surfaces had no shared bound: a 6,000-character objective rendered
+    // continuationPrompt at ~13.6k, so the wake-up never reached the model.
+    const goal = makeWorstCaseGoal();
+    const longBranch = `factory/${"overlong-branch-name-".repeat(60)}`;
+    const rendered: Array<[string, string]> = [
+      ["continuationPrompt", continuationPrompt(goal)],
+      ["progressPrompt", progressPrompt(goal)],
+      ["budgetLimitPrompt", budgetLimitPrompt(goal)],
+      ["objectiveUpdatedPrompt", objectiveUpdatedPrompt(goal)],
+      ["workerQualityBrief", workerQualityBrief(longBranch)],
+    ];
+    assert.ok(MAX_PROMPT_CHARS <= 8_000, `bound was ${MAX_PROMPT_CHARS}`);
+    for (const [name, text] of rendered) {
+      assert.ok(text.length <= MAX_PROMPT_CHARS, `${name} was ${text.length} chars`);
+    }
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      assert.match(text, /Objective marker: /);
+      assert.match(text, /objective truncated to fit the request limit/);
+    }
+    for (const text of [budgetLimitPrompt(goal), objectiveUpdatedPrompt(goal)]) {
+      assert.match(text, /Objective marker: /);
+    }
+  });
+
+  it("keeps the DECISIONS line and every decision id when the objective is trimmed", () => {
+    // The objective is untrusted data and is trimmed first; a decision marker
+    // sliced away to make room for it is a failed round, not a compact one.
+    const goal = makeWorstCaseGoal();
+    for (const text of [continuationPrompt(goal), progressPrompt(goal)]) {
+      const decisionsLine = text.split("\n").find((line) => line.startsWith("DECISIONS:"));
+      assert.ok(decisionsLine, "the DECISIONS line survives compaction");
+      assert.match(decisionsLine, /25 owner decision\(s\) await the user/);
+      for (const decision of goal.decisions) {
+        assert.match(decisionsLine, new RegExp(decision.id));
+      }
+    }
+  });
+
+  it("sends routine questions to the owning root without creating owner decisions", () => {
+    const goal = makeLargeGoal();
+    const continuation = continuationPrompt(goal);
+    const progress = progressPrompt(goal);
+    for (const brief of [workerQualityBrief("integration"), workerQualityBrief(null)]) {
+      for (const literal of [
+        "owning root",
+        "ultragoal_send_message",
+        "no owner decision",
+        "request_decision",
+      ]) {
+        assert.match(brief, new RegExp(literal));
+      }
+    }
+    for (const literal of [
+      "owning root",
+      "ultragoal_send_message",
+      "request_decision",
+      "not an owner decision",
+      "timeout",
+      "approval",
+    ]) {
+      assert.match(continuation, new RegExp(literal));
+    }
+    assert.match(continuation, /routine/i);
+    assert.match(progress, /owning root/);
+    assert.match(progress, /routine/i);
   });
 });
 

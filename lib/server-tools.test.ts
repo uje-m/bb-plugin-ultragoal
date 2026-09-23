@@ -204,6 +204,15 @@ function intakeRoot(rootId: string, extraRootIds: string[] = []) {
 }
 
 describe("large-plan agent tool contracts", () => {
+  it("accepts a nonempty decision id and keeps strict state input validation", () => {
+    const tool = registeredTools().get("ultragoal_state")!;
+    assert.equal(tool.parse({ decision_id: "dec_x" }).ok, true);
+    assert.equal(tool.parse({ decision_id: 1 }).ok, false);
+    assert.equal(tool.parse({ decision_id: "" }).ok, false);
+    assert.equal(tool.parse({ plan_limit: 101 }).ok, false);
+    assert.equal(tool.parse({ unexpected: true }).ok, false);
+  });
+
   it("accepts paged ultragoal_state reads and caps them at 100 rows", () => {
     const tool = registeredTools().get("ultragoal_state")!;
     assert.equal(tool.parse({}).ok, true);
@@ -2081,6 +2090,234 @@ describe("large-plan agent tool contracts", () => {
       sends.some((call) => (call[0] as { threadId?: string }).threadId === "thr_protocol_root"),
       "the root must be awakened after the retry budget is exhausted",
     );
+  });
+});
+
+describe("ultragoal_state full-answer lookup", () => {
+  const callTool = (host: FakePluginHost, name: string, input: unknown, threadId: string) =>
+    host.harness.behavior.callAgentTool(name, input, { threadId });
+
+  const startGoal = async (host: FakePluginHost, threadId: string) => {
+    const started = await callTool(
+      host,
+      "ultragoal_start",
+      { objective: `Exercise full-answer lookup on ${threadId}` },
+      threadId,
+    );
+    assert.equal(isToolError(started), false, toolText(started));
+  };
+
+  const requestDecision = async (host: FakePluginHost, threadId: string, question: string) => {
+    const requested = await callTool(host, "request_decision", { question }, threadId);
+    assert.equal(isToolError(requested), false, toolText(requested));
+    return (JSON.parse(toolText(requested)) as { decision_id: string }).decision_id;
+  };
+
+  const resolveDecision = async (
+    host: FakePluginHost,
+    threadId: string,
+    decision: string,
+    answer: string,
+    resolution: "answered" | "withdrawn" = "answered",
+  ) => {
+    const resolved = await callTool(
+      host,
+      "resolve_decision",
+      { decision, resolution, answer },
+      threadId,
+    );
+    assert.equal(isToolError(resolved), false, toolText(resolved));
+  };
+
+  const addChild = (host: FakePluginHost, root: string, child: string) => {
+    host.bb.storage.database().prepare(`
+      INSERT INTO collab_agents (
+        thread_id, root_thread_id, parent_thread_id, task_name, created_at,
+        display_name, item_id, role
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'worker')
+    `).run(child, root, root, `/root/${child}`, Date.now(), child);
+  };
+
+  const refusal = {
+    content: [{ type: "text", text: "decision unavailable" }],
+    isError: true,
+  };
+
+  const assertDenied = (result: unknown, answers: string[]) => {
+    assert.equal(isToolError(result), true);
+    const serialized = JSON.stringify(result);
+    for (const answer of answers) assert.equal(serialized.includes(answer), false);
+    assert.deepEqual(result, refusal);
+  };
+
+  it("returns the exact 8,200-character answer after it has been delivered", async () => {
+    const host = registeredHost();
+    const root = "thr_full_answer";
+    await startGoal(host, root);
+    const decision = await requestDecision(host, root, "Which answer must remain readable?");
+    const answer = "0123456789".repeat(820);
+    await resolveDecision(host, root, decision, answer);
+
+    const row = host.bb.storage.database().prepare(
+      "SELECT answer, delivered_at FROM goal_decisions WHERE thread_id = ? AND id = ?",
+    ).get(root, decision) as { answer: string; delivered_at: number | null };
+    assert.equal(row.answer, answer);
+    assert.notEqual(row.delivered_at, null, "root resolution marks the answer delivered");
+
+    const result = await callTool(host, "ultragoal_state", { decision_id: decision }, root);
+    assert.equal(isToolError(result), false, toolText(result));
+    const parsed = JSON.parse(toolText(result)) as { decision_id: string; answer: string };
+    assert.equal(parsed.decision_id, decision);
+    assert.equal(parsed.answer.length, 8_200);
+    assert.equal(parsed.answer, answer);
+  });
+
+  it("uses one indistinguishable refusal for children, foreign roots, missing, open, and withdrawn ids", async () => {
+    const host = registeredHost();
+    const rootA = "thr_answer_root_a";
+    const rootB = "thr_answer_root_b";
+    const child = "thr_answer_child";
+    await startGoal(host, rootA);
+    await startGoal(host, rootB);
+    addChild(host, rootA, child);
+
+    const decisionA = await requestDecision(host, rootA, "Root A's private decision?");
+    const decisionB = await requestDecision(host, rootB, "Root B's private decision?");
+    const answerA = "root A private answer";
+    const answerB = "root B private answer";
+    await resolveDecision(host, rootA, decisionA, answerA);
+    await resolveDecision(host, rootA, decisionA, answerA, "withdrawn");
+    const identicalRetry = await callTool(
+      host,
+      "ultragoal_state",
+      { decision_id: decisionA },
+      rootA,
+    );
+    assert.equal(isToolError(identicalRetry), false, toolText(identicalRetry));
+    assert.equal(
+      (JSON.parse(toolText(identicalRetry)) as { answer: string }).answer,
+      answerA,
+      "an identical conflicting resolution keeps the first committed answer available",
+    );
+    await resolveDecision(host, rootA, decisionA, "second conflicting answer");
+    const conflictRetry = await callTool(
+      host,
+      "ultragoal_state",
+      { decision_id: decisionA },
+      rootA,
+    );
+    assert.equal(isToolError(conflictRetry), false, toolText(conflictRetry));
+    assert.equal(
+      (JSON.parse(toolText(conflictRetry)) as { answer: string }).answer,
+      answerA,
+      "a conflicting resolution cannot replace the committed answer",
+    );
+    await resolveDecision(host, rootB, decisionB, answerB);
+
+    const openId = await requestDecision(host, rootA, "This answer is still open?");
+    const withdrawnId = await requestDecision(host, rootA, "This decision became moot?");
+    const withdrawnAnswer = "withdrawn private answer";
+    await resolveDecision(host, rootA, withdrawnId, withdrawnAnswer, "withdrawn");
+
+    const denials = [
+      await callTool(host, "ultragoal_state", { decision_id: decisionA }, child),
+      await callTool(host, "ultragoal_state", { decision_id: decisionA }, rootB),
+      await callTool(host, "ultragoal_state", { decision_id: decisionB }, rootA),
+      await callTool(host, "ultragoal_state", { decision_id: "dec_missing_full_answer" }, rootA),
+      await callTool(host, "ultragoal_state", { decision_id: openId }, rootA),
+      await callTool(host, "ultragoal_state", { decision_id: withdrawnId }, rootA),
+    ];
+    for (const result of denials) {
+      assertDenied(result, [answerA, answerB, withdrawnAnswer]);
+    }
+
+    await resolveDecision(host, rootA, openId, "closed after the denial assertion", "withdrawn");
+  });
+
+  it("follows persisted ownership after root transfer and denies the former root and child", async () => {
+    const host = registeredHost();
+    const source = "thr_transfer_answer_source";
+    const target = "thr_transfer_answer_target";
+    const child = "thr_transfer_answer_child";
+    await startGoal(host, source);
+    addChild(host, source, child);
+    const decision = await requestDecision(host, source, "Which answer must survive transfer?");
+    const answer = "answer persisted across root transfer";
+    await resolveDecision(host, source, decision, answer);
+
+    const db = host.bb.storage.database();
+    db.prepare("UPDATE goals SET thread_id = ? WHERE thread_id = ?").run(target, source);
+    db.prepare("UPDATE goal_decisions SET thread_id = ? WHERE thread_id = ?").run(target, source);
+    db.prepare(
+      "UPDATE collab_agents SET root_thread_id = ?, parent_thread_id = ? WHERE thread_id = ?",
+    ).run(target, target, child);
+
+    const currentOwner = await callTool(host, "ultragoal_state", { decision_id: decision }, target);
+    assert.equal(isToolError(currentOwner), false, toolText(currentOwner));
+    assert.equal(
+      (JSON.parse(toolText(currentOwner)) as { answer: string }).answer,
+      answer,
+    );
+    assertDenied(
+      await callTool(host, "ultragoal_state", { decision_id: decision }, source),
+      [answer],
+    );
+    assertDenied(
+      await callTool(host, "ultragoal_state", { decision_id: decision }, child),
+      [answer],
+    );
+  });
+
+  it("keeps the bounded root and child state pages unchanged with and without pagination", async () => {
+    const host = registeredHost();
+    const root = "thr_bounded_state_root";
+    const child = "thr_bounded_state_child";
+    await startGoal(host, root);
+    host.bb.storage.database().prepare(
+      "UPDATE goals SET max_workers = 0 WHERE thread_id = ?",
+    ).run(root);
+    addChild(host, root, child);
+    const items = createItemStore(host.bb);
+    for (let index = 0; index < 45; index += 1) {
+      items.add(root, `Bounded page item ${index}`, "pending");
+    }
+
+    const firstPage = async (threadId: string) => {
+      const result = await callTool(host, "ultragoal_state", {}, threadId);
+      assert.equal(isToolError(result), false, toolText(result));
+      return JSON.parse(toolText(result)) as {
+        goal: { plan: unknown[]; planPage: { cursor: number; limit: number; matching: number; returned: number; nextCursor: number | null } };
+      };
+    };
+    const nextPage = async (threadId: string) => {
+      const result = await callTool(
+        host,
+        "ultragoal_state",
+        { plan_cursor: 40, plan_limit: 5 },
+        threadId,
+      );
+      assert.equal(isToolError(result), false, toolText(result));
+      return JSON.parse(toolText(result)) as {
+        goal: { plan: unknown[]; planPage: { cursor: number; limit: number; matching: number; returned: number; nextCursor: number | null } };
+      };
+    };
+
+    for (const page of [await firstPage(root), await firstPage(child)]) {
+      assert.equal(page.goal.planPage.cursor, 0);
+      assert.equal(page.goal.planPage.limit, 40);
+      assert.equal(page.goal.planPage.matching, 45);
+      assert.equal(page.goal.planPage.returned, 40);
+      assert.equal(page.goal.planPage.nextCursor, 40);
+      assert.equal(page.goal.plan.length, 40);
+    }
+    for (const page of [await nextPage(root), await nextPage(child)]) {
+      assert.equal(page.goal.planPage.cursor, 40);
+      assert.equal(page.goal.planPage.limit, 5);
+      assert.equal(page.goal.planPage.matching, 45);
+      assert.equal(page.goal.planPage.returned, 5);
+      assert.equal(page.goal.planPage.nextCursor, null);
+      assert.equal(page.goal.plan.length, 5);
+    }
   });
 });
 

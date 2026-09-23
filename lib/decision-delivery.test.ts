@@ -424,6 +424,15 @@ describe("durable per-root wakeup ledger", () => {
     assert.equal(row.updatedAt, 3);
     assert.deepEqual(reloaded.outstanding("thr_root"), row);
   });
+
+  it("clears a superseded root's wakeup without touching another root", () => {
+    const { store } = wakeupHost("wakeup-clear-test");
+    store.note("thr_old", "stale", 1);
+    store.note("thr_live", "keep", 2);
+    store.clear("thr_old");
+    assert.equal(store.get("thr_old"), null);
+    assert.equal(store.get("thr_live")?.summary, "keep");
+  });
 });
 
 describe("wakeup reconciliation policy", () => {
@@ -494,7 +503,7 @@ describe("wakeup reconciliation policy", () => {
     );
   });
 
-  it("matches the queue by message identity or marker and never re-creates it", () => {
+  it("matches the queue only by persisted identity and never adopts a foreign marker", () => {
     const { store } = wakeupHost("wakeup-reconcile-queue-test");
     store.note("thr_root", "first", 1);
     store.settle("thr_root", 1, { kind: "queued", messageId: "q7", queueUpdatedAt: 5 }, 2);
@@ -514,8 +523,8 @@ describe("wakeup reconciliation policy", () => {
         queue: { ok: true, rows: [{ id: "q8", content: `WIP ${wakeupMarker("thr_root")}` }] },
         timeline: { ok: true, rows: [] },
       }),
-      "queued",
-      "content carrying the marker is the same proof when the identity moved",
+      "send",
+      "content carrying a marker cannot replace the persisted queue identity",
     );
     assert.equal(
       reconcileWakeup({
@@ -525,6 +534,41 @@ describe("wakeup reconciliation policy", () => {
       }),
       "send",
       "a queue without the identity is not evidence that anything landed",
+    );
+  });
+
+  it("does not adopt stale, foreign, or token-bearing queued messages", () => {
+    const { store } = wakeupHost("wakeup-queue-safety-test");
+    store.note("thr_root", "first", 1);
+    const row = store.outstanding("thr_root")!;
+    assert.equal(
+      reconcileWakeup({
+        row,
+        queue: {
+          ok: true,
+          rows: [
+            { id: "old-root-copy", content: `OWNER WAKE ${wakeupMarker("thr_root")}` },
+            { id: "foreign-root", content: wakeupMarker("thr_other") },
+            { id: "token-bearing", content: "[ultragoal] stale token" },
+          ],
+        },
+        timeline: { ok: true, rows: [] },
+      }),
+      "send",
+    );
+  });
+
+  it("holds an uncertain create instead of resending without an identity", () => {
+    const { store } = wakeupHost("wakeup-unknown-create-test");
+    store.note("thr_root", "uncertain create", 1);
+    store.settle("thr_root", 1, { kind: "unknown" }, 2);
+    assert.equal(
+      reconcileWakeup({
+        row: store.outstanding("thr_root"),
+        queue: { ok: true, rows: [{ id: "remote-copy", content: "wake" }] },
+        timeline: { ok: true, rows: [] },
+      }),
+      "hold",
     );
   });
 

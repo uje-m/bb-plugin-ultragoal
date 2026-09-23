@@ -25,7 +25,14 @@ import { lastUserText, parseSlashGoal } from "./lib/slash.js";
 import { formatGoalCard, goalToolResponse, isUnfinished } from "./lib/status.js";
 import { COLLAB_TOOL_NAMES, createCollabStore, INTAKE_COURIER_DISPLAY_NAME, isIntakeCourier, type ValidatedWorkerBase } from "./lib/collab.js";
 import { createDecisionStore } from "./lib/decisions.js";
-import { decisionIdsInTimeline, deliverAnsweredDecisions } from "./lib/decision-delivery.js";
+import {
+  createRootWakeupStore,
+  decisionIdsInTimeline,
+  deliverAnsweredDecisions,
+  reconcileWakeup,
+  wakeupMarker,
+  type RootWakeup,
+} from "./lib/decision-delivery.js";
 import {
   createFindingStore,
   findingRegistrationCliMessage,
@@ -544,6 +551,7 @@ export default function plugin(bb: BbPluginApi) {
   const items = createItemStore(bb);
   const findings = createFindingStore(bb);
   const decisions = createDecisionStore(bb);
+  const rootWakeups = createRootWakeupStore(bb.storage.database());
   const rootTransfers = createRootTransferStore(bb);
   const agentCache = new Map<string, GoalAgent[]>();
   /** Open native task calls per root, from the last fresh scan. */
@@ -1505,8 +1513,16 @@ export default function plugin(bb: BbPluginApi) {
   // progress heartbeat is due — never as a busy-poll loop while it waits on
   // live workers.
   const lastGoalEvent = new Map<string, number>();
-  function markGoalEvent(rootThreadId: string): void {
+  function markGoalEvent(rootThreadId: string, summary = "UltraGoal state changed"): void {
     lastGoalEvent.set(rootThreadId, Date.now());
+    const goal = store.get(rootThreadId);
+    if (
+      goal &&
+      (goal.status === "active" || goal.status === "budget_limited") &&
+      !transferLocked(rootThreadId)
+    ) {
+      rootWakeups.note(rootThreadId, summary, Date.now());
+    }
   }
 
   // Owner decisions render as native center-pane question cards
@@ -1584,18 +1600,20 @@ export default function plugin(bb: BbPluginApi) {
   // empty, so the orchestrator could not tell a lost answer from a clean board.
   // One in-flight pass per root collapses the inline answer path and the pulse
   // sweep, so a retry can never double-steer the same answer.
-  const decisionDelivery = new Map<string, Promise<void>>();
+  const decisionDelivery = new Map<string, Promise<Awaited<ReturnType<typeof deliverAnsweredDecisions>>>>();
 
-  async function deliverDecisionAnswers(rootThreadId: string): Promise<void> {
+  async function deliverDecisionAnswers(rootThreadId: string): Promise<ReturnType<typeof deliverAnsweredDecisions>> {
     const existing = decisionDelivery.get(rootThreadId);
     if (existing) return existing;
     const run = (async () => {
       const pending = decisions.listUndelivered(rootThreadId);
-      if (pending.length === 0) return;
+      if (pending.length === 0) return { delivered: 0, alreadyDelivered: 0, pending: 0 };
       // While another decision is open the thread is necessarily awaiting the
       // owner's interaction and refuses every steer; skip the 409 and let the
       // next pulse retry once the board is clear.
-      if (decisions.list(rootThreadId, "open").length > 0) return;
+      if (decisions.list(rootThreadId, "open").length > 0) {
+        return { delivered: 0, alreadyDelivered: 0, pending: pending.length };
+      }
       const rows = await readTimeline(rootThreadId);
       const result = await deliverAnsweredDecisions({
         pending,
@@ -1619,6 +1637,7 @@ export default function plugin(bb: BbPluginApi) {
           `Owner decision delivery pending on ${rootThreadId}: ${result.pending} answered decision(s) could not reach the root yet`,
         );
       }
+      return result;
     })().finally(() => {
       decisionDelivery.delete(rootThreadId);
     });
@@ -1633,7 +1652,7 @@ export default function plugin(bb: BbPluginApi) {
   ): Promise<boolean> {
     const resolved = decisions.resolve(goalThreadId, decisionId, "answered", answer);
     if (!resolved) return false;
-    markGoalEvent(goalThreadId);
+    lastGoalEvent.set(goalThreadId, Date.now());
     decisionAborts.get(decisionId)?.abort();
     // The answer is committed, so the root is free for its next durable open
     // decision now — promotion never waits on delivery or a keeper's unwind.
@@ -1641,7 +1660,10 @@ export default function plugin(bb: BbPluginApi) {
     const goal = store.get(goalThreadId);
     if (goal) publish(goalThreadId, view(goal));
     bb.log.info(`Owner decision ${decisionId} answered on ${goalThreadId}: ${answer.slice(0, 80)}`);
-    await deliverDecisionAnswers(goalThreadId);
+    const delivery = await deliverDecisionAnswers(goalThreadId);
+    if (delivery.pending > 0) {
+      rootWakeups.note(goalThreadId, "Owner decision answer is waiting for root delivery", Date.now());
+    }
     return true;
   }
 
@@ -1855,6 +1877,8 @@ export default function plugin(bb: BbPluginApi) {
                 rootActivity.delete(sourceThreadId);
                 rootReviveState.delete(sourceThreadId);
                 forgetNativeScan(sourceThreadId);
+                rootWakeups.clear(sourceThreadId);
+                rootWakeups.clear(targetThreadId);
                 publish(sourceThreadId, null);
               },
             });
@@ -2827,15 +2851,45 @@ export default function plugin(bb: BbPluginApi) {
   // cross it silently. This is opt-in and OFF by default: with the setting off,
   // every request reaches the owner exactly as it would without this plugin.
   // User questions are never answered here either way.
+  async function readPendingInteractions(threadId: string): Promise<{
+    known: boolean;
+    rows: Array<Record<string, unknown>>;
+  }> {
+    const interactions = (bb.sdk.threads as unknown as {
+      interactions?: { list?: (args: { threadId: string }) => Promise<unknown> };
+    }).interactions;
+    if (!interactions || typeof interactions.list !== "function") {
+      // Hosts predating the interaction reader expose no surface at all. That
+      // is a known empty surface; an actual reader failure remains unknown.
+      return { known: true, rows: [] };
+    }
+    try {
+      const listed = await interactions.list({ threadId });
+      return { known: true, rows: (Array.isArray(listed) ? listed : []) as Array<Record<string, unknown>> };
+    } catch {
+      return { known: false, rows: [] };
+    }
+  }
+
+  function interactionNeedsProviderTurn(row: Record<string, unknown>): boolean {
+    const payload = row.payload && typeof row.payload === "object"
+      ? row.payload as Record<string, unknown>
+      : null;
+    const kind = typeof payload?.kind === "string" ? payload.kind : typeof row.kind === "string" ? row.kind : "";
+    const renderer = typeof row.rendererId === "string" ? row.rendererId : "";
+    const source = typeof row.source === "string" ? row.source : typeof payload?.source === "string" ? payload.source : "";
+    if (payload?.turnBound === false || row.turnBound === false) return false;
+    if (kind === "plugin" || kind === "owner-decision" || renderer === "owner-decision" || source === "plugin") {
+      return false;
+    }
+    return true;
+  }
+
   async function approveInteractions(threadId: string): Promise<number> {
     if (!snapshotDefaults.autoApproveAgentRequests) return 0;
-    let rows: Array<Record<string, unknown>> = [];
-    try {
-      const listed = await bb.sdk.threads.interactions.list({ threadId });
-      rows = (Array.isArray(listed) ? listed : []) as Array<Record<string, unknown>>;
-    } catch {
-      return 0;
-    }
+    const pending = await readPendingInteractions(threadId);
+    if (!pending.known) return 0;
+    const rows = pending.rows;
     let approved = 0;
     for (const row of rows) {
       const id = typeof row.id === "string" ? row.id : null;
@@ -3069,8 +3123,7 @@ export default function plugin(bb: BbPluginApi) {
     if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) return;
     if (!view(goal).settings.autoContinue) return;
     await ensureCrew(rootId);
-    if (await threadIsRunning(bb, rootId)) return;
-    await continueIfIdle(rootId, store.get(rootId) ?? goal);
+    await reconcileRootWakeup(rootId);
   }
 
   async function refreshRunning(threadId: string): Promise<boolean> {
@@ -3210,6 +3263,7 @@ export default function plugin(bb: BbPluginApi) {
       findings.clear(threadId);
       decisions.clear(threadId);
       invalidBaseSuppressions.clear(threadId);
+      rootWakeups.clear(threadId);
     }
     const goal =
       !existing || existing.status === "complete"
@@ -3351,6 +3405,153 @@ export default function plugin(bb: BbPluginApi) {
     }
   }
 
+  function wakeupInput(rootThreadId: string, row: RootWakeup, goal: StoredGoal) {
+    const snapshot = view(goal);
+    return [{
+      type: "text" as const,
+      text: [
+        wakeupMarker(rootThreadId),
+        `Automatic wake-up: ${row.summary}`,
+        continuationPrompt(snapshot),
+      ].join("\n\n"),
+      visibility: "agent-only" as const,
+      mentions: [],
+    }];
+  }
+
+  async function reconcileRootWakeup(rootThreadId: string): Promise<void> {
+    if (transferLocked(rootThreadId)) return;
+    const goal = store.get(rootThreadId);
+    if (!goal || (goal.status !== "active" && goal.status !== "budget_limited")) return;
+    const row = rootWakeups.outstanding(rootThreadId);
+    if (!row) return;
+    const queueApi = (bb.sdk.threads as unknown as {
+      queuedMessages?: {
+        list: (args: { threadId: string }) => Promise<unknown>;
+        create: (args: unknown) => Promise<unknown>;
+        update: (args: unknown) => Promise<unknown>;
+      };
+    }).queuedMessages;
+    const input = wakeupInput(rootThreadId, row, goal);
+
+    let thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+    try {
+      thread = await bb.sdk.threads.get({ threadId: rootThreadId });
+    } catch {
+      rootWakeups.settle(rootThreadId, row.revision, { kind: "unknown" }, Date.now());
+      return;
+    }
+    const pendingInteractions = await readPendingInteractions(rootThreadId);
+    if (
+      !pendingInteractions.known ||
+      pendingInteractions.rows.some(interactionNeedsProviderTurn)
+    ) {
+      // A durable wake must not start or steer a root that is waiting on a
+      // provider-bound interaction. Unknown interaction state is equally
+      // unsafe; the wake remains outstanding for a later reconciliation.
+      return;
+    }
+    // Start idle roots directly. Queueing is for a root that is already in a
+    // provider turn; an idle root must wake now rather than wait for another
+    // provider event to drain its queue.
+    if (threadAcceptsStart(thread)) {
+      const sent = await sendSteering(rootThreadId, input[0]!.text, "start");
+      rootWakeups.settle(
+        rootThreadId,
+        row.revision,
+        { kind: sent ? "dispatched" : "unknown" },
+        Date.now(),
+      );
+      return;
+    }
+
+    // Older compatible hosts have no queue area. Keep their established send
+    // path, but still record the durable outcome so a reload never invents a
+    // second notification for the same event.
+    if (
+      !queueApi ||
+      typeof queueApi.list !== "function" ||
+      typeof queueApi.create !== "function" ||
+      typeof queueApi.update !== "function"
+    ) {
+      const runningNow = await threadIsRunning(bb, rootThreadId);
+      const sent = await sendSteering(rootThreadId, input[0]!.text, runningNow ? "steer" : "start");
+      rootWakeups.settle(
+        rootThreadId,
+        row.revision,
+        { kind: sent ? "dispatched" : "unknown" },
+        Date.now(),
+      );
+      return;
+    }
+
+    let timeline: { ok: boolean; rows: readonly unknown[] } = { ok: false, rows: [] };
+    let queue: { ok: boolean; rows: Array<{ id: string; updatedAt?: number }> } = { ok: false, rows: [] };
+    try {
+      const listed = await bb.sdk.threads.timeline({ threadId: rootThreadId });
+      if (!Array.isArray(listed?.rows)) throw new Error("timeline response was not a row list");
+      timeline = { ok: true, rows: listed.rows };
+    } catch {
+      // Unknown history cannot prove a send landed.
+    }
+    try {
+      const listed = await queueApi.list({ threadId: rootThreadId });
+      if (!Array.isArray(listed)) throw new Error("queued-message response was not a row list");
+      queue = { ok: true, rows: listed as Array<{ id: string; updatedAt?: number }> };
+    } catch {
+      // Unknown queue state cannot authorize an edit, delete, or resend.
+    }
+    const action = reconcileWakeup({ row, queue, timeline });
+    if (action === "settled" || action === "hold") return;
+    const queued = row.queueMessageId
+      ? queue.rows.find((candidate) => candidate.id === row.queueMessageId)
+      : undefined;
+
+    if (action === "dispatched") {
+      rootWakeups.settle(rootThreadId, row.revision, { kind: "dispatched" }, Date.now());
+      return;
+    }
+
+    if (action === "queued" && queued) {
+      if (typeof queued.updatedAt !== "number") return;
+      try {
+        const updated = await queueApi.update({
+          threadId: rootThreadId,
+          queuedMessageId: queued.id,
+          expectedUpdatedAt: queued.updatedAt,
+          input,
+        }) as { updatedAt?: number };
+        rootWakeups.settle(
+          rootThreadId,
+          row.revision,
+          {
+            kind: "queued",
+            messageId: queued.id,
+            queueUpdatedAt: typeof updated.updatedAt === "number" ? updated.updatedAt : queued.updatedAt,
+          },
+          Date.now(),
+        );
+      } catch {
+        rootWakeups.settle(rootThreadId, row.revision, { kind: "unknown" }, Date.now());
+      }
+      return;
+    }
+
+    try {
+      const created = await queueApi.create({
+        threadId: rootThreadId,
+        input,
+        senderThreadId: rootThreadId,
+      }) as { id?: unknown; updatedAt?: unknown };
+      const messageId = typeof created.id === "string" ? created.id.trim() : "";
+      const updatedAt = typeof created.updatedAt === "number" ? created.updatedAt : Number.NaN;
+      if (!messageId || !Number.isFinite(updatedAt)) throw new Error("queue create returned no durable identity");
+      rootWakeups.settle(rootThreadId, row.revision, { kind: "queued", messageId, queueUpdatedAt: updatedAt }, Date.now());
+    } catch {
+      rootWakeups.settle(rootThreadId, row.revision, { kind: "unknown" }, Date.now());
+    }
+  }
+
   async function requestProgressUpdate(threadId: string, goal: StoredGoal): Promise<boolean> {
     if (inflight.has(threadId)) return false;
     const snap = await viewFresh(goal);
@@ -3361,13 +3562,11 @@ export default function plugin(bb: BbPluginApi) {
     // Steered input interrupts pending native Task subagents on Cursor and
     // orphans their tool calls; hold the check-in until they finish.
     if (hasPendingNativeTasks(threadId)) return false;
-    const runningNow = await threadIsRunning(bb, threadId);
-    const sent = await sendSteering(
-      threadId,
-      progressPrompt(snap),
-      runningNow ? "steer" : "start",
-    );
-    if (!sent) return false;
+    const before = rootWakeups.get(threadId)?.revision ?? 0;
+    markGoalEvent(threadId, "Periodic progress check-in due");
+    await reconcileRootWakeup(threadId);
+    const after = rootWakeups.get(threadId);
+    if (!after || after.revision < before + 1 || after.settledRevision < before + 1) return false;
     store.update(threadId, {
       lastProgressAt: Date.now(),
       lastContinueAt: Date.now(),
@@ -3511,8 +3710,9 @@ export default function plugin(bb: BbPluginApi) {
                 error instanceof Error ? error.message : String(error)
               }`,
             );
-          });
+        });
         await deliverDecisionAnswers(threadId);
+        await reconcileRootWakeup(threadId);
         await reviveErroredRoot(threadId);
         const restarted = await watchRootTurn(threadId);
         // A wedge restart already submitted one turn. A second start in the
@@ -3623,6 +3823,7 @@ export default function plugin(bb: BbPluginApi) {
       findings.clear(threadId);
       decisions.clear(threadId);
       invalidBaseSuppressions.clear(threadId);
+      rootWakeups.clear(threadId);
       if (store.clear(threadId)) publish(threadId, null);
       return true;
     }
@@ -3662,6 +3863,7 @@ export default function plugin(bb: BbPluginApi) {
       findings.clear(threadId);
       decisions.clear(threadId);
       invalidBaseSuppressions.clear(threadId);
+      rootWakeups.clear(threadId);
       const cleared = store.clear(threadId);
       if (cleared) publish(threadId, null);
       return { cleared };
@@ -4130,6 +4332,7 @@ export default function plugin(bb: BbPluginApi) {
         }
         store.update(rootThreadId, { completionSummary: summary.trim() });
       }
+      if (status === "complete" || status === "blocked") rootWakeups.clear(rootThreadId);
       const next = applyStatus(rootThreadId, status, null);
       return goalToolResponse(next ? view(next) : null, status === "complete");
     },
@@ -4582,7 +4785,7 @@ export default function plugin(bb: BbPluginApi) {
         };
       }
       decisionAborts.get(resolved.id)?.abort();
-      markGoalEvent(owner);
+      lastGoalEvent.set(owner, Date.now());
       // A resolution that took the active card frees the root for its next
       // durable open decision without waiting for the keeper to unwind.
       promoteDecisionPrompt(owner);
@@ -4602,7 +4805,10 @@ export default function plugin(bb: BbPluginApi) {
         if (committedHere && threadId === owner) {
           decisions.markDelivered(owner, resolved.id);
         } else {
-          void deliverDecisionAnswers(owner);
+          const delivery = await deliverDecisionAnswers(owner);
+          if (delivery.pending > 0) {
+            rootWakeups.note(owner, "Owner decision answer is waiting for root delivery", Date.now());
+          }
         }
       }
       void publishFresh(owner);
@@ -5080,11 +5286,17 @@ export default function plugin(bb: BbPluginApi) {
       void publishFresh(parentRoot);
       void nudgeRoot(parentRoot);
     }
-    const pendingInteractions = await bb.sdk.threads.interactions
-      .list({ threadId: thread.id })
-      .catch(() => []);
-    if (Array.isArray(pendingInteractions) && pendingInteractions.length > 0) {
-      bb.log.info(`Skipping Goal continue on ${thread.id}: pending interaction`);
+    const pendingInteractions = await readPendingInteractions(thread.id);
+    if (
+      !pendingInteractions.known ||
+      (pendingInteraction && pendingInteractions.rows.length === 0) ||
+      pendingInteractions.rows.some(interactionNeedsProviderTurn)
+    ) {
+      bb.log.info(
+        `Skipping Goal continue on ${thread.id}: ${
+          pendingInteractions.known ? "provider-bound or unknown interaction" : "unreadable interaction state"
+        }`,
+      );
       return;
     }
 
@@ -5128,7 +5340,11 @@ export default function plugin(bb: BbPluginApi) {
       }
       return;
     }
-    await continueIfIdle(thread.id, latest);
+    if (rootWakeups.outstanding(thread.id)) {
+      await reconcileRootWakeup(thread.id);
+    } else {
+      await continueIfIdle(thread.id, latest);
+    }
   });
 
   bb.events.on("thread.failed", async ({ thread, error }) => {
@@ -5198,6 +5414,7 @@ export default function plugin(bb: BbPluginApi) {
     findings.clear(thread.id);
     decisions.clear(thread.id);
     invalidBaseSuppressions.clear(thread.id);
+    rootWakeups.clear(thread.id);
     if (store.clear(thread.id)) publish(thread.id, null);
   });
 
@@ -5855,6 +6072,7 @@ export default function plugin(bb: BbPluginApi) {
       findings.clear(threadId);
       decisions.clear(threadId);
       invalidBaseSuppressions.clear(threadId);
+      rootWakeups.clear(threadId);
       store.clear(threadId);
       publish(threadId, null);
       return { exitCode: 0, stdout: "UltraGoal cleared." };

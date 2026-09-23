@@ -3969,8 +3969,17 @@ export default function plugin(bb: BbPluginApi) {
       plan_status: z.enum(["open", "pending", "in_progress", "completed", "all"]).optional(),
       plan_cursor: z.number().int().nonnegative().optional(),
       plan_limit: z.number().int().min(1).max(100).optional(),
+      decision_id: z.string().min(1).optional(),
     }).strict(),
-    async execute({ plan_status, plan_cursor, plan_limit }, { threadId }) {
+    async execute({ plan_status, plan_cursor, plan_limit, decision_id }, { threadId }) {
+      if (decision_id !== undefined) {
+        const owner = await goalOwnerOfCaller(threadId);
+        const decision = owner?.threadId === threadId ? decisions.get(threadId, decision_id) : null;
+        if (!decision || decision.status !== "answered" || decision.answer === null) {
+          return { content: [{ type: "text", text: "decision unavailable" }], isError: true };
+        }
+        return JSON.stringify({ decision_id: decision.id, answer: decision.answer });
+      }
       const rootThreadId = await goalThreadIdOfCaller(threadId);
       await refreshRunning(rootThreadId);
       const accounted = await account(rootThreadId);

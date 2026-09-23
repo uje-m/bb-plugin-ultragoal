@@ -3974,7 +3974,8 @@ export default function plugin(bb: BbPluginApi) {
     async execute({ plan_status, plan_cursor, plan_limit, decision_id }, { threadId }) {
       if (decision_id !== undefined) {
         const owner = await goalOwnerOfCaller(threadId);
-        const decision = owner?.threadId === threadId ? decisions.get(threadId, decision_id) : null;
+        const decision =
+          owner?.threadId === threadId ? decisions.get(owner.threadId, decision_id) : null;
         if (!decision || decision.status !== "answered" || decision.answer === null) {
           return { content: [{ type: "text", text: "decision unavailable" }], isError: true };
         }

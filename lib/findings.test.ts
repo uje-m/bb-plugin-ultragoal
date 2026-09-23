@@ -6,6 +6,11 @@ import {
   findingRegistrationCliMessage,
   findingRegistrationOutcome,
 } from "./findings.ts";
+import {
+  MAX_BASE_REF_CHARS,
+  goalFindingBaseRefSchema,
+  goalFindingSchema,
+} from "../contract.js";
 
 const hosts: FakePluginHost[] = [];
 afterEach(async () => {
@@ -267,5 +272,78 @@ describe("finding project provenance", () => {
     assert.equal(again.created, false);
     assert.equal(findings.remediationQueue("thr_g")[0]?.projectId, "proj_first");
     assert.equal(findings.remediationQueue("thr_g")[0]?.id, first.finding.id);
+  });
+});
+
+describe("the resolved PR head a finding names", () => {
+  it("persists baseRef trim-only and round-trips it", () => {
+    // No tracker client exists here, so the filer resolved the ref and the
+    // register stores exactly that ref — never a PR number or URL to resolve.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", {
+      title: "Defect on the PR branch", file: "a.ts:1", evidence: "e", baseRef: "  PR/Fix-58-Head  ",
+    });
+    assert.equal(rec.finding.baseRef, "PR/Fix-58-Head");
+    assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, "PR/Fix-58-Head");
+    assert.equal(findings.list("thr_g")[0]?.baseRef, "PR/Fix-58-Head");
+    assert.equal(findings.remediationQueue("thr_g")[0]?.baseRef, "PR/Fix-58-Head");
+  });
+
+  it("leaves baseRef null when the filer named no PR", () => {
+    // Absent must read as "none", never as a ref something should resolve.
+    const findings = freshFindings();
+    const rec = findings.report("thr_g", { title: "No PR", file: "a.ts:1", evidence: "e" });
+    assert.equal(rec.finding.baseRef, null);
+    assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, null);
+    assert.equal(findings.remediationQueue("thr_g")[0]?.baseRef, null);
+  });
+
+  it("parses a GoalFinding object recorded before the field existed", () => {
+    // Additive and never defaulted, so pre-change objects keep parsing.
+    const legacy = goalFindingSchema.safeParse({
+      id: "fnd_legacy", fingerprint: "fp", title: "Legacy", file: "a.ts:1",
+      evidence: "e", status: "open", itemId: null, createdAt: 1,
+    });
+    assert.ok(legacy.success);
+    assert.equal(legacy.data.baseRef, undefined);
+    assert.equal(goalFindingSchema.safeParse({ ...legacy.data, baseRef: null }).success, true);
+  });
+
+  it("refuses a non-ref-shaped baseRef, naming what to supply instead", () => {
+    // Resolving a PR number or URL needs a tracker client this plugin
+    // deliberately lacks, so the shape is refused at the one recording boundary.
+    for (const ref of [
+      "https://github.com/uje-m/bb-plugin-ultragoal/pull/58", "pr 58 head",
+      "-pr/58-head", "pr/../58-head", "58",
+    ]) {
+      const parsed = goalFindingBaseRefSchema.safeParse(ref);
+      assert.equal(parsed.success, false, `${ref} must be refused`);
+      assert.match(parsed.error?.issues[0]?.message ?? "", /head branch or head SHA/);
+    }
+    // The fail-closed length bound refuses before the shape refine is reached.
+    assert.equal(goalFindingBaseRefSchema.safeParse("a".repeat(MAX_BASE_REF_CHARS + 1)).success, false);
+  });
+
+  it("accepts a branch name, a hex SHA, and the empty placeholder", () => {
+    for (const ref of ["pr/58-head", "fix/R4-finding-baseref", "a1b2c3d",
+      "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", "a".repeat(MAX_BASE_REF_CHARS)]) {
+      assert.equal(goalFindingBaseRefSchema.safeParse(ref).success, true, `${ref} must be accepted`);
+    }
+    // Deliberate: a legacy or placeholder Finding carrying "" keeps parsing;
+    // non-empty is the filing boundary's rule, not the shape's.
+    assert.equal(goalFindingBaseRefSchema.safeParse("").success, true);
+  });
+
+  it("adds the column to a table that predates it, at store creation", () => {
+    // freshFindings' CREATE TABLE is the pre-column register; the store owns
+    // the self-heal (worker-brief precedent), not lib/store.ts's positional
+    // migration list.
+    const findings = freshFindings();
+    const db = hosts[hosts.length - 1]!.bb.storage.database();
+    const columns = (db.prepare("PRAGMA table_info(goal_findings)").all() as Array<{ name: string }>)
+      .map((column) => column.name);
+    assert.equal(columns.includes("base_ref"), true);
+    const rec = findings.report("thr_g", { title: "Self-healed", file: "a.ts:1", evidence: "e", baseRef: "pr/58-head" });
+    assert.equal(findings.get("thr_g", rec.finding.id)?.baseRef, "pr/58-head");
   });
 });

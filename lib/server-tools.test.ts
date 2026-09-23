@@ -204,6 +204,15 @@ function intakeRoot(rootId: string, extraRootIds: string[] = []) {
 }
 
 describe("large-plan agent tool contracts", () => {
+  it("accepts a nonempty decision id and keeps strict state input validation", () => {
+    const tool = registeredTools().get("ultragoal_state")!;
+    assert.equal(tool.parse({ decision_id: "dec_x" }).ok, true);
+    assert.equal(tool.parse({ decision_id: 1 }).ok, false);
+    assert.equal(tool.parse({ decision_id: "" }).ok, false);
+    assert.equal(tool.parse({ plan_limit: 101 }).ok, false);
+    assert.equal(tool.parse({ unexpected: true }).ok, false);
+  });
+
   it("accepts paged ultragoal_state reads and caps them at 100 rows", () => {
     const tool = registeredTools().get("ultragoal_state")!;
     assert.equal(tool.parse({}).ok, true);

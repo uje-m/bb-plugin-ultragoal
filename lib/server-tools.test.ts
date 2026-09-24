@@ -2545,6 +2545,193 @@ describe("owner decision cards: one active card per root", () => {
   });
 });
 
+describe("durable automatic root wakeups", () => {
+  type QueueRow = { id: string; updatedAt: number; content: unknown };
+
+  function wakeupHost(options?: {
+    interactionRows?: Array<Record<string, unknown>>;
+    interactionsUnreadable?: boolean;
+    unknownCreate?: boolean;
+    rootStatus?: string;
+  }) {
+    const queue: QueueRow[] = [];
+    const sends: unknown[] = [];
+    const updates: unknown[] = [];
+    let nextId = 1;
+    const host = registeredHost({
+      threads: {
+        get: async ({ threadId }) => makeThreadResponse({
+          id: threadId,
+          projectId: "proj",
+          providerId: "codex",
+          parentThreadId: null,
+          status: threadId === "thr_wakeup_root" ? options?.rootStatus ?? "active" : "idle",
+          hasPendingInteraction: threadId === "thr_wakeup_root" && Boolean(options?.interactionRows),
+        } as never),
+        list: () => [],
+        timeline: () => ({ rows: [] }),
+        send: (args: unknown) => {
+          sends.push(args);
+          return { ok: true };
+        },
+        stop: () => ({ ok: true }),
+        interactions: {
+          list: async () => {
+            if (options?.interactionsUnreadable) throw new Error("interaction read failed");
+            return options?.interactionRows ?? [];
+          },
+          resolve: async () => ({}) as never,
+        },
+        queuedMessages: {
+          list: async () => queue,
+          create: async (args: { input: unknown }) => {
+            const row = { id: `q_wakeup_${nextId++}`, updatedAt: nextId, content: args.input };
+            queue.push(row);
+            if (options?.unknownCreate) return undefined;
+            return row;
+          },
+          update: async (args: { queuedMessageId: string; expectedUpdatedAt: number; input: unknown }) => {
+            updates.push(args);
+            const row = queue.find((entry) => entry.id === args.queuedMessageId);
+            if (!row || row.updatedAt !== args.expectedUpdatedAt) throw new Error("stale queue row");
+            row.updatedAt += 1;
+            row.content = args.input;
+            return row;
+          },
+        },
+      },
+    });
+    const db = host.bb.storage.database();
+    db.prepare(
+      `UPDATE goals SET thread_id = 'thr_wakeup_root', status = 'active', max_workers = 1,
+         verify_enabled = 0, progress_update_minutes = 0, last_continue_at = ?
+       WHERE thread_id = 'thr_sentinel'`,
+    ).run(Date.now());
+    const settle = async () => {
+      for (let index = 0; index < 60; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    const pulse = async () => {
+      const service = host.harness.behavior.runService("progress-pulse");
+      await settle();
+      service.controller.abort();
+      await service.done;
+      await settle();
+    };
+    return { host, db, queue, sends, updates, settle, pulse };
+  }
+
+  it("coalesces root events into one queued wake and edits that identity", async () => {
+    const fx = wakeupHost();
+    const patch = async (step: string) => {
+      const result = await fx.host.harness.behavior.callAgentTool(
+        "ultragoal_patch",
+        { plan: [{ step, status: "pending" }] },
+        { threadId: "thr_wakeup_root" },
+      );
+      assert.equal(isToolError(result), false, toolText(result));
+    };
+    await patch("First coalesced wake event");
+    await patch("Second coalesced wake event");
+    await fx.pulse();
+    assert.equal(fx.queue.length, 1, "one automatic wakeup owns the root");
+    const firstId = fx.queue[0]!.id;
+    const ledger = () => fx.db.prepare(
+      "SELECT state, revision, settled_revision, queue_message_id FROM goal_root_wakeups WHERE thread_id = ?",
+    ).get("thr_wakeup_root") as { state: string; revision: number; settled_revision: number; queue_message_id: string };
+    assert.equal(ledger().state, "queued");
+    assert.equal(ledger().queue_message_id, firstId);
+    await patch("Third event after the first queue settle");
+    await fx.pulse();
+    assert.equal(fx.queue.length, 1, "later events update the same queued message");
+    assert.equal(fx.queue[0]!.id, firstId);
+    assert.equal(fx.updates.length, 1);
+    assert.equal(ledger().revision, ledger().settled_revision);
+    assert.equal(fx.sends.length, 0, "an active root uses the composer queue, not duplicate sends");
+  });
+
+  it("holds when interaction state is unreadable and continues past a turnless plugin card", async () => {
+    const unreadable = wakeupHost({ interactionsUnreadable: true, rootStatus: "idle" });
+    unreadable.db.prepare("UPDATE goals SET last_continue_at = ? WHERE thread_id = ?").run(0, "thr_wakeup_root");
+    await unreadable.host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_wakeup_root", status: "idle", hasPendingInteraction: true } as never),
+      lastAssistantText: null,
+    });
+    assert.equal(unreadable.sends.length, 0, "unknown interaction state must not authorize a send");
+
+    const turnless = wakeupHost({
+      rootStatus: "idle",
+      interactionRows: [{ id: "plugin_card", kind: "plugin", turnBound: false }],
+    });
+    turnless.db.prepare("UPDATE goals SET last_continue_at = NULL WHERE thread_id = ?").run("thr_wakeup_root");
+    await turnless.host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_wakeup_root", status: "idle", hasPendingInteraction: true } as never),
+      lastAssistantText: null,
+    });
+    assert.ok(turnless.sends.length > 0, "a turnless plugin card must not block root continuation");
+  });
+
+  it("does not dispatch a paused wake and clears it when the root is cleared", async () => {
+    const fx = wakeupHost();
+    const result = await fx.host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ step: "Wake that must wait through pause", status: "pending" }] },
+      { threadId: "thr_wakeup_root" },
+    );
+    assert.equal(isToolError(result), false, toolText(result));
+    const paused = await fx.host.harness.behavior.runCli(["pause", "--thread", "thr_wakeup_root"]);
+    assert.equal(paused.exitCode, 0, paused.stderr ?? "");
+    await fx.pulse();
+    assert.equal(fx.queue.length, 0, "paused roots are never woken");
+    const cleared = await fx.host.harness.behavior.runCli(["clear", "--thread", "thr_wakeup_root"]);
+    assert.equal(cleared.exitCode, 0, cleared.stderr ?? "");
+    assert.equal(
+      (fx.db.prepare("SELECT COUNT(*) AS n FROM goal_root_wakeups WHERE thread_id = ?").get("thr_wakeup_root") as { n: number }).n,
+      0,
+      "clearing a root retires its pending wakeup",
+    );
+  });
+
+  it("does not duplicate a queued wake after an uncertain create result", async () => {
+    const fx = wakeupHost({ unknownCreate: true });
+    const result = await fx.host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ step: "Wake with an uncertain queue create", status: "pending" }] },
+      { threadId: "thr_wakeup_root" },
+    );
+    assert.equal(isToolError(result), false, toolText(result));
+    await fx.pulse();
+    assert.equal(fx.queue.length, 1);
+    const state = () => fx.db.prepare(
+      "SELECT state FROM goal_root_wakeups WHERE thread_id = ?",
+    ).get("thr_wakeup_root") as { state: string };
+    assert.equal(state().state, "unknown");
+    await fx.pulse();
+    assert.equal(fx.queue.length, 1, "unknown create outcomes never blind-resend");
+  });
+
+  it("holds a durable wake while a provider-bound interaction is pending", async () => {
+    const fx = wakeupHost({
+      rootStatus: "idle",
+      interactionRows: [{ id: "approval", payload: { kind: "approval" } }],
+    });
+    const result = await fx.host.harness.behavior.callAgentTool(
+      "ultragoal_patch",
+      { plan: [{ step: "Wake around a provider interaction", status: "pending" }] },
+      { threadId: "thr_wakeup_root" },
+    );
+    assert.equal(isToolError(result), false, toolText(result));
+    await fx.pulse();
+    assert.equal(fx.sends.length, 0);
+    assert.equal(fx.queue.length, 0);
+    assert.equal(
+      (fx.db.prepare("SELECT state FROM goal_root_wakeups WHERE thread_id = ?").get("thr_wakeup_root") as { state: string }).state,
+      "pending",
+    );
+  });
+});
+
 describe("resolve_finding end to end", () => {
   const PLUGIN_REPO = "/Users/braedonsaunders/Documents/bb-plugin-ultragoal";
 

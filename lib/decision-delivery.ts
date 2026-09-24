@@ -82,6 +82,7 @@ export interface RootWakeupStore {
     outcome: WakeupOutcome,
     now: number,
   ): RootWakeup | null;
+  clear(threadId: string): void;
 }
 
 interface WakeupRow {
@@ -171,6 +172,7 @@ export function createRootWakeupStore(
   const readAllOutstandingStmt = db.prepare(
     "SELECT * FROM goal_root_wakeups WHERE revision > settled_revision ORDER BY thread_id",
   );
+  const clearStmt = db.prepare("DELETE FROM goal_root_wakeups WHERE thread_id = ?");
   // The compare-and-set lives in the UPDATE itself: a read-then-write window in
   // JS could settle a revision a newer note already superseded. `@kind` is the
   // outcome kind, so one statement covers all three: dispatched/queued record
@@ -256,6 +258,10 @@ export function createRootWakeupStore(
       }) as WakeupRow | undefined;
       return applied ? rowToWakeup(applied) : null;
     },
+
+    clear(threadId: string): void {
+      clearStmt.run(threadId);
+    },
   };
 }
 
@@ -309,16 +315,17 @@ export type WakeupAction = "settled" | "queued" | "dispatched" | "send" | "hold"
  * Authority order is deliberate. Unreadable history or an unreadable queue is
  * `hold`: missing evidence can neither claim delivery nor authorize a blind
  * resend. The marker in authoritative history proves the wakeup landed. A
- * queue row still holding `queueMessageId` — or carrying the marker — means the
- * caller updates that queued message in place; the row's identity, not its
- * `state` label, is what the queue is matched against, so an unknown outcome
- * that kept a queued identity is still never re-created. Both readings showing
- * nothing is the reconciled resend path: queue absence is not delivery proof.
+ * A queue row still holding the persisted `queueMessageId` means the caller
+ * updates that queued message in place; a marker in another row is not
+ * ownership evidence. The row's identity, not its `state` label, is what the
+ * queue is matched against, so an unknown outcome that kept a queued identity
+ * is still never re-created. Both readings showing nothing is the reconciled
+ * resend path: queue absence is not delivery proof.
  * Anything unreadable or unrecognized holds.
  */
 export function reconcileWakeup(input: {
   row: RootWakeup | null;
-  queue: { ok: boolean; rows: readonly { id: string; content?: string }[] };
+  queue: { ok: boolean; rows: readonly { id: string; content?: unknown }[] };
   timeline: { ok: boolean; rows: readonly unknown[] };
 }): WakeupAction {
   const { row } = input;
@@ -331,10 +338,15 @@ export function reconcileWakeup(input: {
     .join("\n");
   if (history.includes(marker)) return "dispatched";
   if (!input.queue.ok) return "hold";
-  const held = input.queue.rows.some(
-    (queued) =>
-      (row.queueMessageId !== null && queued.id === row.queueMessageId) ||
-      (queued.content ?? "").includes(marker),
-  );
-  return held ? "queued" : "send";
+  const held = input.queue.rows.some((queued) => {
+    if (row.queueMessageId === null || queued.id !== row.queueMessageId) return false;
+    return true;
+  });
+  if (held) return "queued";
+  // An uncertain create/send may already exist remotely without a durable
+  // message id. Absence of an exact identity is not permission to create a
+  // second copy; retain the unknown state until authoritative history proves
+  // delivery or an operator supplies a recovery decision.
+  if (row.state === "unknown") return "hold";
+  return "send";
 }
